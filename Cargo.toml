@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "tools/png",
+    "tools/reconl-diff",
+    "tools/host",
+    "tools/reconl-bench",
+    "tools/reconl-info",
+    "core",
+    "raster",
+    "shadow",
+    "resource",
+    "scene",
+    "backends/null",
+    "backends/soft-cpu",
+    "backends/d3d11",
+    "ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "local"
+
+[workspace.dependencies]
+reconl-core = { path = "core" }
+reconl-raster = { path = "raster" }
+reconl-shadow = { path = "shadow" }
+reconl-resource = { path = "resource" }
+reconl-scene = { path = "scene" }
+reconl-backend-null = { path = "backends/null" }
+reconl-backend-softcpu = { path = "backends/soft-cpu" }
+reconl-backend-d3d11 = { path = "backends/d3d11" }
+reconl-png = { path = "tools/png" }
+reconl-host = { path = "tools/host" }
+reconl = { package = "reconl-ffi", path = "ffi" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.test]
+opt-level = 2

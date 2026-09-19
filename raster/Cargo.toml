@@ -1,0 +1,12 @@
+[package]
+name = "reconl-raster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl-core = { workspace = true }
+
+[lib]
+name = "reconl_raster"
+path = "src/lib.rs"

@@ -1,0 +1,15 @@
+[package]
+name = "reconl-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl = { workspace = true }
+reconl-core = { workspace = true }
+reconl-host = { workspace = true }
+reconl-png = { workspace = true }
+
+[[bin]]
+name = "reconl-bench"
+path = "src/main.rs"

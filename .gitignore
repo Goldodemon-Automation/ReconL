@@ -1,0 +1,27 @@
+/target
+**/target
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.dll
+*.so
+*.dylib
+*.exp
+
+# Toolchain-local bits
+*.log
+*.rcls
+
+# Recorded runs and spill caches produced by reconl-bench / the test suite
+/out
+/bench
+/.reconl-spill
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# C example build output
+/examples/c/build/

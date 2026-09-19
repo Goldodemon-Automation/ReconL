@@ -1,0 +1,11 @@
+[package]
+name = "reconl-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lib]
+name = "reconl_core"
+path = "src/lib.rs"

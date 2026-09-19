@@ -1,0 +1,12 @@
+[package]
+name = "reconl-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl = { workspace = true }
+reconl-core = { workspace = true }
+
+[dev-dependencies]
+serial_test = "3"

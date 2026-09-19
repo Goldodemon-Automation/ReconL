@@ -1,0 +1,12 @@
+[package]
+name = "reconl-backend-null"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl-core = { workspace = true }
+
+[lib]
+name = "reconl_backend_null"
+path = "src/lib.rs"

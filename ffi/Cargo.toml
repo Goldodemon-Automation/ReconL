@@ -1,0 +1,27 @@
+[package]
+name = "reconl-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+reconl-core = { workspace = true }
+
+[dependencies]
+reconl-core = { workspace = true }
+reconl-raster = { workspace = true }
+reconl-shadow = { workspace = true }
+reconl-resource = { workspace = true }
+reconl-scene = { workspace = true }
+reconl-backend-null = { workspace = true }
+reconl-backend-softcpu = { workspace = true }
+reconl-backend-d3d11 = { workspace = true }
+
+[lib]
+name = "reconl"
+crate-type = ["cdylib", "staticlib", "rlib"]
+path = "src/lib.rs"
+
+[[example]]
+name = "classify_probe"
+path = "examples/classify_probe.rs"

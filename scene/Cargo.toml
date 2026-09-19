@@ -1,0 +1,12 @@
+[package]
+name = "reconl-scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl-core = { workspace = true }
+
+[lib]
+name = "reconl_scene"
+path = "src/lib.rs"
