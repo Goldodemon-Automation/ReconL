@@ -1,16 +1,11 @@
 //! Non-windows fallback: the backend is unavailable, loudly.
 
-use reconl_core::error::{Code, Error, Result};
-use reconl_backend_softcpu::ShadowRequest;
+use reconl_contract::{FrameInput, ShadowRequest};
 use reconl_core::budget::Budget;
+use reconl_core::error::{Code, Error, Result};
 use reconl_core::stats::{Counters, FrameNumbers, ShadowCounters};
 use reconl_core::tier::{Backend, Tier, TierReason};
 use std::sync::Arc;
-
-use reconl_raster::math::Mat4;
-use reconl_raster::shade::LightSet;
-
-pub use reconl_backend_softcpu::FrameInput;
 
 /// The probe types the non-windows build still has to name, so the ABI layer
 /// compiles and reports the backend as unavailable rather than not existing.
@@ -43,7 +38,6 @@ pub struct D3d11Config {
     pub adapter_index: usize,
     pub resolution_scale: f32,
     pub target_frame_ms: u32,
-    pub over_target_frames_to_downgrade: u32,
     pub shadow: ShadowRequest,
 }
 
@@ -54,7 +48,6 @@ impl Default for D3d11Config {
             adapter_index: 0,
             resolution_scale: 1.0,
             target_frame_ms: 16,
-            over_target_frames_to_downgrade: 0,
             shadow: ShadowRequest::default(),
         }
     }
@@ -66,7 +59,6 @@ pub struct D3d11Snapshot {
     pub shadows: ShadowCounters,
     pub frame: FrameNumbers,
     pub color_checksum: u64,
-    pub depth_checksum: u64,
 }
 
 pub struct D3d11Device;
@@ -88,6 +80,10 @@ impl D3d11Device {
         TierReason::HostRequest
     }
 
+    /// The device decides tiers and applies them here; off Windows there is no
+    /// backend for it to apply one to.
+    pub fn relabel(&mut self, _to: Tier, _reason: TierReason) {}
+
     pub fn caps(&self) -> u32 {
         0
     }
@@ -108,15 +104,11 @@ impl D3d11Device {
         Err(Error::new(Code::BackendUnavailable, "the d3d11 backend requires windows"))
     }
 
-    pub fn readback(&self, _out: &mut [u8]) -> Result<u64> {
+    pub fn read_frame_into(&mut self, _out: &mut [u8], _pitch: u32, _flip: u32) -> Result<()> {
         Err(Error::new(Code::BackendUnavailable, "the d3d11 backend requires windows"))
     }
 
     pub fn color_checksum(&self) -> u64 {
-        0
-    }
-
-    pub fn depth_checksum(&self) -> u64 {
         0
     }
 

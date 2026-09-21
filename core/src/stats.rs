@@ -188,6 +188,14 @@ pub struct FrameNumbers {
     pub allocations_in_frame: u32,
 }
 
+/// Cross-frame counters a host can read.
+///
+/// Every field here is counted by the layer that owns the event and is read by
+/// someone - a host through `ReconLStats`, the offload policy, or a test. The
+/// frame-time ladder's own memory (how many consecutive frames were over the
+/// target) is deliberately *not* here: it is per-device state owned by the
+/// ladder, and a second copy in these counters would be a second definition of
+/// "over target" that nothing reads and nothing keeps in step.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Counters {
     pub frames_presented: u32,
@@ -196,8 +204,6 @@ pub struct Counters {
     pub safe_path_events: u32,
     pub audit_divergences: u32,
     pub last_result: Option<Code>,
-    pub downgrade_threshold_frames: u32,
-    pub frames_over_target: u32,
     pub device_losses: u32,
     pub frames_since_tier_change: u32,
 }

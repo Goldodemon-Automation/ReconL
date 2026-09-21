@@ -123,7 +123,11 @@ reconlSubmit: RECONL_ERR_DEVICE_LOST (-6) — device reported: map colour stagin
 ```
 
 That one is a genuine removal (`DXGI_ERROR_DEVICE_REMOVED`, which the classifier
-maps to `DEVICE_LOST`). Contrast a frame the driver merely *refuses* - a
+maps to `DEVICE_LOST`). It is a state of the machine, not a property of the load:
+a driver whose device instance is already suspended reports it on the first frame,
+and a healthy driver renders the same 512x512 load indefinitely - re-measured
+during the last pass, the run completes 5 warmup + 60 measured frames with
+`failures 0` and never leaves `d3d11`. Contrast a frame the driver merely *refuses* - a
 32768-wide target, past its 16384-texel limit - which surfaces as
 `RECONL_ERR_INVALID_ARGUMENT (-1)` with the driver's `E_INVALIDARG` in the
 message, and the device still usable.
@@ -194,8 +198,10 @@ cargo run  -p reconl-diff -- compare tests/golden/soft-cpu-shadow.png
 ```
 
 The C ABI is verified from both sides: `ffi/tests/abi_layout.rs` generates
-`_Static_assert`s from the Rust structs and asks a C compiler to compile them
-against the shipped header, so a field added on one side and not the other stops
-the build. `ffi/tests/abi.rs` drives every entry point through the C-shaped surface,
+`_Static_assert`s from the Rust structs and from every constant and enum the
+header exports, and asks a C compiler to compile them against the shipped
+header, so a field or a value changed on one side and not the other fails
+`cargo test` (it skips, with a printed reason, where the host has no C compiler).
+`ffi/tests/abi.rs` drives every entry point through the C-shaped surface,
 including the failure paths, and the runtime behaviour of the shipped DLL is
 checked by C probes built against its import library.

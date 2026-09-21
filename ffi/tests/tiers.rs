@@ -335,6 +335,7 @@ fn run(run: Run, scene: &Scene) -> Vec<(Vec<u8>, abi::ReconLStats)> {
                 Some(camera) => camera as *const abi::ReconLCamera,
                 None => core::ptr::null(),
             },
+            framegen: core::ptr::null(),
         };
         for _ in 0..run.frames {
             let mut pixels = vec![0u8; (run.width * run.height * 4) as usize];
@@ -1494,19 +1495,25 @@ fn every_blend_mode_matches_the_reference() {
 const OFFLOAD_W: u32 = 256;
 const OFFLOAD_H: u32 = 256;
 
-/// A hardware device run at the offload resolution, with the ladder settings the
-/// offload policy reads. `reconlPresent` is what steps that policy and nothing
-/// else does, so a run's per-frame stats are the only way to watch it decide.
-fn ladder(frames: u32, target_ms: u32, after: u32, allow: u32) -> Run {
+/// A hardware device run at any size, with the ladder settings the offload policy
+/// reads. `reconlPresent` is what steps that policy and nothing else does, so a
+/// run's per-frame stats are the only way to watch it decide.
+fn ladder_at(size: u32, frames: u32, target_ms: u32, after: u32, allow: u32) -> Run {
     Run {
         allow_downgrade: allow,
         target_frame_ms: target_ms,
         downgrade_after_frames: after,
         frames,
-        width: OFFLOAD_W,
-        height: OFFLOAD_H,
+        width: size,
+        height: size,
         ..Run::one(abi::backend::D3D11, 1)
     }
+}
+
+/// The same at the offload resolution, where the legs that are not ladder legs
+/// run: no offload allowed, or a target no device here can miss.
+fn ladder(frames: u32, target_ms: u32, after: u32, allow: u32) -> Run {
+    ladder_at(OFFLOAD_W, frames, target_ms, after, allow)
 }
 
 /// The reference tier's own render of the same frames, for the two things the
@@ -1534,6 +1541,18 @@ fn detail_of(entry: &abi::ReconLDowngrade) -> String {
     String::from_utf8_lossy(&entry.detail[..len]).into_owned()
 }
 
+/// A ring's entries as a host reads them: the change, the frame it happened on,
+/// and the reason it carries.
+fn ring(stats: &abi::ReconLStats) -> Vec<(u32, u32, u32, u64, String)> {
+    let count = (stats.downgrade_count as usize).min(stats.downgrade_capacity as usize);
+    (0..count)
+        .map(|i| {
+            let e = &stats.downgrades[i];
+            (e.from, e.to, e.reason, e.frame_index, detail_of(e))
+        })
+        .collect()
+}
+
 /// The number that follows `marker` in a downgrade's detail.
 ///
 /// The policy writes the measurement that decided it into the entry it caused -
@@ -1551,53 +1570,309 @@ fn number_after(detail: &str, marker: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+// ---------------------------------------------------- the ladder legs, once
+
+/// How many frames a ladder leg drives, and how many quiet frames at its end
+/// count as "the ladder has quit". The policy's own state bounds the changes a
+/// plan can take - one return, then one offload that reuses the measurement - so
+/// a quiet tail is a verdict and not a guess, and a leg is driven to it rather
+/// than sampled at a fixed frame.
+const LADDER_FRAMES: u32 = 24;
+const LADDER_QUIET_FRAMES: usize = 3;
+
+/// How many times a leg re-derives its window before it gives up.
+///
+/// The window is a measurement of this host, taken while the rest of the suite
+/// may be loading it, so it can stop being reachable between the pilot run and
+/// the leg run. Re-measuring is what makes the leg deterministic without weakening
+/// it: every attempt drives the same sequence and is judged by the same clause.
+const LADDER_ATTEMPTS: u32 = 3;
+
+/// The window a ladder leg points the device at, measured out of both tiers on
+/// this machine.
+///
+/// A hard-coded millisecond makes the verdict a property of the host, and the
+/// number answers two questions of which the *slower* one decides which binds:
+/// the hardware has to *miss* the target - that miss is the trigger - and where
+/// the reference tier is the faster tier, the one that wins the calibration and
+/// then has to arm the settle window on its own frames, that tier needs a frame
+/// *inside* it. A fresh device's first frame bounds the target from above,
+/// because it is the frame the offload fires on and the first frame a rebuilt
+/// device presents.
+#[derive(Clone, Copy)]
+struct LadderWindow {
+    target_ms: u32,
+    cpu_cheapest_ns: u64,
+    cpu_typical_ns: u64,
+    gpu_first_ns: u64,
+}
+
+/// Measures both tiers with their ladders off and derives the window, or fails
+/// with both measurements.
+///
+/// The target is the ABI's smallest whole millisecond, raised to the smallest
+/// millisecond that covers the reference tier's **cheapest** warm frame only when
+/// a fresh hardware device's first frame is over **twice** the raised value.
+///
+/// Cheapest, not typical: the settle window needs *one* frame inside the target
+/// (`within_target` counts frames inside it and this threshold is one), so the
+/// cheap end is what the window actually needs - and raising the target on the
+/// cheap end makes the raise a property of a *slow host*, where every frame of
+/// both tiers is inflated together, instead of a property of *load*, where the
+/// reference tier's median frame drifts over a millisecond while the hardware's
+/// first frame does not. That distinction is the difference between a pin and a
+/// coin flip: the target doubles, and a rebuilt hardware device's first frame is
+/// no longer reliably over it.
+///
+/// Twice, not merely over it, for the ceiling: the first frame is a device setup
+/// frame, and the spread between one cold device and the next on a loaded machine
+/// is large enough that a target only just under it stops being a target for the
+/// device a leg then builds. Requiring real room means the raised target is only
+/// ever used in the regime that needs it - the remembered leg, where the
+/// reference tier wins the calibration and its own frames have to re-arm the
+/// settle window - and every other machine, including a thrashing one, gets the
+/// smallest millisecond, which every hardware frame measured here was over.
+fn ladder_window(leg: &str, scene: &Scene, size: u32) -> Result<LadderWindow, String> {
+    // A tier's first frame, its cheapest warm frame and its typical warmth, with
+    // the ladder off.
+    let pilot = |backend: u32, tier: u32| -> (u64, u64, u64) {
+        let frames = run(
+            Run { frames: 8, width: size, height: size, ..Run::one(backend, tier) },
+            scene,
+        );
+        let mut warm: Vec<u64> = frames
+            .iter()
+            .skip(1)
+            .map(|(_, stats)| stats.frame.total_ns)
+            .filter(|ns| *ns > 0)
+            .collect();
+        warm.sort_unstable();
+        let first = frames.first().map(|(_, stats)| stats.frame.total_ns).unwrap_or(0);
+        (first, warm.first().copied().unwrap_or(0), warm.get(warm.len() / 2).copied().unwrap_or(0))
+    };
+    let (cpu_first, cpu_cheapest, cpu_typical) = pilot(abi::backend::SOFT_CPU, 2);
+    let (gpu_first, _gpu_cheapest, _gpu_typical) = pilot(abi::backend::D3D11, 1);
+    let cpu_ms = ((cpu_cheapest + 999_999) / 1_000_000).max(1) as u32;
+    let cap_ms = gpu_first.saturating_sub(1) / 1_000_000;
+    let target_ms = if u64::from(cpu_ms) * 2 <= cap_ms { cpu_ms } else { 1 };
+    if cap_ms < 1 || u64::from(target_ms) > cap_ms {
+        return Err(format!(
+            "{leg}: no whole-millisecond target this host can use. The reference tier's first frame \
+             is {cpu_first} ns, its cheapest warm frame {cpu_cheapest} ns (typical {cpu_typical} ns), \
+             which {cpu_ms} ms would cover, while a fresh hardware device's first frame is \
+             {gpu_first} ns - {cap_ms} ms of room over the hardware, which is not twice what \
+             covering the reference tier's frames would need. The sequence this leg pins cannot be \
+             exercised on this host in this measurement."
+        ));
+    }
+    Ok(LadderWindow {
+        target_ms,
+        cpu_cheapest_ns: cpu_cheapest,
+        cpu_typical_ns: cpu_typical,
+        gpu_first_ns: gpu_first,
+    })
+}
+
+/// One device's ladder run, with a host's reading of it in one place: the offload
+/// entries, the returns, and the bound the anti-thrash rule puts on every leg.
+struct LadderRun {
+    leg: &'static str,
+    frames: Vec<(Vec<u8>, abi::ReconLStats)>,
+}
+
+/// Drives one hardware device through the ladder at `window` - the host's bit
+/// set, the policy's own thresholds - and reports the trigger the window was
+/// derived against: the arm's device is a fresh one, so its first frame is a
+/// device setup frame, and it has to miss. `Err` is this host crossing its own
+/// measured window, which is what the caller re-derives for, and not a verdict
+/// about the ladder.
+fn ladder_run(leg: &'static str, scene: &Scene, size: u32, window: LadderWindow) -> Result<LadderRun, String> {
+    let frames = run(
+        ladder_at(size, LADDER_FRAMES, window.target_ms, 1, abi::allow_downgrade::TIER),
+        scene,
+    );
+    let first = &frames[0].1;
+    if first.safe_path_events != 1 || first.backend != abi::backend::SOFT_CPU {
+        return Err(format!(
+            "{leg}: a hardware device's first frame cost {} ns and did not miss the derived {} ms \
+             target (the reference tier's cheapest frame here is {} ns, its typical {} ns, and a \
+             fresh hardware device's first frame {} ns; backend {}, safe-path events {}): the \
+             offload this sequence is built on did not happen",
+            first.frame.total_ns,
+            window.target_ms,
+            window.cpu_cheapest_ns,
+            window.cpu_typical_ns,
+            window.gpu_first_ns,
+            first.backend,
+            first.safe_path_events
+        ));
+    }
+    Ok(LadderRun { leg, frames })
+}
+
+/// A ladder leg on a window derived from this machine, re-derived when the leg
+/// does not say what it exists to say.
+///
+/// `reachable` is the caller's verdict on one run - the sequence that leg is
+/// about - and it is the same clause the caller asserts afterwards, so nothing is
+/// weakened by asking it here: the retry buys the leg a fresh measurement of the
+/// host rather than a weaker standard, and a leg that never satisfies it is
+/// returned as it stands so the caller's own assertion fails with everything the
+/// leg measured. Only a host where *no* attempt could even be set up panics here,
+/// with the derivation's own reason.
+fn ladder_leg(
+    leg: &'static str,
+    scene: &Scene,
+    size: u32,
+    reachable: impl Fn(&LadderRun) -> bool,
+) -> (LadderWindow, LadderRun) {
+    let mut why = String::new();
+    let mut last: Option<(LadderWindow, LadderRun)> = None;
+    for attempt in 1..=LADDER_ATTEMPTS {
+        match ladder_window(leg, scene, size).and_then(|window| {
+            ladder_run(leg, scene, size, window).map(|run| (window, run))
+        }) {
+            Ok((window, run)) => {
+                if reachable(&run) {
+                    return (window, run);
+                }
+                why = format!("{leg}: attempt {attempt} drove the sequence but it did not reach its verdict");
+                last = Some((window, run));
+            }
+            Err(reason) => why = reason,
+        }
+    }
+    last.unwrap_or_else(|| panic!("{leg}: no window this host can use after {LADDER_ATTEMPTS} measurements: {why}"))
+}
+
+impl LadderRun {
+    fn frames(&self) -> &[(Vec<u8>, abi::ReconLStats)] {
+        &self.frames
+    }
+
+    fn last(&self) -> &abi::ReconLStats {
+        &self.frames.last().expect("a leg rendered frames").1
+    }
+
+    /// The offload entries the policy wrote, in order. The reference tier's own
+    /// relabels share `FRAME_TIME_OVER_TARGET` and say so in their detail
+    /// (`this device's own tier`); they are a different decision - the device's
+    /// *tier*, not its backend - so they are not offloads.
+    fn offloads(&self) -> Vec<String> {
+        let last = self.last();
+        let mut entries = Vec::new();
+        for i in 0..last.downgrade_capacity as usize {
+            let entry = &last.downgrades[i];
+            if entry.reason != reason(reconl_core::tier::TierReason::FrameTimeOverTarget) {
+                continue;
+            }
+            let detail = detail_of(entry);
+            if !detail.contains("this device's own tier") {
+                entries.push(detail);
+            }
+        }
+        entries
+    }
+
+    /// How many times the device returned to the hardware. Counted by reason, not
+    /// by the tier it came from: the reference tier's own ladder may have
+    /// relabelled itself before the return, so a return can be logged from T3 or
+    /// T4 rather than from the T2 the offload adopted.
+    fn returns(&self) -> usize {
+        let last = self.last();
+        (0..last.downgrade_capacity as usize)
+            .filter(|i| {
+                last.downgrades[*i].reason == reason(reconl_core::tier::TierReason::Recovery)
+            })
+            .count()
+    }
+
+    /// The rule every leg obeys, and the thing that makes "the ladder quit"
+    /// checkable rather than assumed: at most three backend changes per plan - the
+    /// offload, the return the settle window bought, and the offload that reuses
+    /// the measurement - at most one of them a return, and `LADDER_QUIET_FRAMES`
+    /// frames at the end that changed nothing.
+    fn assert_settled_within_bounds(&self) {
+        let leg = self.leg;
+        let last = self.last();
+        assert_eq!(
+            last.frames_presented, LADDER_FRAMES,
+            "{leg}: {} of {LADDER_FRAMES} frames were presented",
+            last.frames_presented
+        );
+        assert_eq!(last.frames_dropped, 0, "{leg}: a frame was dropped");
+        assert_eq!(last.failures, 0, "{leg}: the host saw a failed call");
+        assert!(
+            last.safe_path_events <= 3,
+            "{leg}: the device changed backend {} times: one plan is allowed one round trip",
+            last.safe_path_events
+        );
+        let returns = self.returns();
+        assert!(returns <= 1, "{leg}: the device returned to the hardware {returns} times");
+        let tail = &self.frames[self.frames.len() - LADDER_QUIET_FRAMES..];
+        assert!(
+            tail.iter().all(|(_, stats)| stats.safe_path_events == last.safe_path_events),
+            "{leg}: the ladder was still changing backend in its last {LADDER_QUIET_FRAMES} frames \
+             ({} -> {})",
+            tail[0].1.safe_path_events,
+            last.safe_path_events
+        );
+        assert!(
+            last.safe_path_events < 2 || returns == 1,
+            "{leg}: the device took {} backend changes but the log holds {returns} returns to the \
+             hardware",
+            last.safe_path_events
+        );
+    }
+}
+
 /// The core of the offload, end to end on the real ABI: a hardware tier that
 /// misses its frame-time target hands the next frame to the reference tier, that
 /// frame is the calibration, and the measurement the policy took for itself
-/// decides whether the device stays there or comes back. The frame it hands over is the reference tier's
-/// frame, byte for byte.
+/// decides whether the device stays there or comes back. The frame it hands over
+/// is the reference tier's frame, byte for byte.
+///
+/// This is the ladder leg that runs the *shadowed* plan key - `occluder_scene(1)`
+/// is two cascades, PCF 3x3 and a bounded shadow-map budget, which is what the
+/// policy files its measurement under - so the ladder is exercised with a plan
+/// whose shadow work and whose plan key are both real.
 #[test]
 fn an_overloaded_hardware_tier_offloads_and_the_measurement_decides() {
     if !d3d11_usable() {
-        eprintln!("d3d11 is not usable on this host: the offload test is skipped");
         return;
     }
     let scene = occluder_scene(1);
+    let leg = "the one-round-trip leg (256x256, shadowed plan)";
 
     // The reference tier's own render of the same frame, for the byte-for-byte
     // check below. It renders two frames because the calibration frame is frame
     // index 1, not 0, and a frame's content depends on its index.
     let reference = reference_frames(&scene);
 
-    let frames = run(ladder(4, 1, 1, abi::allow_downgrade::TIER), &scene);
+    let (_, run) = ladder_leg(leg, &scene, OFFLOAD_W, |_| true);
+    let frames = run.frames();
 
-    // Frame 0 was the hardware's, and it missed the 1 ms target: the device is
-    // on the reference tier before frame 1 is recorded.
+    // Frame 0 was the hardware's, and it missed the derived target: the device is
+    // on the reference tier before frame 1 is recorded. (`ladder_run` has already
+    // failed if the miss did not happen.)
     let first = &frames[0].1;
-    assert_eq!(
-        first.backend,
-        abi::backend::SOFT_CPU,
-        "a hardware frame over target did not offload (safe-path events {})",
-        first.safe_path_events
-    );
-    assert_eq!(first.safe_path_events, 1, "one backend change: the offload itself");
+    assert_eq!(first.safe_path_events, 1, "{leg}: one backend change: the offload itself");
     assert_eq!(
         first.downgrades[0].reason,
-        reason(reconl_core::tier::TierReason::FrameTimeOverTarget)
+        reason(reconl_core::tier::TierReason::FrameTimeOverTarget),
+        "{leg}: the offload is not logged with the reason that caused it"
     );
-    assert_eq!(first.tier, 2, "the reference tier the device continued on");
+    assert_eq!(first.tier, 2, "{leg}: the reference tier the device continued on");
     assert_eq!(first.frames_presented, 1);
-    assert_eq!(first.frames_dropped, 0);
-    assert_eq!(first.failures, 0, "no call failed: the host saw a frame, not an error");
+    assert_eq!(first.failures, 0, "{leg}: no call failed: the host saw a frame, not an error");
 
     // Frame 1 is the calibration, rendered by the reference tier, and it is the
     // same frame the reference tier renders given the same input.
     assert_eq!(
         frames[1].0, reference[1].0,
-        "the offloaded frame differs from the reference tier's own render of it"
+        "{leg}: the offloaded frame differs from the reference tier's own render of it"
     );
     assert_eq!(frames[1].1.frames_presented, 2);
-    assert_eq!(frames[1].1.frames_dropped, 0);
 
     // The decision follows the measurement, and only the measurement: the
     // device is back on the hardware exactly when the reference tier measured
@@ -1609,23 +1884,23 @@ fn an_overloaded_hardware_tier_offloads_and_the_measurement_decides() {
     let second = &frames[1].1;
     let offload_detail = detail_of(&frames[0].1.downgrades[0]);
     let gpu_ns = number_after(&offload_detail, "the hardware measured ")
-        .unwrap_or_else(|| panic!("the offload records no hardware cost: {offload_detail}"));
+        .unwrap_or_else(|| panic!("{leg}: the offload records no hardware cost: {offload_detail}"));
     let cpu_ns = if second.backend == abi::backend::D3D11 {
         let entry = second
             .downgrades
             .iter()
             .find(|d| d.reason == reason(reconl_core::tier::TierReason::Recovery))
-            .expect("the return to the hardware is not in the tier log");
+            .unwrap_or_else(|| panic!("{leg}: the return to the hardware is not in the tier log"));
         let detail = detail_of(entry);
         number_after(&detail, "the reference tier measured ")
-            .unwrap_or_else(|| panic!("the return records no comparison: {detail}"))
+            .unwrap_or_else(|| panic!("{leg}: the return records no comparison: {detail}"))
     } else {
         // Still on the reference tier, so its own last frame is the calibration.
         second.frame.total_ns
     };
     assert!(
         cpu_ns > 1_000_000,
-        "the reference tier's measured cost is not a frame's cost: {cpu_ns} ns"
+        "{leg}: the reference tier's measured cost is not a frame's cost: {cpu_ns} ns"
     );
     // And it is a real cost, not a number the policy invented: the same frame
     // rendered by a reference-tier device of its own is the same order of
@@ -1634,62 +1909,218 @@ fn an_overloaded_hardware_tier_offloads_and_the_measurement_decides() {
     let control_ns = reference[1].1.frame.total_ns;
     assert!(
         control_ns > 0 && cpu_ns >= control_ns / 8 && cpu_ns <= control_ns * 8,
-        "the recorded reference-tier cost ({cpu_ns} ns) is not the same order as the tier's own \
-         measurement of that frame ({control_ns} ns)"
+        "{leg}: the recorded reference-tier cost ({cpu_ns} ns) is not the same order as the tier's \
+         own measurement of that frame ({control_ns} ns)"
     );
     let cpu_slower = cpu_ns >= gpu_ns;
-    eprintln!(
-        "offload calibration: reference {cpu_ns} ns vs hardware {gpu_ns} ns -> {}",
-        if cpu_slower { "back to the hardware" } else { "stayed on the reference tier" }
-    );
     assert_eq!(
         second.backend == abi::backend::D3D11,
         cpu_slower,
-        "the calibration decided against its own measurement (reference {cpu_ns} ns, hardware \
-         {gpu_ns} ns)"
+        "{leg}: the calibration decided against its own measurement (reference {cpu_ns} ns, \
+         hardware {gpu_ns} ns)"
     );
     if cpu_slower {
-        assert_eq!(second.safe_path_events, 2, "the return is a second backend change");
+        assert_eq!(second.safe_path_events, 2, "{leg}: the return is a second backend change");
         // The reason is the offload's own: the hardware tier's frame-time ladder
         // (telemetry that relabels a GPU tier, and pre-dates the offload) says
         // FRAME_TIME_OVER_TARGET, so RECOVERY can only come from this policy.
         assert_eq!(
             second.tier_reason,
             reason(reconl_core::tier::TierReason::Recovery),
-            "the device came back to the hardware without recording why"
+            "{leg}: the device came back to the hardware without recording why"
+        );
+        // Found by reason, not by position: the frame's own tier step - if the run
+        // had already armed one when the calibration frame closed - is recorded
+        // *before* the return, which is the order they happened in
+        // (`docs/offload.md`, "Two layers, one number").
+        let entries = ring(second);
+        let recovery = entries
+            .iter()
+            .rev()
+            .find(|(_, _, why, _, _)| *why == reason(reconl_core::tier::TierReason::Recovery))
+            .unwrap_or_else(|| {
+                panic!("{leg}: the device came back to the hardware without recording why: {entries:?}")
+            });
+        assert!(
+            recovery.4.contains("measured"),
+            "{leg}: the return does not record the measurement that caused it: {}",
+            recovery.4
         );
         assert_eq!(
-            second.downgrades[1].reason,
-            reason(reconl_core::tier::TierReason::Recovery)
-        );
-        assert!(
-            detail_of(&second.downgrades[1]).contains("measured"),
-            "the return does not record the measurement that caused it: {}",
-            detail_of(&second.downgrades[1])
+            entries.last().map(|entry| entry.2),
+            Some(reason(reconl_core::tier::TierReason::Recovery)),
+            "{leg}: the backend change is not the last thing the frame recorded: {entries:?}"
         );
     }
 
-    // The measurement is remembered: four frames, at most one offload and one
-    // return, because a workload that oscillates around the target must not
-    // thrash between tiers.
-    let last = &frames[3].1;
-    assert_eq!(last.frames_presented, 4);
-    assert_eq!(last.frames_dropped, 0);
+    // The bound on every leg of the ladder, and the quiet tail that shows the
+    // ladder quit instead of sampling one frame and assuming it had: the returned
+    // trip is attempted at most once per plan, which is what keeps a workload
+    // oscillating around the target from thrashing between tiers, and the third
+    // backend change it allows is the offload that reuses the measurement instead
+    // of paying for a second calibration (see the remembered leg below, which
+    // reaches that branch; at this size the reference tier always loses the
+    // calibration, so the device goes back to the hardware and stays).
+    run.assert_settled_within_bounds();
+}
+
+/// The shadowed plan key the remembered leg runs at: the occluder scene at 32x32,
+/// with the shadow map's texel budget cut so the reference tier's own shadow pass
+/// leaves whole milliseconds between it and the hardware - the window the
+/// remembered sequence needs. The key still carries a real shadow configuration
+/// (enabled, two cascades, PCF), because that is the plan the measurement is
+/// filed under; it differs from `occluder_scene(1)`'s only in the budget.
+fn shadowed_ladder_scene() -> Scene {
+    occluder_scene_case(ShadowCase::budget(2 << 20))
+}
+
+/// The other half of the remembered rule, run on two plan keys.
+///
+/// `docs/offload.md`: "the result is remembered per plan so the calibration is
+/// never paid twice for the same regression". The 256x256 leg above cannot reach
+/// that half: the reference tier is about seven times slower there, so it always
+/// *loses* the calibration, the device goes straight back to the hardware, and a
+/// hardware frame that misses afterwards is never offloaded again at that plan.
+/// This leg needs the opposite regime - the reference tier wins the calibration,
+/// the settle window buys the device a return trip, and the frame that misses
+/// after that return reuses the measurement - and derives its window from both
+/// tiers' own measured costs to get there.
+///
+/// It runs that sequence on a plan key whose shadow work is real and on one
+/// without, because the plan a comparison is filed under is the resolution and
+/// the shadow configuration together: the rule holding on one key and not the
+/// other would be a defect in exactly the dimension the memory is keyed on.
+#[test]
+fn the_tier_log_holds_every_change_however_the_backend_moved() {
+    if !d3d11_usable() {
+        return;
+    }
+    let size = 32u32;
+    let leg = "the log leg (32x32, shadowed plan)";
+    let scene = shadowed_ladder_scene();
+    // This leg says something about the record only if the device actually moved
+    // between backends, so that is the verdict the window is re-derived for.
+    let (_, run) = ladder_leg(leg, &scene, size, |run| {
+        run.last().safe_path_events >= 2
+    });
+    let frames = run.frames();
+    let last = &frames[frames.len() - 1].1;
+
+    // This leg moves the frames between backends, which is what the record has to
+    // survive: it offloads, returns to the hardware and offloads again.
     assert!(
-        last.safe_path_events <= 2,
-        "the device changed backend {} times across four frames: it is thrashing",
+        last.safe_path_events >= 2,
+        "{leg}: the leg did not move the device between backends ({} change(s)), so it says \
+         nothing about whether the record survives one",
         last.safe_path_events
     );
-    // The tier log also carries the hardware backend's own relabels, which are
-    // telemetry that pre-dates the offload; what must stay bounded is the number
-    // of *returns*, one per plan.
-    let recoveries = (0..last.downgrade_capacity as usize)
-        .filter(|i| {
-            last.downgrades[*i].reason == reason(reconl_core::tier::TierReason::Recovery)
-                && last.downgrades[*i].from == 2
-        })
-        .count();
-    assert!(recoveries <= 1, "the device returned to the hardware {recoveries} times");
+
+    // One owner, one log: the record is the device's, and a change that happened
+    // stays readable after the backend that made it is gone. Read against the
+    // *live* backend's ring, an entry recorded during a calibration frame vanished
+    // the moment the frames moved back to the hardware - and the entry that
+    // replaced it could name a tier no entry in the ring had ever produced.
+    let final_ring = ring(last);
+    for (index, (_, stats)) in frames.iter().enumerate() {
+        for entry in ring(stats) {
+            assert!(
+                final_ring.contains(&entry),
+                "{leg}: frame {index} read an entry that is gone by the last frame: {entry:?}\n\
+                 the log at the end holds {final_ring:#?}"
+            );
+        }
+    }
+
+    // "In the order they happened": the frame each change carries never goes
+    // backwards, whichever layer made it.
+    for pair in final_ring.windows(2) {
+        assert!(
+            pair[0].3 <= pair[1].3,
+            "{leg}: the log is out of order: {} at frame {} is listed before {} at frame {}",
+            pair[0].4,
+            pair[0].3,
+            pair[1].4,
+            pair[1].3
+        );
+    }
+
+    // The count is every change the device has made, not the entries that happen
+    // to be in a ring of 16: it never goes backwards, and it covers the changes a
+    // host saw happen.
+    let mut previous = 0u32;
+    for (index, (_, stats)) in frames.iter().enumerate() {
+        assert!(
+            stats.downgrade_count >= previous,
+            "{leg}: frame {index} reports {} changes after {} earlier ones",
+            stats.downgrade_count,
+            previous
+        );
+        previous = stats.downgrade_count;
+    }
+    assert!(
+        last.downgrade_count >= last.safe_path_events,
+        "{leg}: {} backend change(s) but only {} entry(ies) logged",
+        last.safe_path_events,
+        last.downgrade_count
+    );
+}
+
+#[test]
+fn a_plan_is_calibrated_once_however_often_it_offloads() {
+    if !d3d11_usable() {
+        return;
+    }
+    let size = 32u32;
+    for (leg, scene) in [
+        ("the remembered leg (32x32, shadowed plan)", shadowed_ladder_scene()),
+        ("the remembered leg (32x32, no shadows)", single_triangle_scene(0)),
+    ] {
+        // The verdict this leg exists for - the second offload, the one that
+        // reuses the measurement - is what a window is re-derived for when this
+        // host's frames move under it.
+        let (window, run) = ladder_leg(leg, &scene, size, |run| run.offloads().len() >= 2);
+        run.assert_settled_within_bounds();
+
+        // The sequence, read for what the policy wrote rather than for a count.
+        let offloads = run.offloads();
+        let returns = run.returns();
+        assert!(
+            !offloads.is_empty() && offloads[0].contains("calibrating the reference tier"),
+            "{leg}: the first offload of a plan is its calibration: {offloads:?}"
+        );
+        // The branch this leg exists for. Reaching it is the policy's to do with a
+        // window the derivation above has established - a target the reference
+        // tier's frames are inside and a fresh hardware device's first frame is
+        // over - so a leg that does not reach it fails with everything it
+        // measured, rather than passing on an unexercised path.
+        assert!(
+            offloads.len() >= 2,
+            "{leg}: the remembered offload was never reached. With a {} ms target (the reference \
+             tier's typical warm frame {} ns, a fresh hardware device's first frame {} ns) the \
+             ladder changed backend {} time(s), returned to the hardware {returns} time(s) and \
+             wrote {} offload(s): {offloads:?}. The window the derivation established says this \
+             sequence was reachable, so either the ladder stopped short of reusing the \
+             measurement or this host's frames moved under it.",
+            window.target_ms,
+            window.cpu_typical_ns,
+            window.gpu_first_ns,
+            run.last().safe_path_events,
+            offloads.len()
+        );
+        for (index, detail) in offloads.iter().enumerate().skip(1) {
+            assert!(
+                !detail.contains("calibrating the reference tier"),
+                "{leg}: offload {} of this plan paid for a second calibration: {detail}",
+                index + 1
+            );
+            assert!(
+                detail.contains("already measured"),
+                "{leg}: offload {} of this plan does not record that it reused the measurement: \
+                 {detail}",
+                index + 1
+            );
+        }
+    }
 }
 
 /// The other half of the rule: no offload without a miss. A host whose frames
@@ -1732,7 +2163,99 @@ fn a_host_that_forbids_tier_changes_keeps_its_hardware() {
                 "a return trip this policy made, with the host's bit clear"
             );
         }
+
+        // The opt-out is an opt-out from *backend changes*, not from the ladder:
+        // a host whose frames miss the target still gets the device's own relabel,
+        // which keeps the hardware and lowerers its quality tier. That response is
+        // the device's to make and the device's to record - the backend decides
+        // nothing and keeps no log - so it has to be in the ring a host reads.
+        let last = &frames[frames.len() - 1].1;
+        assert!(
+            last.downgrade_count >= 1,
+            "allow_downgrade {allow:#x}: the device's frames were over the 1 ms target and it did \
+             not relabel itself (tier {}, entries {})",
+            last.tier,
+            last.downgrade_count
+        );
+        assert!(
+            last.downgrade_count <= last.downgrade_capacity,
+            "the ring reports more entries than it can hold"
+        );
+        let entries = ring(last);
+        let relabel = entries
+            .iter()
+            .rev()
+            .find(|(_, _, why, _, detail)| {
+                *why == reason(reconl_core::tier::TierReason::FrameTimeOverTarget)
+                    && detail.contains("this device's own tier")
+            })
+            .unwrap_or_else(|| panic!("allow_downgrade {allow:#x}: the relabel was not logged: {entries:?}"));
+        assert_eq!(
+            relabel.1,
+            last.tier,
+            "the host reads tier {} while the last tier the device's own relabel logged is {}: \
+             {entries:?}",
+            last.tier,
+            relabel.1
+        );
     }
+}
+
+/// The ladder's schedule, which a host can see and therefore has to be pinned:
+/// the device's own relabel acts on the frame *after* the cost that armed it, one
+/// frame behind the offload, which acts on the frame it just closed. Both layers
+/// answer from the device's one run, so a relabel is never charged to the frame
+/// that armed it - the frame `ffi/src/offload.rs` answers this from, and the
+/// order the backends' own ladders kept before both layers shared the device's
+/// run.
+///
+/// The offload is opted out of, so the relabel is the only response this device
+/// can make, and the arm is asserted rather than hoped for: every frame at this
+/// resolution costs tens of milliseconds against the 1 ms target the ladder legs
+/// use, and the test fails on the measurement if that is not true here.
+#[test]
+fn the_ladder_charges_a_relabel_to_the_frame_after_the_cost() {
+    if !d3d11_usable() {
+        return;
+    }
+    let frames = run(ladder(2, 1, 1, abi::allow_downgrade::NONE), &occluder_scene(1));
+    let target_ns = 1_000_000;
+    assert!(
+        frames[0].1.frame.total_ns > target_ns,
+        "this pin needs a first frame that misses the target: it cost {} ns against {target_ns} ns",
+        frames[0].1.frame.total_ns
+    );
+    // The frame that armed the run was charged nothing: the host reads the tier
+    // it created the device at, and an empty ring.
+    assert_eq!(
+        frames[0].1.tier, 1,
+        "the first frame stepped a tier the run had not armed yet (entries {})",
+        frames[0].1.downgrade_count
+    );
+    assert_eq!(
+        frames[0].1.downgrade_count, 0,
+        "a tier change was logged on the frame that armed the run rather than the one after it: {}",
+        ring(&frames[0].1).len()
+    );
+    // The frame after it is the frame the relabel acts on, and it says so.
+    let second = &frames[1].1;
+    assert_eq!(
+        second.downgrade_count, 1,
+        "the frame after the miss did not charge the relabel it armed: {:?}",
+        ring(second)
+    );
+    let entry = &second.downgrades[0];
+    assert_eq!(
+        (entry.from, entry.to, entry.frame_index),
+        (1, 2, 1),
+        "the relabel is not charged to the frame after the cost that armed it"
+    );
+    assert!(
+        detail_of(entry).contains("this device's own tier"),
+        "the entry does not say which layer made the change: {}",
+        detail_of(entry)
+    );
+    assert_eq!(second.tier, 2, "the host reads the tier the relabel logged");
 }
 
 /// The trigger is the driver's verdict, not the error code. Every failure this

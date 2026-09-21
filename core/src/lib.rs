@@ -1,15 +1,21 @@
-//! ReconL core: tier resolver, budget accounting, handles, error model, stats,
-//! logging and the host-allocator plumbing every other crate builds on.
+//! ReconL core: tier resolver, budget accounting, error model, stats, logging
+//! and the host-allocator plumbing every other crate builds on.
 //!
 //! No graphics here, no platform code here, no external dependencies here.
 //! Anything that knows how to put a pixel somewhere lives in a backend.
+//!
+//! Handles are deliberately *not* here. A handle's header is part of the C
+//! surface - `reconlRetain`/`reconlRelease` read it off a `void*` - and it
+//! carries the device back-pointer the FFI uses to prove a child belongs to its
+//! device, so it lives in `ffi/src/handle.rs` with the rest of the ABI's object
+//! model. This crate used to carry a second, unused handle table; two
+//! representations of one concern is how a reader learns the wrong one.
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc)]
 
 pub mod alloc;
 pub mod budget;
 pub mod error;
-pub mod handle;
 pub mod hash;
 pub mod log;
 pub mod stats;
@@ -19,7 +25,6 @@ pub mod tier;
 pub use alloc::{HostAlloc, HostAllocatorA, HostBox, HostStats, HostVec};
 pub use budget::{Budget, BudgetCaps, Reservation};
 pub use error::{Code, Error, Result};
-pub use handle::{HandleKind, RefHandle};
 pub use hash::{xxh64, xxh64_seeded, XxHash64};
 pub use log::Level;
 pub use stats::{Counters, Downgrade, DowngradeLog, ShadowCounters, Stats, TimingAccum};

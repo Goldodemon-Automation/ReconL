@@ -13,8 +13,12 @@
 //!    crossfade and filter dispatch run in the reference's order, and the blend
 //!    states below reproduce `shade::blend` exactly.
 //! 3. **Readback.** The colour target is copied to a staging texture, mapped,
-//!    and converted to the same tightly packed RGBA8 the reference's `to_rgba8`
-//!    hands back; depth is checksummed the same way.
+//!    and laid into the buffer the host handed to the present, in the row layout
+//!    it asked for - the same bytes the reference's `to_rgba8_rows` produces.
+//!    The frame's colour checksum - the fingerprint the audit compares two
+//!    renders of one frame by - is taken from those bytes, and only on the frames
+//!    that ask for one, because it is a full pass over the frame that no other
+//!    caller reads.
 //!
 //! The one deliberate fidelity note: D3D11's `R8G8B8A8_UNORM` write truncates
 //! where the reference's `to_u8` rounds. That is a property of the hardware
@@ -28,16 +32,16 @@
 //! descriptor is `InvalidArgument`/`NotSupported`, anything unclassifiable is
 //! `BackendUnavailable` - never a blanket loss over a healthy device.
 
-use reconl_backend_softcpu::{FrameInput, ShadowRequest};
+use reconl_contract::{FrameInput, ShadowRequest};
 use reconl_core::alloc::HostAlloc;
 use reconl_core::budget::{Budget, Reservation};
 use reconl_core::error::{Code, Error, Result};
-use reconl_core::stats::{Counters, Downgrade, DowngradeLog, FrameNumbers, ShadowCounters};
+use reconl_core::stats::{Counters, FrameNumbers, ShadowCounters};
 use reconl_core::tier::{caps, rules, shadow_plan, Backend, ShadowFilter, ShadowPlan, Tier, TierReason};
 use reconl_raster::math::{self, Mat4};
 use reconl_raster::shade::LightSet;
 use reconl_raster::{
-    checksum_f32, DrawItem, ShaderRef, Vertex, CULL_BACK, CULL_FRONT, COMPARE_GREATER,
+    checksum_bytes, rendered_viewport, DrawItem, ShaderRef, Vertex, CULL_BACK, CULL_FRONT, COMPARE_GREATER,
 };
 use reconl_shadow as shadow;
 use std::sync::Arc;
@@ -95,9 +99,6 @@ pub struct D3d11Config {
     pub adapter_index: usize,
     pub resolution_scale: f32,
     pub target_frame_ms: u32,
-    /// GPU tiers do not step themselves down for frame time in this release:
-    /// the host sees the times and decides. `0` = the feature is off.
-    pub over_target_frames_to_downgrade: u32,
     /// Cascade split lambda. Shared with the reference backend's config so both
     /// tiers fit the same cascades: `0` = uniform, `1` = logarithmic.
     pub split_lambda: f32,
@@ -111,7 +112,6 @@ impl Default for D3d11Config {
             adapter_index: 0,
             resolution_scale: 1.0,
             target_frame_ms: 16,
-            over_target_frames_to_downgrade: 0,
             split_lambda: 0.75,
             shadow: ShadowRequest::default(),
         }
@@ -133,7 +133,6 @@ pub struct D3d11Snapshot {
     pub shadows: ShadowCounters,
     pub frame: FrameNumbers,
     pub color_checksum: u64,
-    pub depth_checksum: u64,
 }
 
 const VERTEX_STRIDE: u32 = std::mem::size_of::<Vertex>() as u32;
@@ -520,9 +519,16 @@ struct ColorTarget {
     height: u32,
     color: ID3D11Texture2D,
     rtv: ID3D11RenderTargetView,
-    depth: ID3D11Texture2D,
+    /// Held for the depth/stencil view that binds it, like `_white` below: the
+    /// view is what the passes use, and the texture has to outlive the resize
+    /// that would otherwise drop it.
+    _depth: ID3D11Texture2D,
     dsv: ID3D11DepthStencilView,
     color_staging: ID3D11Texture2D,
+    /// A second staging copy, of the *depth* buffer, for the one caller that
+    /// reads it: frame generation reprojects pixels by their depth. Only
+    /// allocated alongside the target the way the colour copy is, and only used
+    /// when a host asked for generated frames.
     depth_staging: ID3D11Texture2D,
     reservation: Option<Reservation>,
 }
@@ -582,19 +588,22 @@ pub struct D3d11Device {
 
     color: Option<ColorTarget>,
     maps: Option<ShadowMaps>,
-    /// Tightly packed RGBA8 of the last frame, refreshed by the same readback
-    /// that produces the checksums.
+    /// Tightly packed RGBA8 of a frame, filled by `capture`. Both `pixels` and
+    /// the colour checksum are taken from these bytes, so the two can never
+    /// describe different frames.
     rgba8: Vec<u8>,
-    color_scratch: Vec<f32>,
-    depth_scratch: Vec<f32>,
+    /// The frame's depth, tightly packed, filled by `depth_into` for frame
+    /// generation. Kept beside `rgba8` for the same reason: one buffer sized by
+    /// the target rather than one allocation per read.
+    depth_f32: Vec<f32>,
+    /// Which frame `rgba8` holds, so the frame is copied out of the driver once:
+    /// an audit capture and a present of the same frame share one map.
+    captured: Option<u64>,
 
     counters: Counters,
     shadows: ShadowCounters,
     frame: FrameNumbers,
     color_checksum: u64,
-    depth_checksum: u64,
-    frames_over_target: u32,
-    downgrade_log: DowngradeLog,
 }
 
 impl D3d11Device {
@@ -797,15 +806,12 @@ impl D3d11Device {
             color: None,
             maps: None,
             rgba8: Vec::new(),
-            color_scratch: Vec::new(),
-            depth_scratch: Vec::new(),
+            depth_f32: Vec::new(),
+            captured: None,
             counters: Counters::default(),
             shadows: ShadowCounters::default(),
             frame: FrameNumbers::default(),
             color_checksum: 0,
-            depth_checksum: 0,
-            frames_over_target: 0,
-            downgrade_log: DowngradeLog::new(),
         })
     }
 
@@ -868,10 +874,6 @@ impl D3d11Device {
         unsafe { self.device.GetDeviceRemovedReason() }.is_err()
     }
 
-    pub fn downgrades(&self) -> &DowngradeLog {
-        &self.downgrade_log
-    }
-
     pub fn counters(&self) -> Counters {
         self.counters
     }
@@ -886,16 +888,11 @@ impl D3d11Device {
             shadows: self.shadows,
             frame: self.frame,
             color_checksum: self.color_checksum,
-            depth_checksum: self.depth_checksum,
         }
     }
 
     pub fn color_checksum(&self) -> u64 {
         self.color_checksum
-    }
-
-    pub fn depth_checksum(&self) -> u64 {
-        self.depth_checksum
     }
 
     pub fn frame_size(&self) -> (u32, u32) {
@@ -909,25 +906,21 @@ impl D3d11Device {
             + self.maps.as_ref().and_then(|m| m.reservation.as_ref()).map(|r| r.bytes()).unwrap_or(0)
     }
 
-    /// Steps down one tier, recording why. Returns the new tier.
+    /// Applies a tier the *device* decided on: the same backend at a lower
+    /// quality tier, with everything a tier change invalidates dropped.
     ///
-    /// A tier change invalidates the shadow layout (the new tier has a
-    /// different cascade cap, filter cap and cache location), so the maps are
-    /// dropped and rebuilt by the next frame.
-    pub fn step_down(&mut self, reason: TierReason, frame_index: u64, detail: &str) -> Tier {
-        let from = self.tier;
-        let to = from.step_down();
-        if to == from {
-            return from;
-        }
-        self.downgrade_log.record(Downgrade::new(from, to, reason, frame_index, 0, detail));
+    /// The backend does not decide this and does not record it: a device's tier
+    /// has one owner (the frame-time ladder in `ffi/src/offload.rs`, `docs/offload.md`)
+    /// and one log, and a backend's own ring would die with the backend while the
+    /// tier it changed does not.
+    pub fn relabel(&mut self, to: Tier, reason: TierReason) {
         self.tier = to;
         self.tier_reason = reason;
         self.counters.frames_since_tier_change = 0;
-        self.counters.downgrade_threshold_frames = self.config.over_target_frames_to_downgrade;
+        // A tier change invalidates the shadow layout (the new tier has a
+        // different cascade cap, filter cap and cache location), so the maps are
+        // dropped and rebuilt by the next frame.
         self.maps = None;
-        self.frames_over_target = 0;
-        to
     }
 
     /// Flushes the immediate context. Called at frame boundaries only.
@@ -965,8 +958,9 @@ impl D3d11Device {
                 return Ok(());
             }
         }
-        // Colour, depth and the two staging copies, counted against the budget
-        // the same way the reference counts its CPU targets.
+        // Colour, depth and their two staging copies - including the depth
+        // staging, which only frame generation reads - counted against the
+        // budget the same way the reference counts its CPU targets.
         let bytes = u64::from(target_w) * u64::from(target_h) * (4 + 4) * 2;
         let reservation = self.budget.reserve_ram(bytes).map_err(|e| {
             self.counters.safe_path_events += 1;
@@ -1032,6 +1026,8 @@ impl D3d11Device {
             ..color_desc
         };
         let color_staging = create_texture(&self.device, &staging_desc, "colour staging texture")?;
+        // Same shape as the depth texture it copies from, so `CopyResource` is
+        // legal: both are `R32_TYPELESS` and neither has a view applied.
         let depth_staging = create_texture(
             &self.device,
             &D3D11_TEXTURE2D_DESC { Format: DXGI_FORMAT_R32_TYPELESS, ..staging_desc },
@@ -1039,13 +1035,14 @@ impl D3d11Device {
         )?;
 
         self.rgba8.clear();
+        self.depth_f32.clear();
         self.rgba8.resize((target_w as usize) * (target_h as usize) * 4, 0);
         self.color = Some(ColorTarget {
             width: target_w,
             height: target_h,
             color,
             rtv,
-            depth,
+            _depth: depth,
             dsv,
             color_staging,
             depth_staging,
@@ -1236,67 +1233,135 @@ impl D3d11Device {
             }
         }
         Ok(())
-    }
+    }    /// Copies the colour target to staging, maps it, and lays the rows into
+    /// `out` - honouring `pitch` and the flip the present asked for. The only
+    /// place a frame leaves the driver.
+    fn copy_target_rows(
+        context: &ID3D11DeviceContext,
+        target: &ColorTarget,
+        out: &mut [u8],
+        pitch: usize,
+        flip: bool,
+    ) -> Result<()> {
+        let rows = target.height as usize;
+        let row_bytes = target.width as usize * 4;
 
-    /// Copies the colour and depth targets to staging, maps them, and computes
-    /// the same FNV-1a checksums the reference computes over its CPU targets.
-    fn readback_target(&mut self) -> Result<()> {
-        let Some(target) = self.color.as_ref() else {
-            return Ok(());
-        };
-        let (width, height) = (target.width as usize, target.height as usize);
-
-        unsafe { self.context.CopyResource(&target.color_staging, &target.color) };
+        unsafe { context.CopyResource(&target.color_staging, &target.color) };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(&target.color_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        }
-        .map_err(|e| err("map colour staging texture", e))?;
-        let row_bytes = width * 4;
-        self.color_scratch.clear();
-        self.color_scratch.reserve(row_bytes * height);
-        for row in 0..height {
-            let src = unsafe { (mapped.pData as *const u8).add(row * mapped.RowPitch as usize) };
+        unsafe { context.Map(&target.color_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .map_err(|e| err("map colour staging texture", e))?;
+        for row in 0..rows {
+            let source = if flip { rows - 1 - row } else { row };
+            let src = unsafe {
+                (mapped.pData as *const u8).add(source * mapped.RowPitch as usize)
+            };
             let bytes = unsafe { std::slice::from_raw_parts(src, row_bytes) };
-            self.rgba8[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(bytes);
-            self.color_scratch.extend(bytes.iter().map(|&b| f32::from(b) / 255.0));
+            let at = row * pitch;
+            out[at..at + row_bytes].copy_from_slice(bytes);
         }
-        unsafe { self.context.Unmap(&target.color_staging, 0) };
-        self.color_checksum = checksum_f32(&self.color_scratch);
-
-        unsafe { self.context.CopyResource(&target.depth_staging, &target.depth) };
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe {
-            self.context
-                .Map(&target.depth_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-        }
-        .map_err(|e| err("map depth staging texture", e))?;
-        let row_floats = mapped.RowPitch as usize / 4;
-        self.depth_scratch.clear();
-        self.depth_scratch.reserve(width * height);
-        for row in 0..height {
-            let src = unsafe { (mapped.pData as *const f32).add(row * row_floats) };
-            self.depth_scratch
-                .extend_from_slice(unsafe { std::slice::from_raw_parts(src, width) });
-        }
-        unsafe { self.context.Unmap(&target.depth_staging, 0) };
-        self.depth_checksum = checksum_f32(&self.depth_scratch);
+        unsafe { context.Unmap(&target.color_staging, 0) };
         Ok(())
     }
 
-    /// The presented image as tightly packed RGBA8, plus its checksum.
-    pub fn readback(&self, out: &mut [u8]) -> Result<u64> {
-        let (width, height) = self.frame_size();
-        let needed = (width as usize) * (height as usize) * 4;
-        if out.len() < needed {
+    /// (Re)lays tightly packed rows into a destination with a row pitch and
+    /// possibly a flip.
+    fn lay_out_rows(
+        out: &mut [u8],
+        src: &[u8],
+        rows: usize,
+        row_bytes: usize,
+        pitch: usize,
+        flip: bool,
+    ) {
+        for row in 0..rows {
+            let source = if flip { rows - 1 - row } else { row };
+            let at = row * pitch;
+            let from = source * row_bytes;
+            out[at..at + row_bytes].copy_from_slice(&src[from..from + row_bytes]);
+        }
+    }
+
+    /// Copies the frame's depth out of the driver into `out`, tightly packed,
+    /// `width * height` values.
+    ///
+    /// This is the one thing frame generation needs that a present does not: the
+    /// depth buffer, which tells the generator where each pixel's content sits in
+    /// space. It is a driver readback like the colour one, so it costs a copy - 
+    /// which is why nothing calls it unless a host asked for generated frames.
+    pub fn depth_into(&mut self, out: &mut [f32]) -> Result<()> {
+        let target = self
+            .color
+            .as_ref()
+            .ok_or_else(|| Error::new(Code::NotReady, "no frame has been prepared"))?;
+        let rows = target.height as usize;
+        let row_f32 = target.width as usize;
+        if out.len() < rows * row_f32 {
+            return Err(Error::new(Code::InvalidArgument, "the depth buffer is too small for the frame"));
+        }
+        unsafe {
+            self.context.CopyResource(&target.depth_staging, &target._depth);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context
+                .Map(&target.depth_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| err("map depth staging texture", e))?;
+            for row in 0..rows {
+                // SAFETY: the mapped region spans `RowPitch * height` bytes and
+                // holds one `f32` per pixel of the row.
+                let src = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize) as *const f32;
+                let dst = &mut out[row * row_f32..row * row_f32 + row_f32];
+                dst.copy_from_slice(core::slice::from_raw_parts(src, row_f32));
+            }
+            self.context.Unmap(&target.depth_staging, 0);
+        }
+        Ok(())
+    }
+
+    /// Reads the frame out of the driver into the tightly packed `rgba8`, the
+    /// form the checksum hashes. `frame_index` records which frame it holds.
+    fn capture(&mut self, frame_index: u64) -> Result<()> {
+        let Some(target) = self.color.as_ref() else {
+            return Ok(());
+        };
+        let row_bytes = target.width as usize * 4;
+        self.rgba8.resize(row_bytes * target.height as usize, 0);
+        Self::copy_target_rows(&self.context, target, &mut self.rgba8, row_bytes, false)?;
+        self.captured = Some(frame_index);
+        Ok(())
+    }
+
+    /// Writes the last rendered frame into the host's presentation buffer, in
+    /// the layout the present asked for: `pitch` is the destination's row length
+    /// in bytes, `flip` reverses the row order, and a zero pitch means tightly
+    /// packed.
+    ///
+    /// The frame is read out of the driver here, on the frame a host asks for
+    /// it, rather than on every submit - a host that renders to a swapchain never
+    /// pays for a readback it does not read - and it is laid straight into the
+    /// host's own buffer, so there is no tightly packed copy of the frame
+    /// between the driver's staging texture and the host.
+    pub fn read_frame_into(&mut self, out: &mut [u8], pitch: u32, flip: u32) -> Result<()> {
+        let Some(target) = self.color.as_ref() else {
+            return Err(Error::new(Code::NotReady, "no frame has been rendered"));
+        };
+        let rows = target.height as usize;
+        let row_bytes = target.width as usize * 4;
+        let pitch = if pitch == 0 { row_bytes } else { pitch as usize };
+        let needed = rows
+            .saturating_sub(1)
+            .saturating_mul(pitch)
+            .saturating_add(row_bytes);
+        if pitch < row_bytes || out.len() < needed {
             return Err(Error::new(Code::InvalidArgument, "readback buffer is too small"));
         }
-        if self.rgba8.len() < needed {
-            return Err(Error::new(Code::NotReady, "no frame has been rendered"));
+        if self.captured == Some(self.frame.frame_index) {
+            // An audit already read this frame out of the driver: those bytes are
+            // this frame's pixels, so laying them out is cheaper than asking the
+            // driver again for the same frame. `rgba8` is tightly packed, so its
+            // row stride is a row.
+            Self::lay_out_rows(out, &self.rgba8, rows, row_bytes, pitch, flip != 0);
+            return Ok(());
         }
-        out[..needed].copy_from_slice(&self.rgba8[..needed]);
-        Ok(self.color_checksum)
+        Self::copy_target_rows(&self.context, target, out, pitch, flip != 0)
     }
 
     /// Renders one frame. `prepare_frame` has already reserved the targets, so
@@ -1428,11 +1493,19 @@ impl D3d11Device {
                 );
             }
             self.context.OMSetRenderTargets(Some(&[Some(rtv)]), &dsv);
+            // The host's viewport, resolved against the target this tier
+            // actually renders into: a tier that renders at a fraction of the
+            // frame confines the same fraction, and `(0, 0)` - the documented
+            // default - is the whole target. D3D11 clips rasterisation to this
+            // rect, which is the same confinement the reference tier does by
+            // clamping its tiles, so the two tiers agree pixel for pixel.
+            let (view_w, view_h) =
+                rendered_viewport(input.viewport, (input.width, input.height), (width, height));
             self.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 TopLeftX: 0.0,
                 TopLeftY: 0.0,
-                Width: width as f32,
-                Height: height as f32,
+                Width: view_w as f32,
+                Height: view_h as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
@@ -1465,8 +1538,13 @@ impl D3d11Device {
         }
         let raster_ns = raster_start.elapsed().as_nanos() as u64;
 
-        // ---- readback + checksums -------------------------------------------
-        self.readback_target()?;
+        // ---- the frame's fingerprint, on the frames that asked for one -------
+        if input.checksum {
+            self.capture(input.frame_index)?;
+            self.color_checksum = checksum_bytes(&self.rgba8);
+        } else {
+            self.color_checksum = 0;
+        }
 
         self.shadows.cascades_rendered = cascades_rendered;
         self.shadows.shadow_pass_ns = shadow_ns;
@@ -1495,27 +1573,7 @@ impl D3d11Device {
             allocations_in_frame: 0,
         };
         self.frame = frame;
-
-        // The frame-time ladder. Telemetry only: it steps the tier and counts,
-        // it never changes a pixel.
         self.counters.frames_since_tier_change += 1;
-        let target_ns = u64::from(self.config.target_frame_ms) * 1_000_000;
-        if target_ns > 0 && frame.total_ns > target_ns {
-            self.frames_over_target += 1;
-            self.counters.frames_over_target += 1;
-            if self.config.over_target_frames_to_downgrade > 0
-                && self.frames_over_target >= self.config.over_target_frames_to_downgrade
-            {
-                self.step_down(
-                    TierReason::FrameTimeOverTarget,
-                    input.frame_index,
-                    "frame time over target",
-                );
-            }
-        } else {
-            self.frames_over_target = 0;
-        }
-
         Ok(frame)
     }
 

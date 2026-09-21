@@ -5,7 +5,7 @@
 //! `tests/abi_layout.rs`, which generates `_Static_assert`s from the Rust
 //! `size_of`/`offset_of` values and asks a real C compiler to compile them
 //! against the shipped header. If a field is added on one side, the C compiler
-//! fails and CI stops - which is the only way an ABI stays a contract.
+//! fails the test - which is the only way an ABI stays a contract.
 //!
 //! Rules mirrored from the header:
 //!   * every struct the library reads starts with `ReconLBase`
@@ -29,6 +29,13 @@ pub const RECONL_MAX_CASCADES: usize = 4;
 pub const RECONL_MAX_LIGHTS: usize = 64;
 pub const RECONL_MAX_TEXTURE_SLOTS: usize = 8;
 pub const RECONL_MAX_ATTACHMENTS: usize = 4;
+/// Published for a host sizing its own vertex layout table. The implementation
+/// supports one stream this release (a second is `RECONL_ERR_NOT_SUPPORTED`),
+/// so nothing reads this - the gate keeps the header's number pinned anyway.
+pub const RECONL_MAX_VERTEX_STREAMS: usize = 4;
+/// An upper bound a host may size caps snapshots against; no field of the API
+/// is an array of caps bits, so nothing reads this either.
+pub const RECONL_MAX_CAPS: usize = 32;
 pub const RECONL_MAX_NAME: usize = 64;
 pub const RECONL_MAX_MESSAGE: usize = 192;
 pub const RECONL_MAX_PATH: usize = 260;
@@ -88,8 +95,14 @@ pub mod struct_type {
     pub const LIGHT_LIST: u32 = 19;
     pub const ERROR_INFO: u32 = 20;
     pub const CAMERA: u32 = 21;
+    pub const FRAME_GEN: u32 = 22;
     pub const SOFTCPU_DESC: u32 = 64;
     pub const NULL_DESC: u32 = 65;
+    /// The three `ReconL*Desc` structs in `reconl_backends.h`. Reserved: this
+    /// revision accepts `ReconLDeviceDesc::backend_desc` and never reads it, so
+    /// the type ids exist for the header's catalogue and nothing dispatches on
+    /// them yet.
+    pub const D3D11_DESC: u32 = 66;
 }
 
 // ------------------------------------------------------------------ backend ids
@@ -135,6 +148,59 @@ pub mod caps {
     pub const SIMD_WASM128: u32 = 1 << 12;
     pub const COMPUTE: u32 = 1 << 13;
     pub const PRESENT_TO_MEMORY: u32 = 1 << 14;
+}
+
+// ------------------------------------------------- the enums a descriptor uses
+//
+// The header's remaining numeric enums. `format` and `index_format` are
+// load-bearing - the texture/swapchain gates and the indexed-draw gate test a
+// descriptor against exactly these names - while `buffer_usage`,
+// `texture_usage` and `frame_state` are recorded from the header and not read by
+// any code path: bits are stored, and the frame machine is a Rust enum with no
+// exchange with a host. The gate in `tests/abi_layout.rs` pins all of them.
+
+pub mod format {
+    pub const UNKNOWN: u32 = 0;
+    pub const R8G8B8A8_UNORM: u32 = 1;
+    pub const B8G8R8A8_UNORM: u32 = 2;
+    pub const R8G8B8A8_SRGB: u32 = 3;
+    pub const R32_FLOAT: u32 = 4;
+    pub const R32G32_FLOAT: u32 = 5;
+    pub const R32G32B32_FLOAT: u32 = 6;
+    pub const R32G32B32A32_FLOAT: u32 = 7;
+    pub const D32_FLOAT: u32 = 8;
+}
+
+pub mod buffer_usage {
+    pub const VERTEX: u32 = 1 << 0;
+    pub const INDEX: u32 = 1 << 1;
+    pub const UNIFORM: u32 = 1 << 2;
+    pub const UPLOAD: u32 = 1 << 3;
+    pub const READBACK: u32 = 1 << 4;
+    pub const STATIC: u32 = 1 << 5;
+    pub const DYNAMIC: u32 = 1 << 6;
+}
+
+pub mod texture_usage {
+    pub const SAMPLED: u32 = 1 << 0;
+    pub const RENDER_TARGET: u32 = 1 << 1;
+    pub const DEPTH_STENCIL: u32 = 1 << 2;
+    pub const SHADOW_MAP: u32 = 1 << 3;
+    pub const HOST_READBACK: u32 = 1 << 4;
+    pub const MIPMAPPED: u32 = 1 << 5;
+    pub const STATIC: u32 = 1 << 6;
+}
+
+pub mod index_format {
+    pub const UINT16: u32 = 0;
+    pub const UINT32: u32 = 1;
+}
+
+pub mod frame_state {
+    pub const IDLE: u32 = 0;
+    pub const OPEN: u32 = 1;
+    pub const SUBMITTED: u32 = 2;
+    pub const PRESENTED: u32 = 3;
 }
 
 // ------------------------------------------------------------------ allocator
@@ -490,6 +556,18 @@ pub struct ReconLStatsDesc {
     pub reserved: u32,
 }
 
+/// Frame generation, as a host sees it. Mirrors `ReconLFrameGenStats`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReconLFrameGenStats {
+    pub ready: u32,
+    pub generated: u32,
+    pub generated_ns: u64,
+    pub last_ahead: f32,
+    pub reserved: u32,
+    pub reserved2: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReconLStats {
@@ -513,6 +591,9 @@ pub struct ReconLStats {
     pub last_result: i32,
     pub tier_reason_text: [u8; RECONL_MAX_MESSAGE],
     pub device_name: [u8; RECONL_MAX_NAME],
+    /// Appended after `device_name`: the prefix this revision reads
+    /// unconditionally is everything above it.
+    pub framegen: ReconLFrameGenStats,
 }
 
 #[repr(C)]
@@ -578,6 +659,17 @@ pub struct ReconLCamera {
     pub reserved: f32,
 }
 
+/// Frame generation for one frame: `enabled` keeps the frame's pixels, depth
+/// and camera so a generated frame can be warped from it. Mirrors
+/// `ReconLFrameGenDesc` in the header.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReconLFrameGenDesc {
+    pub base: StructHeader,
+    pub enabled: u32,
+    pub reserved: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReconLFrameDesc {
@@ -589,8 +681,10 @@ pub struct ReconLFrameDesc {
     pub lights: *const ReconLLightList,
     pub shadows: *const ReconLShadowConfig,
     /// The frame camera, or null for the identity view and default frustum.
-    /// This is the extension region: see the `ABIStruct` impl below.
     pub camera: *const ReconLCamera,
+    /// Frame generation for this frame, or null. This is the end of the
+    /// extension region: see the `ABIStruct` impl below.
+    pub framegen: *const ReconLFrameGenDesc,
 }
 
 #[repr(C)]
@@ -632,11 +726,30 @@ abi_struct!(ReconLRenderPassDesc, struct_type::RENDER_PASS_DESC);
 abi_struct!(ReconLSwapchainDesc, struct_type::SWAPCHAIN_DESC);
 abi_struct!(ReconLPresentDesc, struct_type::PRESENT_DESC);
 abi_struct!(ReconLShadowConfig, struct_type::SHADOW_CONFIG);
-abi_struct!(ReconLStats, struct_type::STATS);
+/// `ReconLStats` grew a trailing `framegen` block, so the bytes every revision
+/// has carried stop before it. A host compiled against the previous header
+/// declares exactly that prefix, which is what makes the new counters an
+/// addition rather than a break - and what `reconlGetStats` writes no more of
+/// than the caller declared.
+impl ABIStruct for ReconLStats {
+    const STRUCT_TYPE: u32 = struct_type::STATS;
+    const MIN_SIZE: u32 = Self::PREFIX_SIZE;
+}
+
+impl ReconLStats {
+    pub const PREFIX_SIZE: u32 =
+        (core::mem::size_of::<Self>() - core::mem::size_of::<ReconLFrameGenStats>()) as u32;
+
+    /// Whether the caller's struct reaches the `framegen` block.
+    pub fn has_framegen(&self) -> bool {
+        self.base.struct_size >= core::mem::size_of::<Self>() as u32
+    }
+}
 abi_struct!(ReconLLight, struct_type::LIGHT);
 abi_struct!(ReconLLightList, struct_type::LIGHT_LIST);
 abi_struct!(ReconLErrorInfo, struct_type::ERROR_INFO);
 abi_struct!(ReconLCamera, struct_type::CAMERA);
+abi_struct!(ReconLFrameGenDesc, struct_type::FRAME_GEN);
 abi_struct!(ReconLStatsDesc, struct_type::STATS);
 
 /// `ReconLFrameDesc` grew a trailing `camera` field, so its prefix - the part
@@ -651,11 +764,21 @@ impl ABIStruct for ReconLFrameDesc {
 
 impl ReconLFrameDesc {
     /// The bytes every revision has carried: up to and including `shadows`.
-    pub const PREFIX_SIZE: u32 =
-        (core::mem::size_of::<Self>() - core::mem::size_of::<*const ReconLCamera>()) as u32;
+    const PTR: u32 = core::mem::size_of::<*const ReconLCamera>() as u32;
+    pub const PREFIX_SIZE: u32 = core::mem::size_of::<Self>() as u32 - 2 * Self::PTR;
+    /// The bytes a caller that stops after `camera` declares. That was the whole
+    /// struct before `framegen` was appended, so it is the threshold at which
+    /// `camera` must still be read: a host compiled against the previous header
+    /// is not silently read as having no camera.
+    pub const CAMERA_SIZE: u32 = core::mem::size_of::<Self>() as u32 - Self::PTR;
 
     /// Whether the caller's struct reaches the `camera` field.
     pub fn has_camera(&self) -> bool {
+        self.base.struct_size >= Self::CAMERA_SIZE
+    }
+
+    /// Whether the caller's struct reaches the `framegen` field.
+    pub fn has_framegen(&self) -> bool {
         self.base.struct_size >= core::mem::size_of::<Self>() as u32
     }
 }

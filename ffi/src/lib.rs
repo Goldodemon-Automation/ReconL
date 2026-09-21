@@ -1,24 +1,41 @@
-//! `reconl`: the C ABI surface. Everything a host can call lives here, and
-//! nothing that a host can call lives anywhere else.
+//! `reconl`: the C ABI surface. Everything a host can call lives in this crate,
+//! and nothing a host can call lives outside it.
 //!
-//! Structure of the crate, in the order a call flows through it:
+//! # Where things live
 //!
-//! 1. [`abi`] - the `#[repr(C)]` mirror of `include/reconl/reconl.h`.
-//! 2. `sizing` - what a descriptor costs, from the descriptor alone. Pure
-//!    arithmetic, so the price of a request is decided and tested before any
-//!    budget or allocator is involved.
-//! 3. handles - every object is a ref-counted, host-allocated block that begins
-//!    with [`HandleHeader`]. `reconlRetain`/`reconlRelease` work on `void*` and
-//!    read that header, so any handle can be passed to them and a handle of the
-//!    wrong kind is caught rather than misread.
-//! 4. the device - owns the budget, the tier, the stats, and exactly one of the
-//!    two milestone-1 backends.
-//! 5. entry points - thin: validate, translate, delegate, record. No policy of
-//!    their own, because policy that lives in the binding surface cannot be
-//!    tested from Rust: they ask `sizing` what a request costs and `Budget`
-//!    whether it is affordable, then hand it to the backend.
+//! Each C-visible concern has one home, and the home is where the *rules* are,
+//! not where the wrappers are:
+//!
+//! | module | owns |
+//! |---|---|
+//! | [`abi`] | the `#[repr(C)]` mirror of `include/reconl/reconl.h` |
+//! | `sizing` | what a descriptor costs, from the descriptor alone |
+//! | `handle` | the object model: kinds, headers, child handles, and the ref-counted lifetime `reconlRetain`/`reconlRelease` drive |
+//! | `entry` | the boundary glue every entry point uses: the failed-call frame guard, the panic boundary, the entry macros |
+//! | `offload` | the tier policy - why this device is on the tier it is on - and the backend rebuilds every decision needs |
+//! | `layout` | how bytes move between a host's buffer and a frame or a texture |
+//! | `order` | the order each frame call considers its refusals in: one table per entry point, one function per question, one runner |
+//! | `version` | version numbers, the name tables, the log controls |
+//! | this file | the device's own state, and the entry points over it: device, resources, commands, frame, submit, present, stats |
+//!
+//! The table is the shape a change should follow. A rule about when a device
+//! leaves the hardware belongs in `offload`; a rule about a host pitch belongs in
+//! `layout`; a rule about what a handle is belongs in `handle`. Anything a host
+//! sees is still reached through this file's entry points, which validate,
+//! translate, delegate and record - no policy of their own, because policy that
+//! lives in the binding surface cannot be tested from Rust.
+//!
+//! Still to draw, in no particular order, because the sections below are
+//! interleaved inside their entry points rather than stacked: the device's state
+//! (`BackendKind`, `FrameRecord`, `DeviceHandle`, ...) is a `device` module's
+//! subject, and `resources`, `command`, `frame`, `submit`, `present`, `stats`,
+//! `probe` and `config` are each currently a banner in this file rather than a
+//! file of their own.
 //!
 //! ## Panics
+//!
+//! The rules live in modules so they can be read one at a time; what a host
+//! calls is here so there is exactly one place to look for a signature.
 //!
 //! The release profile is `panic = "abort"`, so there is nothing to unwind
 //! across the boundary in a shipped build. In a `panic = "unwind"` build (tests,
@@ -31,24 +48,45 @@
 #![allow(clippy::missing_safety_doc)]
 
 pub mod abi;
+mod entry;
+mod handle;
+mod layout;
+mod offload;
+mod order;
 mod sizing;
+mod version;
+
+use crate::entry::{child, cstr, device_mut, entry, guarded_entry};
+use crate::layout::{host_row_layout, lay_out_rows};
+use crate::offload::Offload;
+use crate::handle::{check_handle, handle_new, header_of, impl_handle};
+
+// Re-exported so the Rust paths a host, a tool or a test already used - the
+// handle types, `reconlRetain`/`reconlRelease`, the name tables and the log
+// controls - keep resolving after the move into modules.
+pub use handle::{
+    reconlRelease, reconlRetain, BufferHandle, FenceHandle, Handle, HandleHeader, Kind, PipelineHandle,
+    SwapchainHandle, TextureHandle,
+};
+pub use version::*;
 
 use abi::*;
 use reconl_backend_d3d11::{D3d11Config, D3d11Device};
 use reconl_backend_null::{NullConfig, NullDevice};
-use reconl_backend_softcpu::{FrameInput, SoftCpuConfig, SoftCpuDevice};
+use reconl_backend_softcpu::{SoftCpuConfig, SoftCpuDevice};
+use reconl_contract::{FrameInput, ShadowRequest};
 use reconl_core::alloc::{host_stats, HostAlloc, HostAllocatorA, HostVec};
 use reconl_core::budget::{Budget, BudgetCaps, Reservation};
 use reconl_core::error::{Code, Error, Result};
-use reconl_core::log::{self, Level};
 use reconl_core::{err, log_info, log_warn};
 use reconl_core::stats::{Counters, Downgrade, DowngradeLog, FrameNumbers, ShadowCounters, Stats};
-use reconl_core::tier::{shadow_plan, ShadowFilter, Tier, TierReason, TIER_COUNT};
+use reconl_core::tier::{shadow_plan, FrameLadder, ShadowFilter, Tier, TierReason};
 use reconl_core::{check_header, Text};
 
 // Re-exported for hosts and tools that build ABI structs: `ABIStruct` carries
 // the `struct_size`/type constants `check_header` validates against.
 pub use reconl_core::{ABIStruct, StructHeader};
+use reconl_raster::framegen::{self, Camera as FrameCamera, History as FrameHistory};
 use reconl_raster::math::{self, Mat4, Vec3, IDENTITY};
 use reconl_raster::shade::{Light, LightSet, SurfaceShader};
 use reconl_raster::{DrawItem, PipelineState, ShaderRef, Vertex, COMPARE_GREATER, CULL_BACK, MAX_TEXTURE_SLOTS};
@@ -56,204 +94,9 @@ use reconl_resource::mips::generate_mip_chain;
 use reconl_scene::WorldRevision;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
-
-// ------------------------------------------------------------------ handles
-
-#[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    Device = 1,
-    Buffer = 2,
-    Texture = 3,
-    Pipeline = 4,
-    Swapchain = 5,
-    CommandList = 6,
-    Fence = 7,
-}
-
-impl Kind {
-    fn name(self) -> &'static str {
-        match self {
-            Kind::Device => "device",
-            Kind::Buffer => "buffer",
-            Kind::Texture => "texture",
-            Kind::Pipeline => "pipeline",
-            Kind::Swapchain => "swapchain",
-            Kind::CommandList => "command list",
-            Kind::Fence => "fence",
-        }
-    }
-}
-
-/// First member of every handle. `void*`-typed ABI calls (`reconlRetain`,
-/// `reconlRelease`) read this to find out what they were handed.
-#[repr(C)]
-pub struct HandleHeader {
-    pub kind: u32,
-    /// 1 for a live handle. The device holds one implicit reference per live
-    /// child, so a child outliving the host's device reference keeps the device
-    /// alive rather than dangling.
-    pub refcount: AtomicU32,
-    pub device: *mut DeviceHandle,
-}
-
-/// Anything with a [`HandleHeader`] first.
-pub unsafe trait Handle {
-    fn header(&self) -> &HandleHeader;
-    fn kind() -> Kind;
-}
-
-macro_rules! impl_handle {
-    ($t:ty, $kind:expr) => {
-        unsafe impl Handle for $t {
-            fn header(&self) -> &HandleHeader {
-                &self.header
-            }
-            fn kind() -> Kind {
-                $kind
-            }
-        }
-    };
-}
-
-/// Allocates a handle with the host allocator. ReconL never uses the Rust global
-/// allocator for objects the host owns.
-unsafe fn handle_new<T: Handle>(alloc: HostAlloc, value: T) -> *mut T {
-    match unsafe { alloc.alloc_bytes(core::mem::size_of::<T>(), core::mem::align_of::<T>().max(16)) } {
-        Ok(p) => {
-            let ptr = p.as_ptr() as *mut T;
-            unsafe { ptr.write(value) };
-            ptr
-        }
-        Err(_) => core::ptr::null_mut(),
-    }
-}
-
-unsafe fn handle_free<T: Handle>(alloc: HostAlloc, ptr: *mut T) {
-    if ptr.is_null() {
-        return;
-    }
-    let bytes = core::mem::size_of::<T>();
-    unsafe { core::ptr::drop_in_place(ptr) };
-    let nonnull = unsafe { core::ptr::NonNull::new_unchecked(ptr as *mut u8) };
-    unsafe { alloc.free_bytes(nonnull, bytes, core::mem::align_of::<T>().max(16)) };
-}
-
-/// Validates a handle pointer of a known kind and returns its header.
-unsafe fn check_handle(ptr: *mut c_void, expected: Kind, what: &str) -> Result<*mut HandleHeader> {
-    if ptr.is_null() {
-        return err!(Code::InvalidArgument, "null {} handle", what);
-    }
-    let header = ptr as *mut HandleHeader;
-    // SAFETY: every handle this library hands out begins with a HandleHeader.
-    let kind = unsafe { (*header).kind };
-    if kind != expected as u32 {
-        return err!(
-            Code::InvalidHandle,
-            "{} handle was passed where a {} was expected",
-            Kind::from_u32(kind).name(),
-            what
-        );
-    }
-    Ok(header)
-}
-
-impl Kind {
-    fn from_u32(v: u32) -> Kind {
-        match v {
-            1 => Kind::Device,
-            2 => Kind::Buffer,
-            3 => Kind::Texture,
-            4 => Kind::Pipeline,
-            5 => Kind::Swapchain,
-            6 => Kind::CommandList,
-            7 => Kind::Fence,
-            _ => Kind::Device,
-        }
-    }
-}
-
-// -------------------------------------------------------------- child handles
-
-#[repr(C)]
-pub struct BufferHandle {
-    header: HandleHeader,
-    bytes: HostVec<u8>,
-    /// Held for the buffer's lifetime, so its bytes stay counted against the
-    /// device budget until the host releases it.
-    ram: Reservation,
-    usage: u32,
-    name: Text<64>,
-}
-impl_handle!(BufferHandle, Kind::Buffer);
-
-#[repr(C)]
-pub struct TextureHandle {
-    header: HandleHeader,
-    width: u32,
-    height: u32,
-    format: u32,
-    usage: u32,
-    /// RGBA8 mip chain, tightly packed.
-    levels: HostVec<HostVec<u8>>,
-    level_sizes: HostVec<(u32, u32)>,
-    /// The whole chain's bytes, counted against the device budget for as long
-    /// as the texture lives.
-    ram: Reservation,
-    name: Text<64>,
-}
-impl_handle!(TextureHandle, Kind::Texture);
-
-impl TextureHandle {
-    fn mip_count(&self) -> u32 {
-        self.levels.len() as u32
-    }
-
-    fn level_bytes(&self) -> u64 {
-        let mut total = 0u64;
-        for level in self.levels.iter() {
-            total += level.len() as u64;
-        }
-        total
-    }
-}
-
-#[repr(C)]
-pub struct PipelineHandle {
-    header: HandleHeader,
-    shading: u32,
-    blend: u32,
-    cull: u32,
-    depth_compare: u32,
-    depth_write: bool,
-    texture_slots: u32,
-    receives_shadow: bool,
-    casts_shadow: bool,
-    two_sided_shadow: bool,
-    name: Text<64>,
-}
-impl_handle!(PipelineHandle, Kind::Pipeline);
-
-#[repr(C)]
-pub struct SwapchainHandle {
-    header: HandleHeader,
-    width: u32,
-    height: u32,
-    format: u32,
-    present_to_memory: bool,
-    depth: bool,
-}
-impl_handle!(SwapchainHandle, Kind::Swapchain);
-
-#[repr(C)]
-pub struct FenceHandle {
-    header: HandleHeader,
-    signaled: bool,
-    frame_index: u64,
-}
-impl_handle!(FenceHandle, Kind::Fence);
+use std::time::Instant;
 
 // ------------------------------------------------------------------ commands
 
@@ -320,7 +163,7 @@ pub struct CommandListHandle {
 }
 impl_handle!(CommandListHandle, Kind::CommandList);
 
-/// The documented push-constant slots (docs/abi.md).
+/// The documented push-constant slots (`include/reconl/reconl.h`).
 pub const PUSH_CONSTANT_VIEW_PROJ: u32 = 0;
 pub const PUSH_CONSTANT_MODEL: u32 = 1;
 
@@ -332,6 +175,51 @@ enum BackendKind {
     Null(Box<NullDevice>),
 }
 
+impl BackendKind {
+    /// The frame's size, whichever backend owns the device.
+    fn frame_size(&self) -> (u32, u32) {
+        match self {
+            BackendKind::SoftCpu(d) => d.frame_size(),
+            BackendKind::D3d11(d) => d.frame_size(),
+            // A null frame is not read: nothing was rasterised and there is no
+            // depth, which `can_generate` reports before any of this is reached.
+            BackendKind::Null(_) => (0, 0),
+        }
+    }
+
+    /// Whether this backend renders frames a generated one can be warped from:
+    /// pixels out of a rasteriser, and a depth buffer saying where in space each
+    /// pixel's content sits.
+    fn can_generate(&self) -> bool {
+        matches!(self, BackendKind::SoftCpu(_) | BackendKind::D3d11(_))
+    }
+
+    /// Reads the frame's pixels out of the backend, tightly packed, into the
+    /// caller's buffer. `row_bytes` is the destination's row length.
+    fn read_frame_tight(&mut self, out: &mut [u8], row_bytes: u32) -> Result<()> {
+        match self {
+            BackendKind::SoftCpu(d) => d.read_frame_into(out, row_bytes, 0),
+            BackendKind::D3d11(d) => d.read_frame_into(out, row_bytes, 0),
+            BackendKind::Null(_) => Err(Error::new(
+                Code::NotSupported,
+                "the null backend renders nothing to generate frames from",
+            )),
+        }
+    }
+
+    /// Copies the frame's depth out of the backend, tightly packed.
+    fn depth_into(&mut self, out: &mut [f32]) -> Result<()> {
+        match self {
+            BackendKind::SoftCpu(d) => d.depth_into(out),
+            BackendKind::D3d11(d) => d.depth_into(out),
+            BackendKind::Null(_) => Err(Error::new(
+                Code::NotSupported,
+                "the null backend has no depth to reproject",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FrameState {
     Idle,
@@ -339,32 +227,14 @@ enum FrameState {
     Submitted,
 }
 
-/// A draw the frame can be re-created from.
-///
-/// The raw pointers are into buffers the device owns; a buffer cannot be
-/// destroyed while its device lives, and the audit re-render happens inside the
-/// device, so they stay valid for as long as this record does.
-#[derive(Clone, Copy)]
-struct DrawRecord {
-    vertices: *const Vertex,
-    vertex_count: u32,
-    indices: *const u32,
-    index_count: u32,
-    transform: Mat4,
-    model: Mat4,
-    pipeline: PipelineState,
-    shading: u32,
-    textured: bool,
-    lit: bool,
-    receives_shadow: bool,
-    dynamic: bool,
-    casts_shadow: bool,
-}
-
 struct FrameRecord {
     index: u64,
     width: u32,
     height: u32,
+    /// The frame's viewport in frame pixels, `(0, 0)` until a pass asks for one.
+    /// Recorded from `BeginPass` and carried into the backend as
+    /// [`FrameInput::viewport`], which is what confines the colour pass.
+    viewport: (u32, u32),
     camera_view: Mat4,
     fov_y_deg: f32,
     aspect: f32,
@@ -373,19 +243,37 @@ struct FrameRecord {
     light_dir: Vec3,
     light_hash: u64,
     lights: LightSet,
-    shadow: reconl_backend_softcpu::ShadowRequest,
+    shadow: ShadowRequest,
     clear_color: [f32; 4],
     clear_depth: f32,
     clear_color_on: bool,
     clear_depth_on: bool,
-    draws: HostVec<DrawRecord>,
+    /// The frame's draws, as a backend reads them: one entry per recorded draw,
+    /// built here, where the bound checks that justify each slice are.
+    ///
+    /// What an entry points at is the *host's* buffer storage, not this
+    /// library's: a handle's bytes are freed when its last reference is released,
+    /// so the host owns keeping them alive while the frame is in use - which the
+    /// test rigs do by releasing a frame's buffers once it is submitted.
+    ///
+    /// The storage of the *list* is the device's, not the frame's: `reset`
+    /// clears it between frames instead of dropping it, so a steady-state frame
+    /// writes into the list the frame before it already had.
+    items: HostVec<DrawItem<'static>>,
+    /// Blocks this frame's own draw list took from the allocator, counted where
+    /// the list grows and folded into the composed frame numbers - so the
+    /// library's `allocations_in_frame` covers every list the frame owns, not
+    /// only the backend's, and agrees with a host's own ledger.
+    items_grown: u32,
     checksum: u64,
-    depth_checksum: u64,
     triangles: u64,
     /// World revisions captured at `BeginFrame`, so the cascade cache key the
     /// backend sees is the one the scene layer published for this frame.
     world_revision: u64,
     static_revision: u64,
+    /// Whether the frame asked for its pixels, depth and camera to be kept so
+    /// generated frames can be warped forward from it.
+    framegen: bool,
 }
 
 impl FrameRecord {
@@ -400,6 +288,7 @@ impl FrameRecord {
             index: 0,
             width: 0,
             height: 0,
+            viewport: (0, 0),
             camera_view: IDENTITY,
             fov_y_deg: 60.0,
             aspect: 1.0,
@@ -408,19 +297,50 @@ impl FrameRecord {
             light_dir: [0.0, -1.0, 0.0],
             light_hash: 0,
             lights: LightSet::new(),
-            shadow: reconl_backend_softcpu::ShadowRequest::default(),
+            shadow: ShadowRequest::default(),
             clear_color: [0.0, 0.0, 0.0, 1.0],
             clear_depth: 0.0,
             clear_color_on: true,
             clear_depth_on: true,
-            draws: HostVec::new(alloc),
+            items: HostVec::new(alloc),
+            items_grown: 0,
             checksum: 0,
-            depth_checksum: 0,
             triangles: 0,
             world_revision: 1,
             static_revision: 1,
+            framegen: false,
         }
     }
+
+    /// Resets the record for the next frame, keeping the draw storage.
+    ///
+    /// `FrameRecord::new` per frame is what made every submit take a fresh draw
+    /// list from the host allocator: the capacity the last frame's list had
+    /// grown was dropped along with the record. Resetting keeps the storage and
+    /// clears it, so the list a frame needs is the list the frame before it
+    /// already had - and a steady state whose command lists do not grow takes
+    /// nothing from the allocator at all.
+    fn reset(&mut self) {
+        let alloc = self.items.alloc();
+        let mut items = core::mem::replace(&mut self.items, HostVec::new(alloc));
+        items.clear();
+        *self = FrameRecord::new(alloc);
+        self.items = items;
+    }
+}
+
+/// The readback half of one presented frame.
+///
+/// A readback belongs to the frame it was measured on, which is why the frame's
+/// identity is kept with it: a present that changed the backend would otherwise
+/// charge one device's readback to the next device's frame record, which has
+/// not rendered anything.
+#[derive(Clone, Copy)]
+struct Readback {
+    /// The backend that rendered the frame the readback hands over.
+    backend: u32,
+    frame_index: u64,
+    ns: u64,
 }
 
 #[repr(C)]
@@ -437,10 +357,24 @@ pub struct DeviceHandle {
     driver: Text<64>,
     stats: Stats,
     last_error: Option<Error>,
+    /// The readback half of the frame that was last presented. Cleared when a
+    /// frame opens, and folded in by `frame_cost` - its only reader - for the
+    /// frame it names and no other.
+    readback: Option<Readback>,
+    /// The one frame-time ladder this device runs (`docs/offload.md`). Both
+    /// layers that act on the tier - the device's own relabel and the host-level
+    /// offload - answer "was this frame over target?" from this one run, so a
+    /// change of threshold or target lands in one place.
+    ladder: FrameLadder,
+    /// Every tier change this device has made, in the order it happened: the
+    /// offloads and returns that changed the backend, the relabels that changed
+    /// the tier a backend renders at, and the host's own tier requests. One log,
+    /// because a backend's own ring died with the backend while the tier it
+    /// changed did not.
+    downgrades: DowngradeLog,
     frame_state: FrameState,
     frame: FrameRecord,
-    shadow: reconl_backend_softcpu::ShadowRequest,
-    null_downgrades: DowngradeLog,
+    shadow: ShadowRequest,
     audit_every_frames: u32,
     world: WorldRevision,
     spill_dir: Option<PathBuf>,
@@ -449,12 +383,14 @@ pub struct DeviceHandle {
     /// (docs/offload.md).
     origin: Origin,
     offload: Offload,
-    /// The device's own record of backend changes. A backend's downgrade log
-    /// cannot hold these: the backend that recorded one may no longer exist.
-    offload_log: DowngradeLog,
     /// `desc.allow_downgrade`, which is what makes `RECONL_DOWNGRADE_TIER` the
     /// host's opt-out from the offload.
     allow_downgrade: u32,
+    /// Frame generation: the newest presented frame's pixels, depth and camera,
+    /// plus the camera before it. Empty, and untouched, unless a frame asked for
+    /// generation - which is what keeps the feature off the path of every host
+    /// that does not use it.
+    framegen: FrameGen,
 }
 impl_handle!(DeviceHandle, Kind::Device);
 
@@ -473,65 +409,69 @@ struct Origin {
     cpu: SoftCpuConfig,
 }
 
-/// What a measured tier comparison is filed under.
+/// Frame generation's retained history, owned by the device (not a backend):
+/// what a generated frame is warped from is the image the *host* was handed, and
+/// that boundary is the FFI's.
 ///
-/// A comparison is only valid for the frame it was measured on: resolution and
-/// the shadow plan (which is per frame, from `ReconLShadowConfig`) both change
-/// what a tier costs. Filing the result under both is what makes it expire when
-/// either changes, with no invalidation logic to get wrong.
-type PlanKey = (u32, u32, u32, u32, u64);
-
-fn plan_key(width: u32, height: u32, shadow: &reconl_backend_softcpu::ShadowRequest) -> PlanKey {
-    (width, height, shadow.cascades, shadow.filter as u32, shadow.texel_budget_bytes)
+/// Every field is empty until a frame asks for generation. `ready` is what makes
+/// a call to `reconlPresentGenerated` meaningful: it is set by a present of a
+/// frame that asked, and cleared by one that did not, so the history can never be
+/// older than the last thing the host saw.
+struct FrameGen {
+    /// The newest presented frame, tightly packed RGBA8.
+    color: HostVec<u8>,
+    /// Its depth, `width * height` NDC values.
+    depth: HostVec<f32>,
+    /// The generated image being handed over: a generated frame is warped into
+    /// here and then laid into whatever layout the caller asked for, so the warp
+    /// runs once per generated frame however the host wants the bytes.
+    image: HostVec<u8>,
+    width: u32,
+    height: u32,
+    /// The camera of the newest frame, and of the one before it: the pair is the
+    /// motion a generated frame extrapolates.
+    cur: Option<FrameCamera>,
+    prev: Option<FrameCamera>,
+    ready: bool,
+    /// Bytes reserved against the device budget for the three buffers above.
+    reservation: Option<Reservation>,
+    /// The counters a host reads back: kept here rather than in `Stats` because
+    /// this is the state they describe, and a second copy is a second thing to
+    /// keep in step.
+    generated: u32,
+    generated_ns: u64,
+    last_ahead: f32,
 }
 
-/// The offload state (docs/offload.md): measured, then remembered.
-///
-/// Nothing here is a guess. The comparison that decides whether an overload is
-/// worth offloading is the reference tier's own measured frame cost against the
-/// hardware's, at one plan, taken from the first frame the reference tier
-/// rendered - which is why the calibration costs no extra frame.
-struct Offload {
-    /// Where the reference tier's cost was measured, and whether it lost there.
-    /// `measured_key` is `None` until a calibration has run, so an unmeasured
-    /// device never trades its hardware for the CPU. The cost itself is in the
-    /// downgrade entry's detail, which is where a host reads it.
-    measured_key: Option<PlanKey>,
-    /// The reference tier measured slower than the hardware at `measured_key`.
-    /// The question is settled there and the offload is not attempted again.
-    cpu_lost: bool,
-    /// A return trip to the hardware was made at this key. One per key: a
-    /// workload that oscillates must not thrash between tiers, and "the hardware
-    /// was tried again and missed" is what "this frame does not fit the GPU"
-    /// means. It also means the CPU's cost here is known, so a second offload at
-    /// this key needs no calibration.
-    returned_key: Option<PlanKey>,
-    /// Consecutive frames over the hardware's target, and inside it while
-    /// offloaded. One threshold drives the ladder in both directions.
-    over_target: u32,
-    within_target: u32,
-    /// The first offloaded frame is also the calibration, so its cost is
-    /// compared before the decision to stay stands.
-    calibrating: bool,
-    /// The hardware cost the calibration is compared against.
-    gpu_ns: u64,
-    /// Hardware faults this device has seen. A rebuilt backend that faults too
-    /// is not returned to, so a broken driver cannot start a rebuild loop.
-    faults: u32,
-}
-
-impl Offload {
-    const fn new() -> Self {
+impl FrameGen {
+    /// The history is allocated by the host's own allocator, like every other
+    /// buffer a device owns: a host that tracks its memory sees these bytes, and
+    /// one that supplies an arena gets them from it.
+    fn new(alloc: HostAlloc) -> Self {
         Self {
-            measured_key: None,
-            cpu_lost: false,
-            returned_key: None,
-            over_target: 0,
-            within_target: 0,
-            calibrating: false,
-            gpu_ns: 0,
-            faults: 0,
+            color: HostVec::new(alloc),
+            depth: HostVec::new(alloc),
+            image: HostVec::new(alloc),
+            width: 0,
+            height: 0,
+            cur: None,
+            prev: None,
+            ready: false,
+            reservation: None,
+            generated: 0,
+            generated_ns: 0,
+            last_ahead: 0.0,
         }
+    }
+
+    /// Zeroes the counters and nothing else: what has been generated is a
+    /// measurement, and `reconlResetStats` restarts measurements. The retained
+    /// frame is not a measurement - it is what a host is still looking at, and a
+    /// host that resets its counters mid-session can keep generating from it.
+    fn reset_counters(&mut self) {
+        self.generated = 0;
+        self.generated_ns = 0;
+        self.last_ahead = 0.0;
     }
 }
 
@@ -584,6 +524,29 @@ impl DeviceHandle {
         }
     }
 
+    /// What the last frame cost, from one place.
+    ///
+    /// A frame is not over when the device stops drawing it: on a swapchain that
+    /// presents to memory the host does not have the frame until the device has
+    /// copied it out, and the host waits for that copy. A backend reports only
+    /// its own frame time, so the boundary that made the host wait folds the
+    /// readback in here - once, for every tier, which is what gives "what a
+    /// frame cost" one definition rather than one per backend. A frame with no
+    /// device pixels to read back contributes none, and a readback is folded
+    /// into the frame it was measured on - the same backend, the same frame -
+    /// so a present that changed the backend cannot charge one device's
+    /// readback to another device's record.
+    fn frame_cost(&self) -> FrameNumbers {
+        let mut frame = self.frame_numbers();
+        frame.allocations_in_frame += self.frame.items_grown;
+        if let Some(readback) = self.readback {
+            if readback.backend == self.backend_id() && readback.frame_index == frame.frame_index {
+                frame.total_ns = frame.total_ns.saturating_add(readback.ns);
+            }
+        }
+        frame
+    }
+
     fn softcpu(&self) -> Option<&SoftCpuDevice> {
         match &self.backend {
             BackendKind::SoftCpu(d) => Some(d),
@@ -598,573 +561,6 @@ impl DeviceHandle {
         }
     }
 
-    /// Every downgrade the device knows about: the ones it made itself (a
-    /// backend change) followed by the current backend's own ladder.
-    fn downgrade_entries(&self) -> Vec<Downgrade> {
-        let mut entries: Vec<Downgrade> = self.offload_log.iter().copied().collect();
-        entries.extend(match &self.backend {
-            BackendKind::SoftCpu(d) => d.downgrades().iter().copied().collect::<Vec<_>>(),
-            BackendKind::D3d11(d) => d.downgrades().iter().copied().collect::<Vec<_>>(),
-            BackendKind::Null(_) => self.null_downgrades.iter().copied().collect::<Vec<_>>(),
-        });
-        entries
-    }
-
-    /// Whether this device may continue its frames on the reference tier.
-    ///
-    /// Three things have to hold: the host left `RECONL_DOWNGRADE_TIER` set, the
-    /// device was built with a hardware backend, and the hardware config to come
-    /// back to exists.
-    fn may_offload(&self) -> bool {
-        (self.allow_downgrade & allow_downgrade::TIER) != 0
-            && self.origin.gpu.is_some()
-            && self.backend_id() == backend::D3D11
-    }
-
-    /// Whether this device is currently rendering on the reference tier because
-    /// it offloaded there, as opposed to having been created there.
-    fn offloaded(&self) -> bool {
-        self.origin.gpu.is_some() && self.backend_id() == backend::SOFT_CPU
-    }
-
-    /// Builds the reference-tier backend an offload renders on.
-    fn build_cpu_backend(&self) -> Result<SoftCpuDevice> {
-        let mut config = self.origin.cpu.clone();
-        // The ladder's own step: a hardware tier lands on T2, because a GPU that
-        // cannot serve a frame cannot serve a higher CPU tier either.
-        config.tier = if self.tier >= Tier::CpuRam { self.tier } else { Tier::CpuRam };
-        SoftCpuDevice::new(self.alloc, Arc::clone(&self.budget), config)
-    }
-
-    /// Rebuilds the hardware backend a return trip goes back to.
-    fn build_gpu_backend(&self) -> Result<D3d11Device> {
-        let config = self.origin.gpu.clone().ok_or_else(|| {
-            Error::new(Code::BackendUnavailable, "this device has no hardware backend to return to")
-        })?;
-        D3d11Device::new(self.alloc, Arc::clone(&self.budget), config)
-    }
-
-    /// Adopts `backend` as the renderer, with the bookkeeping a host reads: the
-    /// tier, the caps, the names, the counter that says the safe path was taken,
-    /// and one downgrade entry carrying the reason.
-    fn adopt_backend(&mut self, backend: BackendKind, reason: TierReason, frame_index: u64, detail: &str) {
-        let from = self.tier;
-        let (to, caps, name, driver, id) = match &backend {
-            BackendKind::SoftCpu(d) => (d.tier(), d.caps(), d.device_name(), d.driver(), backend::SOFT_CPU),
-            BackendKind::D3d11(d) => (d.tier(), d.caps(), d.device_name(), d.driver(), backend::D3D11),
-            BackendKind::Null(d) => (d.tier(), d.caps(), d.device_name(), d.driver(), backend::NULL),
-        };
-        self.backend = backend;
-        self.tier = to;
-        self.tier_reason = reason;
-        self.caps = caps;
-        self.device_name.set(name);
-        self.driver.set(driver);
-        self.stats.backend = id;
-        self.stats.caps = caps;
-        self.stats.tier = to;
-        self.stats.tier_reason = reason;
-        self.stats.tier_reason_text.set(reason.text());
-        self.stats.device_name.set(name);
-        self.stats.counters.safe_path_events += 1;
-        self.stats.counters.frames_since_tier_change = 0;
-        self.offload_log.record(Downgrade::new(from, to, reason, frame_index, 0, detail));
-        log_warn!(
-            "now rendering on {} at tier {} ({}): {}",
-            reconl_core::tier::Backend::from_u32(id).name(),
-            to.name(),
-            reason.text(),
-            detail
-        );
-    }
-
-    /// Hands the frames to the reference tier after a hardware fault.
-    ///
-    /// No comparison here: a device that has been removed is not a slow device,
-    /// so the reference tier is faster by definition and the calibration would
-    /// be measuring nothing.
-    fn offload_on_fault(&mut self, frame_index: u64, detail: &str) -> Result<()> {
-        let cpu = self.build_cpu_backend()?;
-        self.offload.faults += 1;
-        self.offload.calibrating = false;
-        self.offload.over_target = 0;
-        self.offload.within_target = 0;
-        self.adopt_backend(
-            BackendKind::SoftCpu(Box::new(cpu)),
-            TierReason::DeviceRemoved,
-            frame_index,
-            detail,
-        );
-        Ok(())
-    }
-
-    /// Offloads because the hardware missed its target, and - unless the
-    /// comparison is already known - marks the next frame as the calibration that
-    /// decides whether the offload stands.
-    fn offload_on_overload(&mut self, frame_index: u64, detail: &str, calibrate: bool) -> Result<()> {
-        let cpu = self.build_cpu_backend()?;
-        self.offload.calibrating = calibrate;
-        self.offload.over_target = 0;
-        self.offload.within_target = 0;
-        self.adopt_backend(
-            BackendKind::SoftCpu(Box::new(cpu)),
-            TierReason::FrameTimeOverTarget,
-            frame_index,
-            detail,
-        );
-        Ok(())
-    }
-
-    /// Rebuilds the hardware backend after a settle window inside the target.
-    fn return_to_gpu(&mut self, frame_index: u64, detail: &str) -> Result<()> {
-        let gpu = self.build_gpu_backend()?;
-        self.offload.over_target = 0;
-        self.offload.within_target = 0;
-        self.adopt_backend(
-            BackendKind::D3d11(Box::new(gpu)),
-            // Up the ladder, which is what the reason says: a host reading the
-            // log can tell a recovery from how the device started.
-            TierReason::Recovery,
-            frame_index,
-            detail,
-        );
-        Ok(())
-    }
-
-    /// The measured policy, run after every frame that rendered: decides what
-    /// the *next* frame renders on.
-    ///
-    /// Cheap in the steady state - a comparison and two counters - and the only
-    /// place the device changes its own backend, so a host reading the stats sees
-    /// one decision rather than several half-applied ones. Every rule here is a
-    /// rule from docs/offload.md; the arithmetic is the threshold the ladder
-    /// already uses, which is why the two cannot disagree.
-    fn apply_offload_policy(&mut self, frame_index: u64, width: u32, height: u32) -> Result<()> {
-        let target_ms = self.origin.cpu.target_frame_ms;
-        let target_ns = u64::from(target_ms) * 1_000_000;
-        let threshold = self.origin.cpu.over_target_frames_to_downgrade;
-        let total_ns = self.frame_numbers().total_ns;
-        let key = plan_key(width, height, &self.frame.shadow);
-
-        if self.backend_id() == backend::D3D11 {
-            // Measured overload. The target being zero means the ladder is off,
-            // which is a host's way of saying "do not decide for me".
-            self.offload.over_target = if target_ns > 0 && total_ns > target_ns {
-                self.offload.over_target.saturating_add(1)
-            } else {
-                0
-            };
-            if threshold == 0
-                || self.offload.over_target < threshold
-                || self.offload.faults > 0
-                || !self.may_offload()
-            {
-                return Ok(());
-            }
-            if self.offload.measured_key == Some(key) {
-                if self.offload.cpu_lost {
-                    // Measured here: the CPU renders this frame slower, so
-                    // handing it frames would make every frame slower.
-                    return Ok(());
-                }
-                // Measured here and the CPU won. The hardware was tried again
-                // after a return trip and missed, so this frame genuinely does
-                // not fit it - and the calibration's answer is already known.
-                let detail = format!(
-                    "{} frames over the {} ms target at {}x{}, where the reference tier already measured faster",
-                    self.offload.over_target, target_ms, width, height
-                );
-                self.offload_on_overload(frame_index, &detail, false)?;
-                return Ok(());
-            }
-            // Not measured here: one frame on the CPU is the price of not making
-            // every subsequent frame slow.
-            self.offload.gpu_ns = total_ns;
-            // The measurement the calibration is compared against, written into
-            // the entry the miss caused: a host (and the test that pins this)
-            // can then read why the device came back, rather than guessing.
-            let detail = format!(
-                "{} frames over the {} ms target at {}x{}; the hardware measured {} ns; calibrating the reference tier",
-                self.offload.over_target, target_ms, width, height, total_ns
-            );
-            self.offload_on_overload(frame_index, &detail, true)?;
-            return Ok(());
-        }
-
-        if !self.offloaded() {
-            // A device created on the reference tier has nowhere to go.
-            return Ok(());
-        }
-
-        if self.offload.calibrating {
-            // The first offloaded frame is the calibration: the reference tier's
-            // own cost, measured, against the hardware's - no extra frame spent.
-            self.offload.calibrating = false;
-            self.offload.measured_key = Some(key);
-            if target_ns > 0 && self.offload.gpu_ns > 0 && total_ns >= self.offload.gpu_ns {
-                self.offload.cpu_lost = true;
-                let detail = format!(
-                    "the reference tier measured {} against the hardware's {} at {}x{}, so the offload was not a win",
-                    total_ns, self.offload.gpu_ns, width, height
-                );
-                self.return_to_gpu(frame_index, &detail)?;
-            }
-            return Ok(());
-        }
-
-        // The return trip. It needs a target to be inside and a settle window of
-        // frames inside it, and it is attempted at most once per plan: a workload
-        // that oscillates around the target must not thrash between tiers. A
-        // device that offloaded because of a fault rather than a miss therefore
-        // stays offloaded on a host that set no frame-time target, which is the
-        // only host that cannot say whether the hardware has recovered.
-        if target_ns == 0 || threshold == 0 || self.offload.faults > 1 || self.offload.returned_key == Some(key) {
-            return Ok(());
-        }
-        self.offload.within_target = if total_ns <= target_ns {
-            self.offload.within_target.saturating_add(1)
-        } else {
-            0
-        };
-        if self.offload.within_target >= threshold {
-            self.offload.returned_key = Some(key);
-            let detail = format!(
-                "{} frames inside the {} ms target: rebuilding the hardware backend",
-                self.offload.within_target, target_ms
-            );
-            self.return_to_gpu(frame_index, &detail)?;
-        }
-        Ok(())
-    }
-
-    /// Renders `frame` on the reference backend the device is now running.
-    ///
-    /// The draw records in `frame` point into the host's own buffer blocks -
-    /// that is why `FrameRecord` keeps them past Submit - so the reference tier
-    /// can reproduce a frame the hardware did not finish, exactly. That is what
-    /// makes an offloaded frame byte-identical to the same frame rendered on the
-    /// reference tier directly.
-    fn render_frame_on_soft(&mut self, frame: &mut FrameRecord) -> Result<()> {
-        let draw_items = build_draws(self.alloc, frame.draws.as_slice())?;
-        let input = frame_input(frame, draw_items.as_slice());
-        let (color, depth, shadows) = {
-            let soft = self.softcpu_mut().ok_or_else(|| {
-                Error::new(Code::BackendUnavailable, "the reference backend is not available")
-            })?;
-            soft.prepare_frame(frame.width, frame.height)?;
-            soft.render(&input)?;
-            (soft.color_checksum(), soft.depth_checksum(), soft.snapshot().shadows)
-        };
-        frame.checksum = color;
-        frame.depth_checksum = depth;
-        self.stats.shadows = shadows;
-        Ok(())
-    }
-
-    /// A hardware fault during a frame: continue on the reference tier and
-    /// render the frame that faulted there, out of the frame the device still
-    /// holds.
-    ///
-    /// Used by Present, where the frame was already rendered on the GPU and only
-    /// its readback failed; Submit renders its own frame, which it is still
-    /// holding, so it calls the two steps directly.
-    fn recover_frame(&mut self, fault: &Error) -> Result<()> {
-        let mut frame = std::mem::replace(&mut self.frame, FrameRecord::new(self.alloc));
-        let detail = format!("frame {}: {}", frame.index, fault.message.as_str());
-        let result = match self.offload_on_fault(frame.index, &detail) {
-            Ok(()) => self.render_frame_on_soft(&mut frame),
-            Err(e) => Err(e),
-        };
-        self.frame = frame;
-        result
-    }
-
-    /// The present path of a device that just lost its hardware: the frame is
-    /// re-rendered on the reference tier and the host gets the pixels it came
-    /// for, in the layout it asked for.
-    fn present_after_fault(
-        &mut self,
-        fault: &Error,
-        pixels: Option<&mut [u8]>,
-        out_size: u64,
-        out_pitch: u32,
-        flip: u32,
-    ) -> Result<()> {
-        self.recover_frame(fault)?;
-        let (width, height) = self
-            .softcpu()
-            .map(|soft| soft.frame_size())
-            .ok_or_else(|| Error::new(Code::BackendUnavailable, "the reference backend is not available"))?;
-        if let Some(pixels) = pixels {
-            let pitch = if out_pitch == 0 { width * 4 } else { out_pitch };
-            let needed = (height.saturating_sub(1) as u64) * pitch as u64 + width as u64 * 4;
-            if out_size < needed {
-                return err!(Code::InvalidArgument, "the present buffer is too small for {}x{}", width, height);
-            }
-            let mut tight = vec![0u8; (width * height * 4) as usize];
-            if let Some(soft) = self.softcpu_mut() {
-                soft.readback(&mut tight)?;
-            }
-            blit(pixels, &tight, width, height, pitch, flip);
-        }
-        if let Some(soft) = self.softcpu_mut() {
-            soft.on_frame_end()?;
-        }
-        Ok(())
-    }
-
-    fn record_downgrade(&mut self, from: Tier, to: Tier, reason: TierReason, frame_index: u64, detail: &str) {
-        match &mut self.backend {
-            BackendKind::SoftCpu(soft) => {
-                soft.step_down(reason, frame_index, detail);
-            }
-            BackendKind::D3d11(gpu) => {
-                gpu.step_down(reason, frame_index, detail);
-            }
-            BackendKind::Null(_) => {
-                self.null_downgrades.record(Downgrade::new(from, to, reason, frame_index, 0, detail));
-            }
-        }
-    }
-
-}
-
-// ---------------------------------------------------------------- entry glue
-
-/// Drops the open frame if the call that owns it fails.
-///
-/// A device left in `Open` or `Submitted` rejects every later `BeginFrame` with
-/// `FrameInProgress`, and there is no ABI call that abandons a frame, so without
-/// this a host that records one bad draw - or whose present cannot be delivered -
-/// can never render again. Both `Submit` and `Present` take one of these once the
-/// call has committed to the frame and mark it `keep` only on success, so every
-/// failure in between ends the frame instead of stranding it. The counted drop is
-/// what `ReconLStats.frames_dropped` is for.
-///
-/// Holds the device as a raw pointer on purpose: the caller keeps using its own
-/// `&mut`, and the two borrows are disjoint by construction (this one is only
-/// read in `drop`, after the caller's last use).
-struct FrameOwner {
-    device: *mut DeviceHandle,
-    /// Set once the frame reached a state worth keeping.
-    keep: bool,
-}
-
-impl FrameOwner {
-    fn new(device: *mut DeviceHandle) -> Self {
-        Self { device, keep: false }
-    }
-}
-
-impl Drop for FrameOwner {
-    fn drop(&mut self) {
-        if self.keep {
-            return;
-        }
-        // SAFETY: the device outlives the entry point that created this.
-        let device = unsafe { &mut *self.device };
-        device.frame_state = FrameState::Idle;
-        device.stats.counters.frames_dropped += 1;
-    }
-}
-
-/// Runs an entry point body, converting a `Result` into an ABI code and
-/// recording the error where the host will look for it.
-pub fn run_entry(device: *mut DeviceHandle, body: impl FnOnce() -> Result<()>) -> i32 {
-    match body() {
-        Ok(()) => result::OK,
-        Err(err) => record_error(device, err),
-    }
-}
-
-/// An entry point with a panic boundary in `panic = "unwind"` builds. In the
-/// shipped profile (`panic = "abort"`) a panic aborts the process, which is the
-/// documented contract for `panic` across FFI.
-#[cfg(panic = "unwind")]
-pub fn guarded_entry(device: *mut DeviceHandle, body: impl FnOnce() -> Result<()>) -> i32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        Ok(r) => run_entry(device, || r),
-        Err(_) => {
-            record_error(device, Error::new(Code::Panic, "a ReconL invariant broke; the safe path was taken"))
-        }
-    }
-}
-
-#[cfg(not(panic = "unwind"))]
-pub fn guarded_entry(device: *mut DeviceHandle, body: impl FnOnce() -> Result<()>) -> i32 {
-    run_entry(device, body)
-}
-
-macro_rules! entry {
-    ($device:expr, $body:block) => {{
-        let device_ptr: *mut DeviceHandle = $device;
-        // The body is wrapped in its own block so the `block` fragment can be
-        // used in closure-body position at all.
-        $crate::guarded_entry(device_ptr, move || -> ::reconl_core::Result<()> { $body })
-    }};
-}
-
-/// Validates the device handle and yields `&mut DeviceHandle`.
-macro_rules! device_mut {
-    ($ptr:expr) => {{
-        let header = unsafe { check_handle($ptr as *mut c_void, Kind::Device, "device")? };
-        let device = header as *mut DeviceHandle;
-        unsafe { &mut *device }
-    }};
-}
-
-/// Validates a child handle and proves it belongs to `device`.
-macro_rules! child {
-    ($device:expr, $ptr:expr, $kind:expr, $what:expr) => {{
-        let header = unsafe { check_handle($ptr as *mut c_void, $kind, $what)? };
-        let device_header = &$device.header;
-        if unsafe { (*header).device } != (device_header as *const HandleHeader as *mut DeviceHandle) {
-            return err!(
-                Code::InvalidHandle,
-                "{} belongs to a different device",
-                $what
-            );
-        }
-        header
-    }};
-}
-
-// ------------------------------------------------------------------- version
-
-#[no_mangle]
-pub extern "C" fn reconlVersion(major: *mut u32, minor: *mut u32, patch: *mut u32) {
-    unsafe {
-        if !major.is_null() {
-            *major = VERSION_MAJOR;
-        }
-        if !minor.is_null() {
-            *minor = VERSION_MINOR;
-        }
-        if !patch.is_null() {
-            *patch = VERSION_PATCH;
-        }
-    }
-}
-
-const VERSION_STRING: &[u8] = b"0.1.0\0";
-
-#[no_mangle]
-pub extern "C" fn reconlVersionString() -> *const i8 {
-    VERSION_STRING.as_ptr() as *const i8
-}
-
-const UNKNOWN_NAME: &[u8] = b"unknown\0";
-const RESULT_OK: &[u8] = b"RECONL_OK\0";
-const RESULT_INVALID_ARGUMENT: &[u8] = b"RECONL_ERR_INVALID_ARGUMENT\0";
-const RESULT_OUT_OF_MEMORY: &[u8] = b"RECONL_ERR_OUT_OF_MEMORY\0";
-const RESULT_NOT_SUPPORTED: &[u8] = b"RECONL_ERR_NOT_SUPPORTED\0";
-const RESULT_BACKEND_UNAVAILABLE: &[u8] = b"RECONL_ERR_BACKEND_UNAVAILABLE\0";
-const RESULT_BUDGET_EXCEEDED: &[u8] = b"RECONL_ERR_BUDGET_EXCEEDED\0";
-const RESULT_DEVICE_LOST: &[u8] = b"RECONL_ERR_DEVICE_LOST\0";
-const RESULT_INVALID_HANDLE: &[u8] = b"RECONL_ERR_INVALID_HANDLE\0";
-const RESULT_STRUCT_SIZE: &[u8] = b"RECONL_ERR_STRUCT_SIZE\0";
-const RESULT_WRONG_STRUCT_TYPE: &[u8] = b"RECONL_ERR_WRONG_STRUCT_TYPE\0";
-const RESULT_ABI_VERSION: &[u8] = b"RECONL_ERR_ABI_VERSION\0";
-const RESULT_FRAME_IN_PROGRESS: &[u8] = b"RECONL_ERR_FRAME_IN_PROGRESS\0";
-const RESULT_NO_FRAME: &[u8] = b"RECONL_ERR_NO_FRAME\0";
-const RESULT_NOT_READY: &[u8] = b"RECONL_ERR_NOT_READY\0";
-const RESULT_IO: &[u8] = b"RECONL_ERR_IO\0";
-const RESULT_CORRUPT_CACHE: &[u8] = b"RECONL_ERR_CORRUPT_CACHE\0";
-const RESULT_DEGRADED: &[u8] = b"RECONL_ERR_DEGRADED\0";
-const RESULT_PANIC: &[u8] = b"RECONL_ERR_PANIC\0";
-const RESULT_EMPTY_FRAME: &[u8] = b"RECONL_ERR_EMPTY_FRAME\0";
-
-#[no_mangle]
-pub extern "C" fn reconlResultName(r: i32) -> *const i8 {
-    let name: &[u8] = match r {
-        result::OK => RESULT_OK,
-        result::INVALID_ARGUMENT => RESULT_INVALID_ARGUMENT,
-        result::OUT_OF_MEMORY => RESULT_OUT_OF_MEMORY,
-        result::NOT_SUPPORTED => RESULT_NOT_SUPPORTED,
-        result::BACKEND_UNAVAILABLE => RESULT_BACKEND_UNAVAILABLE,
-        result::BUDGET_EXCEEDED => RESULT_BUDGET_EXCEEDED,
-        result::DEVICE_LOST => RESULT_DEVICE_LOST,
-        result::INVALID_HANDLE => RESULT_INVALID_HANDLE,
-        result::STRUCT_SIZE => RESULT_STRUCT_SIZE,
-        result::WRONG_STRUCT_TYPE => RESULT_WRONG_STRUCT_TYPE,
-        result::ABI_VERSION => RESULT_ABI_VERSION,
-        result::FRAME_IN_PROGRESS => RESULT_FRAME_IN_PROGRESS,
-        result::NO_FRAME => RESULT_NO_FRAME,
-        result::NOT_READY => RESULT_NOT_READY,
-        result::IO => RESULT_IO,
-        result::CORRUPT_CACHE => RESULT_CORRUPT_CACHE,
-        result::DEGRADED => RESULT_DEGRADED,
-        result::PANIC => RESULT_PANIC,
-        result::EMPTY_FRAME => RESULT_EMPTY_FRAME,
-        _ => UNKNOWN_NAME,
-    };
-    name.as_ptr() as *const i8
-}
-
-#[no_mangle]
-pub extern "C" fn reconlTierName(tier: u32) -> *const i8 {
-    static NAMES: [&[u8]; 5] = [
-        b"T0/gpu-discrete\0",
-        b"T1/gpu-shared\0",
-        b"T2/cpu-ram\0",
-        b"T3/cpu-thrifty\0",
-        b"T4/out-of-core\0",
-    ];
-    let index = (tier as usize).min(TIER_COUNT - 1);
-    NAMES[index].as_ptr() as *const i8
-}
-
-#[no_mangle]
-pub extern "C" fn reconlBackendName(backend: u32) -> *const i8 {
-    let name: &[u8] = match backend {
-        1 => b"soft-cpu\0",
-        2 => b"null\0",
-        3 => b"d3d11\0",
-        4 => b"d3d12\0",
-        5 => b"vulkan\0",
-        6 => b"gl\0",
-        7 => b"metal\0",
-        8 => b"webgpu\0",
-        9 => b"wasm-webgl2\0",
-        _ => b"none\0",
-    };
-    name.as_ptr() as *const i8
-}
-
-// ------------------------------------------------------------------- logging
-
-#[no_mangle]
-pub extern "C" fn reconlSetLogLevel(level: u32) {
-    log::set_level(match level {
-        0 => Level::Off,
-        1 => Level::Error,
-        2 => Level::Warn,
-        3 => Level::Info,
-        4 => Level::Debug,
-        _ => Level::Trace,
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn reconlGetLogLevel() -> u32 {
-    match log::level() {
-        Level::Off => 0,
-        Level::Error => 1,
-        Level::Warn => 2,
-        Level::Info => 3,
-        Level::Debug => 4,
-        Level::Trace => 5,
-    }
-}
-
-/// Installs a host log sink. Called from the emitting thread; the sink must not
-/// call back into ReconL.
-#[no_mangle]
-pub extern "C" fn reconlSetLogSink(
-    sink: Option<unsafe extern "C" fn(user: *mut c_void, level: u32, message: *const i8, file: *const i8, line: u32)>,
-    user: *mut c_void,
-) {
-    log::set_sink(sink, user);
 }
 
 // --------------------------------------------------------------------- probe
@@ -1318,20 +714,6 @@ pub unsafe extern "C" fn reconlProbe(desc: *const ReconLProbeDesc, out: *mut Rec
     })
 }
 
-/// # Safety
-/// `ptr` must point at a NUL-terminated string.
-unsafe fn cstr(ptr: *const i8) -> String {
-    let mut len = 0usize;
-    // SAFETY: the caller guarantees a NUL-terminated string.
-    unsafe {
-        while *ptr.add(len) != 0 && len < 4096 {
-            len += 1;
-        }
-        let slice = core::slice::from_raw_parts(ptr as *const u8, len);
-        String::from_utf8_lossy(slice).into_owned()
-    }
-}
-
 fn detect_ram_bytes() -> u64 {
     // No OS-specific probing in v0.1: a wrong number is worse than an honest
     // "unknown". The host can pass the real figure in `ReconLMemoryBudget`.
@@ -1358,10 +740,9 @@ fn d3d11_config_from_desc(desc: &ReconLDeviceDesc, tier: Tier) -> D3d11Config {
         adapter_index: 0,
         resolution_scale: 1.0,
         target_frame_ms: desc.target_frame_ms,
-        over_target_frames_to_downgrade: desc.downgrade_after_frames,
         // The shadow request is per frame (`ReconLShadowConfig` on the frame
         // descriptor), exactly as it is for the reference backend.
-        shadow: reconl_backend_softcpu::ShadowRequest::default(),
+        shadow: ShadowRequest::default(),
         ..D3d11Config::default()
     }
 }
@@ -1372,7 +753,6 @@ fn config_from_desc(desc: &ReconLDeviceDesc, spill_dir: Option<PathBuf>, tier: T
         worker_threads: desc.worker_threads,
         seed: desc.seed,
         target_frame_ms: desc.target_frame_ms,
-        over_target_frames_to_downgrade: desc.downgrade_after_frames,
         spill_dir,
         frame_policy: reconl_backend_softcpu::FramePolicy::default(),
         ..SoftCpuConfig::default()
@@ -1495,6 +875,11 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     let cpu_config = config_from_desc(desc, spill_dir.clone(), tier);
     let gpu_config = d3d11_config_from_desc(desc, tier);
 
+    // A tier the backend is asked to start at is a tier change like any other,
+    // and it is recorded in the device's log like any other. Collected here
+    // because the device that owns the log does not exist yet.
+    let mut starting_downgrades: Vec<Downgrade> = Vec::new();
+
     let backend = match requested_backend {
         backend::NULL => {
             let config = NullConfig { fake_tier: tier, command_capacity: 4096, ..NullConfig::default() };
@@ -1519,11 +904,12 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
                 // Honour the host's tier hint within the software ladder.
                 while device.tier() < tier {
                     let from = device.tier();
-                    let to = device.tier().step_down();
+                    let to = from.step_down();
                     if to == from {
                         break;
                     }
-                    device.step_down(TierReason::HostRequest, 0, "host tier hint");
+                    device.relabel(to, TierReason::HostRequest);
+                    starting_downgrades.push(Downgrade::new(from, to, TierReason::HostRequest, 0, 0, "host tier hint"));
                 }
             }
             BackendKind::SoftCpu(Box::new(device))
@@ -1557,7 +943,7 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     stats.tier_reason_text.set(tier_reason.text());
 
     let mut handle = DeviceHandle {
-        header: HandleHeader { kind: Kind::Device as u32, refcount: AtomicU32::new(1), device: core::ptr::null_mut() },
+        header: header_of::<DeviceHandle>(core::ptr::null_mut()),
         alloc,
         budget,
         backend,
@@ -1569,10 +955,12 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
         driver: Text::new(),
         stats,
         last_error: None,
+        readback: None,
+        ladder: FrameLadder::new(desc.target_frame_ms, desc.downgrade_after_frames),
+        downgrades: DowngradeLog::new(),
         frame_state: FrameState::Idle,
         frame: FrameRecord::new(alloc),
-        shadow: reconl_backend_softcpu::ShadowRequest::default(),
-        null_downgrades: DowngradeLog::new(),
+        shadow: ShadowRequest::default(),
         audit_every_frames: 0,
         world: WorldRevision::new(),
         spill_dir,
@@ -1585,9 +973,12 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
             cpu: cpu_config,
         },
         offload: Offload::new(),
-        offload_log: DowngradeLog::new(),
         allow_downgrade: desc.allow_downgrade,
+        framegen: FrameGen::new(alloc),
     };
+    for entry in starting_downgrades {
+        handle.downgrades.record(entry);
+    }
     handle.device_name.set(device_name);
     handle.driver.set(driver);
     handle.shadow = shadow_request_from(None);
@@ -1608,10 +999,10 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     Ok(())
 }
 
-fn shadow_request_from(config: Option<&ReconLShadowConfig>) -> reconl_backend_softcpu::ShadowRequest {
+fn shadow_request_from(config: Option<&ReconLShadowConfig>) -> ShadowRequest {
     match config {
-        None => reconl_backend_softcpu::ShadowRequest::default(),
-        Some(c) => reconl_backend_softcpu::ShadowRequest {
+        None => ShadowRequest::default(),
+        Some(c) => ShadowRequest {
             enabled: c.enabled != 0,
             cascades: c.cascade_count,
             texel_budget_bytes: c.texel_budget_bytes,
@@ -1764,7 +1155,7 @@ pub unsafe extern "C" fn reconlCreateBuffer(device: *mut DeviceHandle, desc: *co
             bytes.as_mut_slice()[..src.len()].copy_from_slice(src);
         }
         let handle = BufferHandle {
-            header: HandleHeader { kind: Kind::Buffer as u32, refcount: AtomicU32::new(1), device: device as *mut DeviceHandle },
+            header: header_of::<BufferHandle>(device as *mut DeviceHandle),
             bytes,
             ram,
             usage: desc.usage,
@@ -1828,7 +1219,7 @@ pub unsafe extern "C" fn reconlCreateTexture(device: *mut DeviceHandle, desc: *c
         if desc.width == 0 || desc.height == 0 {
             return err!(Code::InvalidArgument, "a texture needs non-zero dimensions");
         }
-        if !matches!(desc.format, 1 | 3) {
+        if !matches!(desc.format, abi::format::R8G8B8A8_UNORM | abi::format::R8G8B8A8_SRGB) {
             return err!(
                 Code::NotSupported,
                 "format {} is not a sampling format this release creates; use RECONL_FORMAT_R8G8B8A8_UNORM",
@@ -1857,7 +1248,7 @@ pub unsafe extern "C" fn reconlCreateTexture(device: *mut DeviceHandle, desc: *c
             sizes.push((w, h))?;
         }
         let handle = TextureHandle {
-            header: HandleHeader { kind: Kind::Texture as u32, refcount: AtomicU32::new(1), device: device as *mut DeviceHandle },
+            header: header_of::<TextureHandle>(device as *mut DeviceHandle),
             width: desc.width,
             height: desc.height,
             format: desc.format,
@@ -1905,20 +1296,13 @@ pub unsafe extern "C" fn reconlWriteTexture(device: *mut DeviceHandle, texture: 
         if rows > h {
             return err!(Code::InvalidArgument, "row_count exceeds the level height");
         }
-        let pitch = if level_desc.row_pitch == 0 { w * 4 } else { level_desc.row_pitch };
-        if pitch < w * 4 {
-            return err!(Code::InvalidArgument, "row_pitch is smaller than one row of RGBA8");
-        }
-        let needed = (rows as u64 - 1) * (pitch as u64) + (w as u64) * 4;
-        if level_desc.data_size < needed {
-            return err!(Code::InvalidArgument, "the level payload is too small for {}x{} rows", w, h);
-        }
-        // SAFETY: `needed` bytes were confirmed readable by the caller's size.
+        let pitch = host_row_layout(w, rows, level_desc.data_size, level_desc.row_pitch)? as usize;
+        // SAFETY: the layout check above confirmed the caller's size covers the rows.
         let src = unsafe { core::slice::from_raw_parts(level_desc.data as *const u8, level_desc.data_size as usize) };
         let dest = &mut texture.levels.as_mut_slice()[level_desc.mip as usize];
         for row in 0..rows as usize {
             let dst_at = row * (w as usize) * 4;
-            let src_at = row * (pitch as usize);
+            let src_at = row * pitch;
             dest.as_mut_slice()[dst_at..dst_at + (w as usize) * 4].copy_from_slice(&src[src_at..src_at + (w as usize) * 4]);
         }
         Ok(())
@@ -1941,17 +1325,13 @@ pub unsafe extern "C" fn reconlReadTexture(device: *mut DeviceHandle, texture: *
             Some(size) => *size,
             None => return err!(Code::InvalidArgument, "mip {} does not exist", mip),
         };
-        let pitch = if out_row_pitch == 0 { w * 4 } else { out_row_pitch };
-        let needed = (h as u64 - 1) * pitch as u64 + w as u64 * 4;
-        if out_size < needed {
-            return err!(Code::InvalidArgument, "the readback buffer is too small for {}x{}", w, h);
-        }
+        let pitch = host_row_layout(w, h, out_size, out_row_pitch)? as usize;
         let src = texture.levels.get(mip as usize).map(|l| l.as_slice()).unwrap_or(&[]);
-        // SAFETY: the caller provides `out_size` writable bytes.
+        // SAFETY: the layout check above confirmed the caller's size covers the rows.
         let dest = unsafe { core::slice::from_raw_parts_mut(out as *mut u8, out_size as usize) };
         for row in 0..h as usize {
             let src_at = row * (w as usize) * 4;
-            let dst_at = row * pitch as usize;
+            let dst_at = row * pitch;
             dest[dst_at..dst_at + (w as usize) * 4].copy_from_slice(&src[src_at..src_at + (w as usize) * 4]);
         }
         Ok(())
@@ -2011,7 +1391,7 @@ pub unsafe extern "C" fn reconlCreatePipeline(device: *mut DeviceHandle, desc: *
             return err!(Code::InvalidArgument, "a textured pipeline needs at least one texture slot");
         }
         let mut handle = PipelineHandle {
-            header: HandleHeader { kind: Kind::Pipeline as u32, refcount: AtomicU32::new(1), device: device as *mut DeviceHandle },
+            header: header_of::<PipelineHandle>(device as *mut DeviceHandle),
             shading: desc.shading,
             blend: desc.blend,
             cull: desc.cull,
@@ -2059,14 +1439,17 @@ pub unsafe extern "C" fn reconlCreateSwapchain(device: *mut DeviceHandle, desc: 
         if desc.image_count < 1 || desc.image_count > 3 {
             return err!(Code::InvalidArgument, "image_count must be 1..3");
         }
-        if !matches!(desc.format, 1 | 2 | 3) {
+        if !matches!(
+            desc.format,
+            abi::format::R8G8B8A8_UNORM | abi::format::B8G8R8A8_UNORM | abi::format::R8G8B8A8_SRGB
+        ) {
             return err!(Code::NotSupported, "only 8-bit RGBA/BGRA swapchain formats are supported in this release");
         }
         // A swapchain allocates nothing itself, but it names the image sizes the
         // host will allocate and present, so it passes the same ceiling.
         device.budget.check_allocation(sizing::swapchain_bytes(&desc), "a swapchain")?;
         let handle = SwapchainHandle {
-            header: HandleHeader { kind: Kind::Swapchain as u32, refcount: AtomicU32::new(1), device: device as *mut DeviceHandle },
+            header: header_of::<SwapchainHandle>(device as *mut DeviceHandle),
             width: desc.width,
             height: desc.height,
             format: desc.format,
@@ -2112,7 +1495,7 @@ pub unsafe extern "C" fn reconlCreateCommandList(device: *mut DeviceHandle, desc
         let ram = device.budget.admit_ram(slot_bytes, "a command list")?;
         let commands = HostVec::with_capacity(device.alloc, slots as usize)?;
         let mut handle = CommandListHandle {
-            header: HandleHeader { kind: Kind::CommandList as u32, refcount: AtomicU32::new(1), device: device as *mut DeviceHandle },
+            header: header_of::<CommandListHandle>(device as *mut DeviceHandle),
             commands,
             ram,
             capacity_bytes: slot_bytes as u32,
@@ -2144,7 +1527,7 @@ pub unsafe extern "C" fn reconlCreateFence(device: *mut DeviceHandle, signaled: 
         }
         unsafe { *out = core::ptr::null_mut() };
         let handle = FenceHandle {
-            header: HandleHeader { kind: Kind::Fence as u32, refcount: AtomicU32::new(1), device: device as *mut DeviceHandle },
+            header: header_of::<FenceHandle>(device as *mut DeviceHandle),
             signaled: signaled != 0,
             frame_index: 0,
         };
@@ -2401,12 +1784,13 @@ pub unsafe extern "C" fn reconlCmdCount(list: *const CommandListHandle) -> u32 {
 pub unsafe extern "C" fn reconlBeginFrame(device: *mut DeviceHandle, desc: *mut ReconLFrameDesc) -> i32 {
     entry!(device, {
         let device = device_mut!(device);
-        if desc.is_null() {
-            return err!(Code::InvalidArgument, "null frame descriptor");
-        }
-        if device.frame_state != FrameState::Idle {
-            return err!(Code::FrameInProgress, "a frame is already open");
-        }
+        let mut call = order::BeginFrame::new(device, desc);
+        order::walk(order::BEGIN_FRAME, &mut call)?;
+        let device = call.into_parts();
+        // The frame is built here, after every question has passed, and opened by
+        // the last statement below - so nothing is half-built and the frame is
+        // never open until it can be recorded. That is also why this call's table
+        // has no commit step: it has no frame to take until it has made one.
         let desc_ref = unsafe {
             check_header::<ReconLFrameDesc>(
                 desc as *const reconl_core::StructHeader,
@@ -2520,7 +1904,10 @@ pub unsafe extern "C" fn reconlBeginFrame(device: *mut DeviceHandle, desc: *mut 
             shadow_request_from(Some(config))
         };
 
-        device.frame = FrameRecord::new(device.alloc);
+        device.frame.reset();
+        // This frame's readback half, which the present that delivers it writes.
+        // A frame that is never presented contributes none.
+        device.readback = None;
         device.frame.index = device.stats.counters.frames_presented as u64 + (device.stats.counters.frames_dropped as u64);
         device.frame.width = desc_ref.width;
         device.frame.height = desc_ref.height;
@@ -2562,6 +1949,30 @@ pub unsafe extern "C" fn reconlBeginFrame(device: *mut DeviceHandle, desc: *mut 
             device.frame.fov_y_deg = cam.fov_y_deg;
             device.frame.near = cam.near;
             device.frame.far = cam.far;
+        }
+        // Frame generation for this frame, if the caller's struct reaches the
+        // field. A frame that does not ask keeps nothing: the feature costs a
+        // readback and three buffers, and a host that did not ask for it pays
+        // neither.
+        if desc_ref.has_framegen() && !desc_ref.framegen.is_null() {
+            // SAFETY: `has_framegen` proved the field is inside the caller's
+            // struct, and the caller guarantees a readable ReconLFrameGenDesc
+            // for this call.
+            let fg = unsafe {
+                check_header::<ReconLFrameGenDesc>(
+                    desc_ref.framegen as *const reconl_core::StructHeader,
+                    struct_type::FRAME_GEN,
+                    core::mem::size_of::<ReconLFrameGenDesc>() as u32,
+                    "ReconLFrameGenDesc",
+                )?
+            };
+            device.frame.framegen = fg.enabled != 0;
+        }
+        // A frame that does not ask for generation ends the promise the last one
+        // made: the history describes a frame the host is no longer looking at,
+        // and a generated frame from it would be a picture of the past.
+        if !device.frame.framegen {
+            device.framegen.ready = false;
         }
         device.frame.world_revision = device.world.revision();
         device.frame.static_revision = device.world.static_geometry_revision();
@@ -2657,31 +2068,26 @@ fn pipeline_state(pipeline: &PipelineHandle) -> PipelineState {
 pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const CommandListHandle, fence: *mut FenceHandle) -> i32 {
     entry!(device, {
         let device = device_mut!(device);
-        if list.is_null() {
-            return err!(Code::InvalidArgument, "null command list");
-        }
-        if device.frame_state != FrameState::Open {
-            return err!(Code::NoFrame, "no frame is open; call reconlBeginFrame first");
-        }
+        let mut call = order::Submit::new(device, list, fence);
+        order::walk(order::SUBMIT, &mut call)?;
+        // Past this point the frame is committed (order::SUBMIT): any failure
+        // ends it, and `owner` is what ends it.
+        let (device, mut owner) = call.into_parts();
         let list = unsafe { &*list };
-        child!(device, list as *const CommandListHandle as *mut CommandListHandle, Kind::CommandList, "command list");
-        if !fence.is_null() {
-            // Both handles are checked before the frame is committed: a handle
-            // from another device is a caller bug that must not cost the host
-            // the frame it is about to render, so the frame stays open and the
-            // call can be retried with a valid one.
-            child!(device, fence, Kind::Fence, "fence");
-        }
-        // Past this point the frame is committed: any failure ends it.
-        let mut owner = FrameOwner::new(device as *mut DeviceHandle);
 
         let mut state = PassState::default();
-        let mut draws: HostVec<DrawRecord> = HostVec::with_capacity(device.alloc, list.commands.len())?;
+        // The frame's draw list, cleared and reused rather than taken fresh: the
+        // storage is the record's, and the record outlives the frame, so a
+        // command list no longer than the last frame's costs the allocator
+        // nothing. Only growth - a frame with more commands than any before it -
+        // takes a block, and the host's own ledger is what sees that.
+        device.frame.items.clear();
+        device.frame.items.try_reserve(list.commands.len())?;
         let mut saw_pass = false;
 
         for command in list.commands.iter() {
             match *command {
-                Command::BeginPass { target, load_color, load_depth, clear_color, clear_depth, width: _, height: _ } => {
+                Command::BeginPass { target, load_color, load_depth, clear_color, clear_depth, width, height } => {
                     if state.in_pass {
                         return err!(Code::InvalidArgument, "BeginRenderPass inside a render pass");
                     }
@@ -2698,6 +2104,9 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     device.frame.clear_depth = clear_depth;
                     device.frame.clear_color_on = load_color;
                     device.frame.clear_depth_on = load_depth;
+                    // The pass's viewport, honoured by both backends. `(0, 0)`
+                    // is the documented default and means the whole frame.
+                    device.frame.viewport = (width, height);
                 }
                 Command::EndPass => {
                     if !state.in_pass {
@@ -2776,18 +2185,29 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     let vertices = unsafe { buffer_ref.bytes.as_ptr().add(base as usize) as *const Vertex };
                     let pipeline = state.pipeline.unwrap_or_else(PipelineState::default);
                     let rec = state.pipeline_rec.map(|p| unsafe { &*p });
-                    draws.push(DrawRecord {
-                        vertices,
-                        vertex_count,
-                        indices: core::ptr::null(),
-                        index_count: 0,
+                    if device.frame.items.len() == device.frame.items.capacity() {
+                        device.frame.items_grown += 1;
+                    }
+                    device.frame.items.push(DrawItem {
+                        // SAFETY: the bound check above proved this range lies
+                        // inside the buffer the host handed over, and it is the
+                        // host's reference count that keeps those bytes alive
+                        // while the frame is in use. The slicing happens here,
+                        // beside the check that justifies it.
+                        vertices: unsafe { core::slice::from_raw_parts(vertices, vertex_count as usize) },
+                        indices: None,
                         transform: math::mul(&state.view_proj, &state.model),
                         model: state.model,
                         pipeline,
-                        shading: rec.map(|p| p.shading).unwrap_or(shading::UNLIT),
-                        textured: rec.map(|p| p.texture_slots > 0).unwrap_or(false),
-                        lit: rec.map(|p| p.shading == shading::LAMBERT || p.shading == shading::TEXTURED_LAMBERT).unwrap_or(false),
-                        receives_shadow: rec.map(|p| p.receives_shadow).unwrap_or(false),
+                        shader: ShaderRef::Surface(SurfaceShader {
+                            textured: rec.map(|p| p.texture_slots > 0).unwrap_or(false),
+                            lit: rec.map(|p| p.shading == shading::LAMBERT || p.shading == shading::TEXTURED_LAMBERT).unwrap_or(false),
+                            receives_shadow: rec.map(|p| p.receives_shadow).unwrap_or(false),
+                            texture: None,
+                            lights: None,
+                            shadows: None,
+                            flip_normal: false,
+                        }),
                         dynamic: true,
                         casts_shadow: rec.map(|p| p.casts_shadow).unwrap_or(false),
                     })?;
@@ -2805,7 +2225,7 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                         Some(i) => i,
                         None => return err!(Code::NotReady, "DrawIndexed without an index buffer"),
                     };
-                    if index_format != 1 {
+                    if index_format != abi::index_format::UINT32 {
                         return err!(
                             Code::NotSupported,
                             "16-bit indices are not read directly in this release; upload uint32 indices"
@@ -2831,18 +2251,28 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     let vertices = unsafe { buffer_ref.bytes.as_ptr().add(base as usize) as *const Vertex };
                     let pipeline = state.pipeline.unwrap_or_else(PipelineState::default);
                     let rec = state.pipeline_rec.map(|p| unsafe { &*p });
-                    draws.push(DrawRecord {
-                        vertices,
-                        vertex_count: 0,
-                        indices,
-                        index_count,
+                    if device.frame.items.len() == device.frame.items.capacity() {
+                        device.frame.items_grown += 1;
+                    }
+                    device.frame.items.push(DrawItem {
+                        // SAFETY: both bound checks above proved these ranges lie
+                        // inside their buffers, and `max_index + 1` is the vertex
+                        // count this draw can reach - so the vertex slice ends
+                        // there, not at the end of the buffer.
+                        vertices: unsafe { core::slice::from_raw_parts(vertices, (max_index + 1) as usize) },
+                        indices: Some(unsafe { core::slice::from_raw_parts(indices, index_count as usize) }),
                         transform: math::mul(&state.view_proj, &state.model),
                         model: state.model,
                         pipeline,
-                        shading: rec.map(|p| p.shading).unwrap_or(shading::UNLIT),
-                        textured: rec.map(|p| p.texture_slots > 0).unwrap_or(false),
-                        lit: rec.map(|p| p.shading == shading::LAMBERT || p.shading == shading::TEXTURED_LAMBERT).unwrap_or(false),
-                        receives_shadow: rec.map(|p| p.receives_shadow).unwrap_or(false),
+                        shader: ShaderRef::Surface(SurfaceShader {
+                            textured: rec.map(|p| p.texture_slots > 0).unwrap_or(false),
+                            lit: rec.map(|p| p.shading == shading::LAMBERT || p.shading == shading::TEXTURED_LAMBERT).unwrap_or(false),
+                            receives_shadow: rec.map(|p| p.receives_shadow).unwrap_or(false),
+                            texture: None,
+                            lights: None,
+                            shadows: None,
+                            flip_normal: false,
+                        }),
                         dynamic: true,
                         casts_shadow: rec.map(|p| p.casts_shadow).unwrap_or(false),
                     })?;
@@ -2857,30 +2287,40 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
             return err!(Code::InvalidArgument, "the command list has no render pass");
         }
 
-        device.frame.draws = draws;
         let mut frame = std::mem::replace(&mut device.frame, FrameRecord::new(device.alloc));
         frame.width = if frame.width == 0 { 1 } else { frame.width };
         frame.height = if frame.height == 0 { 1 } else { frame.height };
 
+        // The colour checksum is a full pass over the frame and only the audit
+        // reads it, so it is computed on exactly the frames the audit compares -
+        // the ones it re-renders. Both tiers are told the same thing here, so the
+        // rule has one owner.
+        let audit_this_frame =
+            device.audit_every_frames > 0 && frame.index % device.audit_every_frames as u64 == 0;
+
         // A hardware fault is reported here rather than returned: the frame it
         // interrupted is rendered again on the reference tier instead of being
         // lost (docs/offload.md).
+        //
+        // The checksum is kept beside the record rather than written into it:
+        // the input a backend renders from borrows the record, and the audit path
+        // reads that input a second time - so the record is written once, after
+        // the match.
+        let mut rendered_checksum = 0u64;
         let mut faulted: Option<Error> = None;
         match &mut device.backend {
             BackendKind::SoftCpu(soft) => {
-                let draw_items = build_draws(device.alloc, frame.draws.as_slice())?;
-                let input = frame_input(&frame, draw_items.as_slice());
+                let input = frame_input(&frame, audit_this_frame);
                 soft.render(&input)?;
-                frame.checksum = soft.color_checksum();
-                frame.depth_checksum = soft.depth_checksum();
+                rendered_checksum = soft.color_checksum();
 
                 // The audit: re-render the same frame and compare. It cannot
                 // catch worker-count nondeterminism (the tests do that), but it
                 // catches state-dependent nondeterminism - a stale shadow map, a
                 // recycled buffer, a cache that changed the answer.
-                if device.audit_every_frames > 0 && frame.index % device.audit_every_frames as u64 == 0 {
+                if audit_this_frame {
                     let second = soft.render(&input)?;
-                    if second.frame_index != frame.index || soft.color_checksum() != frame.checksum {
+                    if second.frame_index != frame.index || soft.color_checksum() != rendered_checksum {
                         device.stats.counters.audit_divergences += 1;
                         log_warn!("audit: frame {} rendered differently the second time", frame.index);
                     }
@@ -2888,8 +2328,7 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                 device.stats.shadows = soft.snapshot().shadows;
             }
             BackendKind::D3d11(gpu) => {
-                let draw_items = build_draws(device.alloc, frame.draws.as_slice())?;
-                let input = frame_input(&frame, draw_items.as_slice());
+                let input = frame_input(&frame, audit_this_frame);
                 // Targets are reserved between frames, so Submit only uploads
                 // and draws. A failure is reported under the code the backend's
                 // classifier chose; only a classified DEVICE_LOST is treated as
@@ -2903,16 +2342,15 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                         return Err(e);
                     }
                 } else {
-                    frame.checksum = gpu.color_checksum();
-                    frame.depth_checksum = gpu.depth_checksum();
+                    rendered_checksum = gpu.color_checksum();
 
                     // The same audit the reference runs: re-render the frame and
                     // compare. On hardware this is a determinism check, not a
                     // formality - a GPU that reshuffles its own scheduling must
                     // still produce the identical image twice.
-                    if device.audit_every_frames > 0 && frame.index % device.audit_every_frames as u64 == 0 {
+                    if audit_this_frame {
                         let second = gpu.render(&input)?;
-                        if second.frame_index != frame.index || gpu.color_checksum() != frame.checksum {
+                        if second.frame_index != frame.index || gpu.color_checksum() != rendered_checksum {
                             device.stats.counters.audit_divergences += 1;
                             log_warn!("audit: frame {} rendered differently the second time", frame.index);
                         }
@@ -2922,14 +2360,18 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
             }
             BackendKind::Null(null) => {
                 null.begin_frame(frame.width, frame.height)?;
-                for draw in frame.draws.iter() {
-                    let count = if draw.index_count > 0 { draw.index_count } else { draw.vertex_count } as u64;
+                for draw in frame.items.iter() {
+                    let count = match draw.indices {
+                        Some(indices) => indices.len(),
+                        None => draw.vertices.len(),
+                    } as u64;
                     null.note_draw(count, count / 3);
                 }
                 null.submit()?;
-                frame.checksum = null.last_checksum();
+                rendered_checksum = null.last_checksum();
             }
         }
+        frame.checksum = rendered_checksum;
 
         if let Some(fault) = faulted {
             if !device.may_offload() {
@@ -2946,24 +2388,6 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
             device.render_frame_on_soft(&mut frame)?;
         }
 
-        let tier_now = match &device.backend {
-            BackendKind::SoftCpu(d) => d.tier(),
-            BackendKind::D3d11(d) => d.tier(),
-            BackendKind::Null(d) => d.tier(),
-        };
-        if tier_now != device.tier {
-            device.tier = tier_now;
-            device.tier_reason = match &device.backend {
-                BackendKind::SoftCpu(d) => d.tier_reason(),
-                BackendKind::D3d11(d) => d.tier_reason(),
-                BackendKind::Null(_) => TierReason::HostRequest,
-            };
-            device.stats.tier = device.tier;
-            device.stats.tier_reason = device.tier_reason;
-            device.stats.tier_reason_text.set(device.tier_reason.text());
-            device.stats.counters.frames_since_tier_change = 0;
-        }
-
         device.frame = frame;
         device.frame_state = FrameState::Submitted;
         if !fence.is_null() {
@@ -2972,7 +2396,7 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
             fence.signaled = true;
             fence.frame_index = device.frame.index;
         }
-        owner.keep = true;
+        order::keep_the_frame(&mut owner);
         Ok(())
     })
 }
@@ -3005,25 +2429,29 @@ fn read_mat4(data: &[u8; 64]) -> Mat4 {
     out
 }
 
-/// Turns the recorded draws into rasteriser draws, allocated from `alloc`.
-///
-/// The host says *what to shade*; the backend supplies the lighting state. That
-/// split is why this function only has to translate flags.
-///
-/// The allocator is a parameter, not a default: allocating this list from
-/// anywhere but the host allocator means the draws vanish when the allocation is
-/// refused, and the frame is presented empty while every call still returned OK.
 /// The backend-facing description of one frame.
 ///
-/// Built from the frame record and its draw items in one place because three
+/// Built from the frame record and its draw list in one place because three
 /// paths need it - Submit on either tier, and the re-render after a hardware
 /// fault - and a frame that faulted must reach the other tier describing
 /// exactly what the first tier was asked for.
-fn frame_input<'a>(frame: &FrameRecord, draws: &'a [DrawItem<'a>]) -> FrameInput<'a> {
+///
+/// The draw list is the record's own storage, read in place: handing the same
+/// list to a backend every frame is what makes a frame allocate no list of its
+/// own. What the entries point at is the host's buffer storage, which must stay
+/// alive while the frame is in use (see [`FrameRecord::items`]).
+///
+/// `checksum` asks the backend for the frame's colour fingerprint. It is set
+/// only on audit frames, because computing one is a full pass over the frame.
+fn frame_input<'a>(frame: &'a FrameRecord, checksum: bool) -> FrameInput<'a> {
+    // Covariance does the work: the stored entries are `DrawItem<'static>`, and
+    // a `&[DrawItem<'static>]` *is* a `&[DrawItem<'a>]` for every shorter `'a`.
+    let draws: &'a [DrawItem<'a>] = frame.items.as_slice();
     FrameInput {
         frame_index: frame.index,
         width: frame.width,
         height: frame.height,
+        viewport: frame.viewport,
         camera_view: frame.camera_view,
         fov_y_deg: frame.fov_y_deg,
         aspect: frame.aspect,
@@ -3039,111 +2467,99 @@ fn frame_input<'a>(frame: &FrameRecord, draws: &'a [DrawItem<'a>]) -> FrameInput
         clear_depth_enabled: frame.clear_depth_on,
         world_revision: frame.world_revision,
         static_geometry_revision: frame.static_revision,
+        checksum,
         draws,
     }
 }
 
-/// Copies a tightly packed RGBA frame into the host's presentation buffer,
-/// honouring the row pitch and the flip the present descriptor asked for.
-fn blit(pixels: &mut [u8], tight: &[u8], width: u32, height: u32, pitch: u32, flip: u32) {
-    for row in 0..height as usize {
-        let source_row = if flip != 0 { height as usize - 1 - row } else { row };
-        let src_at = source_row * width as usize * 4;
-        let dst_at = row * pitch as usize;
-        pixels[dst_at..dst_at + width as usize * 4].copy_from_slice(&tight[src_at..src_at + width as usize * 4]);
-    }
-}
-
-fn build_draws<'a>(alloc: HostAlloc, records: &'a [DrawRecord]) -> Result<HostVec<DrawItem<'a>>> {
-    let mut draws = HostVec::with_capacity(alloc, records.len())?;
-    for record in records {
-        let vertices: &'a [Vertex] = if record.indices.is_null() {
-            unsafe { core::slice::from_raw_parts(record.vertices, record.vertex_count as usize) }
-        } else {
-            // Indexed draws still need the whole vertex buffer as a slice; the
-            // bound check in Submit proved the indices stay inside it. Walking
-            // the index list here would be a second, subtly different answer.
-            let max = max_index(record);
-            unsafe { core::slice::from_raw_parts(record.vertices, (max + 1) as usize) }
-        };
-        let indices: Option<&'a [u32]> = if record.indices.is_null() {
-            None
-        } else {
-            Some(unsafe { core::slice::from_raw_parts(record.indices, record.index_count as usize) })
-        };
-        let shader = SurfaceShader {
-            textured: record.textured,
-            lit: record.lit,
-            receives_shadow: record.receives_shadow,
-            texture: None,
-            lights: None,
-            shadows: None,
-            flip_normal: false,
-        };
-        draws.push(DrawItem {
-            vertices,
-            indices,
-            transform: record.transform,
-            model: record.model,
-            pipeline: record.pipeline,
-            shader: ShaderRef::Surface(shader),
-            dynamic: record.dynamic,
-            casts_shadow: record.casts_shadow,
-        })?;
-    }
-    Ok(draws)
-}
-
-fn max_index(record: &DrawRecord) -> u32 {
-    let mut max = 0u32;
-    let indices = unsafe { core::slice::from_raw_parts(record.indices, record.index_count as usize) };
-    for value in indices {
-        if *value > max {
-            max = *value;
-        }
-    }
-    max
-}
-
 // -------------------------------------------------------------------- present
+
+/// Keeps what a generated frame needs from the frame being presented - its
+/// pixels, its depth and its camera - and lays the frame into the host's buffer
+/// from the bytes it kept.
+///
+/// Returns what the reads cost, which is this frame's readback: a host that asked
+/// for generated frames pays a depth read it would not otherwise, and the frame
+/// ladder has to see that. Called only for a frame that asked; a host that did
+/// not pays nothing and the present path is the one it always was.
+fn keep_frame_for_generation(
+    device: &mut DeviceHandle,
+    pixels: Option<&mut [u8]>,
+    out_size: u64,
+    out_pitch: u32,
+    flip: u32,
+) -> Result<u64> {
+    let (width, height) = device.backend.frame_size();
+    // Price the history before allocating it: the frame's own size, four bytes a
+    // pixel of colour, four of depth and four of generated image - reserved like
+    // every other allocation this device makes, and re-reserved only when the
+    // frame's size changes.
+    let bytes = u64::from(width) * u64::from(height) * (4 + 4 + 4);
+    if device.framegen.reservation.is_none() || device.framegen.width != width || device.framegen.height != height {
+        device.framegen.reservation = Some(device.budget.reserve_ram(bytes)?);
+        device.framegen.width = width;
+        device.framegen.height = height;
+    }
+    let pixels_per_frame = (width as usize) * (height as usize);
+    device.framegen.color.resize_with(pixels_per_frame * 4, || 0)?;
+    device.framegen.depth.resize_with(pixels_per_frame, || 0.0)?;
+    device.framegen.image.resize_with(pixels_per_frame * 4, || 0)?;
+
+    let tight = width * 4;
+    let started = Instant::now();
+    device
+        .backend
+        .read_frame_tight(device.framegen.color.as_mut_slice(), tight)?;
+    device.backend.depth_into(device.framegen.depth.as_mut_slice())?;
+    let elapsed = started.elapsed().as_nanos() as u64;
+
+    if let Some(out) = pixels {
+        let pitch = host_row_layout(width, height, out_size, out_pitch)? as usize;
+        lay_out_rows(out, device.framegen.color.as_slice(), height as usize, tight as usize, pitch, flip != 0);
+    }
+
+    // The camera pair is the motion a generated frame extrapolates: the frame
+    // just presented, and the one before it.
+    let camera = FrameCamera::new(
+        device.frame.camera_view,
+        device.frame.fov_y_deg,
+        device.frame.aspect,
+        device.frame.near,
+        device.frame.far,
+    );
+    device.framegen.prev = device.framegen.cur;
+    device.framegen.cur = Some(camera);
+    device.framegen.ready = true;
+    Ok(elapsed)
+}
 
 #[no_mangle]
 pub unsafe extern "C" fn reconlPresent(device: *mut DeviceHandle, swapchain: *mut SwapchainHandle, desc: *mut ReconLPresentDesc) -> i32 {
     entry!(device, {
         let device = device_mut!(device);
-        if swapchain.is_null() {
-            return err!(Code::InvalidArgument, "null swapchain");
-        }
-        child!(device, swapchain, Kind::Swapchain, "swapchain");
-        if device.frame_state != FrameState::Submitted {
-            return err!(Code::NoFrame, "there is no submitted frame to present");
-        }
-        // Past this point the frame is consumed: this call either presents it or
-        // ends it. A present that fails for any later reason - an unreadable
-        // descriptor, a buffer too small for the frame - therefore leaves the
-        // device able to open the next frame rather than stuck in `Submitted`
-        // until the host happens to present successfully. Same contract as a
-        // failed submit, and the same counter.
-        let mut owner = FrameOwner::new(device as *mut DeviceHandle);
+        let mut call = order::Present::new(device, swapchain, desc);
+        order::walk(order::PRESENT, &mut call)?;
+        // The frame is already committed (order::PRESENT): this call either
+        // presents it or ends it, and `owner` is what ends it.
+        let (device, pulled, mut owner) = call.into_parts();
+        let order::PresentArguments { out_pixels, out_size, out_pitch, flip } = pulled;
         let swapchain = unsafe { &*swapchain };
-        let (out_pixels, out_size, out_pitch, flip) = if desc.is_null() {
-            (core::ptr::null_mut(), 0u64, 0u32, 0u32)
-        } else {
-            let d = unsafe {
-                check_header::<ReconLPresentDesc>(
-                    desc as *const reconl_core::StructHeader,
-                    struct_type::PRESENT_DESC,
-                    core::mem::size_of::<ReconLPresentDesc>() as u32,
-                    "ReconLPresentDesc",
-                )?
-            };
-            (d.out_pixels, d.out_pixels_size, d.out_row_pitch, d.flip)
-        };
 
         let mut pixels = if !out_pixels.is_null() {
             Some(unsafe { core::slice::from_raw_parts_mut(out_pixels as *mut u8, out_size as usize) })
         } else {
             None
+        };
+
+        // The readback half of this frame's cost, measured where it happens: the
+        // boundary that hands the frame to the host. No backend accounts for it.
+        // A frame that asked for generation reads its pixels out *here* instead
+        // (tightly, with its depth), so the two paths never read the frame twice.
+        let keep = device.frame.framegen && device.backend.can_generate();
+        let mut readback_ns = if keep {
+            keep_frame_for_generation(device, pixels.as_deref_mut(), out_size, out_pitch, flip)?
+        } else {
+            0
         };
 
         // A hardware fault during the readback is reported rather than returned:
@@ -3153,30 +2569,22 @@ pub unsafe extern "C" fn reconlPresent(device: *mut DeviceHandle, swapchain: *mu
         match &mut device.backend {
             BackendKind::SoftCpu(soft) => {
                 let (width, height) = soft.frame_size();
-                if let Some(pixels) = pixels.as_deref_mut() {
-                    let pitch = if out_pitch == 0 { width * 4 } else { out_pitch };
-                    let needed = (height.saturating_sub(1) as u64) * pitch as u64 + width as u64 * 4;
-                    if out_size < needed {
-                        return err!(Code::InvalidArgument, "the present buffer is too small for {}x{}", width, height);
-                    }
-                    let mut tight = vec![0u8; (width * height * 4) as usize];
-                    soft.readback(&mut tight)?;
-                    blit(pixels, &tight, width, height, pitch, flip);
+                if let Some(pixels) = pixels.as_deref_mut().filter(|_| !keep) {
+                    let pitch = host_row_layout(width, height, out_size, out_pitch)?;
+                    let started = Instant::now();
+                    soft.read_frame_into(pixels, pitch, flip)?;
+                    readback_ns = started.elapsed().as_nanos() as u64;
                 }
                 soft.on_frame_end()?;
             }
             BackendKind::D3d11(gpu) => {
                 let (width, height) = gpu.frame_size();
                 let outcome = (|| -> Result<()> {
-                    if let Some(pixels) = pixels.as_deref_mut() {
-                        let pitch = if out_pitch == 0 { width * 4 } else { out_pitch };
-                        let needed = (height.saturating_sub(1) as u64) * pitch as u64 + width as u64 * 4;
-                        if out_size < needed {
-                            return err!(Code::InvalidArgument, "the present buffer is too small for {}x{}", width, height);
-                        }
-                        let mut tight = vec![0u8; (width * height * 4) as usize];
-                        gpu.readback(&mut tight)?;
-                        blit(pixels, &tight, width, height, pitch, flip);
+                    if let Some(pixels) = pixels.as_deref_mut().filter(|_| !keep) {
+                        let pitch = host_row_layout(width, height, out_size, out_pitch)?;
+                        let started = Instant::now();
+                        gpu.read_frame_into(pixels, pitch, flip)?;
+                        readback_ns = started.elapsed().as_nanos() as u64;
                     }
                     gpu.on_frame_end()
                 })();
@@ -3190,7 +2598,7 @@ pub unsafe extern "C" fn reconlPresent(device: *mut DeviceHandle, swapchain: *mu
             }
             BackendKind::Null(null) => {
                 if let Some(pixels) = pixels.as_deref_mut() {
-                    let pitch = if out_pitch == 0 { swapchain.width * 4 } else { out_pitch };
+                    let pitch = host_row_layout(swapchain.width, swapchain.height, out_size, out_pitch)?;
                     null.present(Some(pixels), pitch)?;
                 } else {
                     null.present(None, 0)?;
@@ -3206,24 +2614,36 @@ pub unsafe extern "C" fn reconlPresent(device: *mut DeviceHandle, swapchain: *mu
             if !device.may_offload() {
                 return Err(fault);
             }
-            device.present_after_fault(&fault, pixels.as_deref_mut(), out_size, out_pitch, flip)?;
+            // The readback that faulted handed nothing over; the one that did
+            // is the reference tier's, and its cost is this frame's too.
+            let recovered =
+                device.present_after_fault(&fault, pixels.as_deref_mut(), out_size, out_pitch, flip)?;
+            readback_ns = readback_ns.saturating_add(recovered);
         }
 
+        device.readback = (readback_ns > 0).then(|| Readback {
+            backend: device.backend_id(),
+            frame_index: device.frame.index,
+            ns: readback_ns,
+        });
         device.stats.counters.frames_presented += 1;
         device.stats.counters.frames_since_tier_change += 1;
-        device.stats.last_frame = device.frame_numbers();
+        device.stats.last_frame = device.frame_cost();
+        // The number the ladder judges is composed here, where the readback the
+        // host waited for is known: a frame presented to memory is not finished
+        // until the device has copied it out.
         let total = device.stats.last_frame.total_ns;
         device.stats.frames.push(total);
         device.frame_state = FrameState::Idle;
-        owner.keep = true;
+        order::keep_the_frame(&mut owner);
 
         // The ladder, driven by measurement, run with the frame closed so a
         // backend change here cannot be observed mid-present. A policy that
         // cannot rebuild a backend leaves the device where it is rather than
         // failing a present that has already succeeded.
         let (index, width, height) = (device.frame.index, device.frame.width, device.frame.height);
-        if let Err(e) = device.apply_offload_policy(index, width, height) {
-            log_warn!("the offload could not change backend: {}", e.message.as_str());
+        if let Err(e) = device.apply_tier_policy(index, width, height) {
+            log_warn!("the tier ladder could not change the device: {}", e.message.as_str());
         }
         Ok(())
     })
@@ -3238,6 +2658,19 @@ pub unsafe extern "C" fn reconlGetStats(device: *mut DeviceHandle, out: *mut Rec
         if out.is_null() {
             return err!(Code::InvalidArgument, "null stats output");
         }
+        // The caller's own struct, validated against the prefix every revision
+        // has carried. This call reports and never reads, so the contract is
+        // "no more than you declared": a host compiled against an older header
+        // is filled to its own end and not one byte further.
+        unsafe {
+            check_header::<ReconLStats>(
+                out as *const reconl_core::StructHeader,
+                struct_type::STATS,
+                ReconLStats::MIN_SIZE,
+                "ReconLStats",
+            )?;
+        }
+        let declared = unsafe { (*out).base.struct_size as usize };
         let mut stats = ReconLStats {
             base: reconl_core::StructHeader::new(core::mem::size_of::<ReconLStats>() as u32, struct_type::STATS),
             backend: device.backend_id(),
@@ -3259,6 +2692,14 @@ pub unsafe extern "C" fn reconlGetStats(device: *mut DeviceHandle, out: *mut Rec
             last_result: result::OK,
             tier_reason_text: [0; abi::RECONL_MAX_MESSAGE],
             device_name: [0; abi::RECONL_MAX_NAME],
+            framegen: ReconLFrameGenStats {
+                ready: if device.framegen.ready { 1 } else { 0 },
+                generated: device.framegen.generated,
+                generated_ns: device.framegen.generated_ns,
+                last_ahead: device.framegen.last_ahead,
+                reserved: 0,
+                reserved2: 0,
+            },
         };
         // The device owns these: it is the only thing that sees a present, a
         // dropped frame, or a failed call. Reading them off the backend left
@@ -3273,9 +2714,11 @@ pub unsafe extern "C" fn reconlGetStats(device: *mut DeviceHandle, out: *mut Rec
         stats.last_result = counters.last_result.map(|c| c.as_i32()).unwrap_or(result::OK);
         set_str(&mut stats.tier_reason_text, device.tier_reason.text());
         set_str(&mut stats.device_name, device.device_name.as_str());
-        let downgrades = device.downgrade_entries();
-        stats.downgrade_count = downgrades.len() as u32;
-        for (slot, d) in stats.downgrades.iter_mut().zip(downgrades.iter()) {
+        // The log is the device's own, and the count is every change it has made
+        // (not only the ones still in the ring), which is what the header
+        // promises: a change is never un-happened by a ring wrapping.
+        stats.downgrade_count = device.downgrades.total();
+        for (slot, d) in stats.downgrades.iter_mut().zip(device.downgrades.iter()) {
             slot.from = d.from as u32;
             slot.to = d.to as u32;
             slot.reason = d.reason as u32;
@@ -3283,7 +2726,59 @@ pub unsafe extern "C" fn reconlGetStats(device: *mut DeviceHandle, out: *mut Rec
             slot.at_ns = d.at_ns;
             set_str(&mut slot.detail, d.detail.as_str());
         }
-        unsafe { out.write(stats) };
+        // Only the bytes the caller declared: a shorter struct gets the prefix
+        // it knows about, and nothing is written past its end.
+        let bytes = declared.min(core::mem::size_of::<ReconLStats>());
+        unsafe {
+            core::ptr::copy_nonoverlapping(&stats as *const ReconLStats as *const u8, out as *mut u8, bytes)
+        };
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn reconlPresentGenerated(
+    device: *mut DeviceHandle,
+    swapchain: *mut SwapchainHandle,
+    desc: *mut ReconLPresentDesc,
+    ahead: f32,
+) -> i32 {
+    entry!(device, {
+        let device = device_mut!(device);
+        let mut call = order::PresentGenerated::new(device, swapchain, desc, ahead);
+        order::walk(order::PRESENT_GENERATED, &mut call)?;
+        let (device, order::GeneratedArguments { out_pixels, out_size, width, height, pitch, flip }) =
+            call.into_parts();
+        let tight = width * 4;
+        let out = unsafe {
+            core::slice::from_raw_parts_mut(out_pixels as *mut u8, out_size as usize)
+        };
+
+        let Some(camera) = device.framegen.cur else {
+            return err!(Code::NoFrame, "no camera was kept with the last frame");
+        };
+        // The motion is the pair; a first frame has no pair and generates itself.
+        let previous = device.framegen.prev.unwrap_or(camera);
+        let started = Instant::now();
+        let result = {
+            let history = FrameHistory {
+                color: device.framegen.color.as_slice(),
+                depth: device.framegen.depth.as_slice(),
+                camera,
+                width,
+                height,
+            };
+            let image = device.framegen.image.as_mut_slice();
+            framegen::generate(&history, &previous, ahead, image)
+        };
+        result?;
+        let elapsed = started.elapsed().as_nanos() as u64;
+        lay_out_rows(out, device.framegen.image.as_slice(), height as usize, tight as usize, pitch as usize, flip != 0);
+
+        device.framegen.generated = device.framegen.generated.saturating_add(1);
+        device.framegen.generated_ns = device.framegen.generated_ns.saturating_add(elapsed);
+        device.framegen.last_ahead = ahead;
+        log_info!("generated frame {} at ahead {}", device.framegen.generated, ahead);
         Ok(())
     })
 }
@@ -3313,7 +2808,7 @@ fn shadow_stats(device: &DeviceHandle) -> ReconLShadowStats {
 }
 
 fn frame_timing(device: &DeviceHandle) -> ReconLFrameTiming {
-    let f = device.frame_numbers();
+    let f = device.frame_cost();
     let timing = device.stats.frames;
     ReconLFrameTiming {
         base: reconl_core::StructHeader::new(core::mem::size_of::<ReconLFrameTiming>() as u32, struct_type::FRAME_DESC),
@@ -3347,6 +2842,11 @@ pub unsafe extern "C" fn reconlResetStats(device: *mut DeviceHandle) -> i32 {
         device.stats.shadows = ShadowCounters::default();
         device.stats.frames.reset();
         device.stats.last_frame = FrameNumbers::default();
+        // Frame generation's own counters are part of the same measurement: a
+        // host that resets between two intervals must not read a `generated`
+        // that still counts the previous one, or its presented/rendered ratio
+        // is the sum of both.
+        device.framegen.reset_counters();
         Ok(())
     })
 }
@@ -3414,15 +2914,9 @@ pub unsafe extern "C" fn reconlRequestTier(device: *mut DeviceHandle, tier: u32,
         let mut current = device.tier;
         while current != requested && current < Tier::OutOfCore {
             let next = if current < requested { requested } else { current.step_down() };
-            device.record_downgrade(current, next, reason, device.frame.index, "host requested a tier change");
+            device.apply_tier(next, reason, device.frame.index, "host requested a tier change");
             current = next;
         }
-        device.tier = current;
-        device.tier_reason = reason;
-        device.stats.tier = current;
-        device.stats.tier_reason = reason;
-        device.stats.tier_reason_text.set(reason.text());
-        device.stats.counters.frames_since_tier_change = 0;
         log_info!("tier requested: now {}", current.name());
         Ok(())
     })
@@ -3467,7 +2961,7 @@ pub unsafe extern "C" fn reconlConfigureShadows(device: *mut DeviceHandle, confi
     entry!(device, {
         let device = device_mut!(device);
         if config.is_null() {
-            device.shadow = reconl_backend_softcpu::ShadowRequest::default();
+            device.shadow = ShadowRequest::default();
             return Ok(());
         }
         let config = unsafe {
@@ -3501,87 +2995,4 @@ pub unsafe extern "C" fn reconlBumpWorldRevision(device: *mut DeviceHandle, flag
     })
 }
 
-// ------------------------------------------------------------------- lifetime
-
-#[no_mangle]
-pub unsafe extern "C" fn reconlRetain(handle: *mut c_void) -> u32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let header = handle as *mut HandleHeader;
-    unsafe { (*header).refcount.fetch_add(1, Ordering::Relaxed) + 1 }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn reconlRelease(handle: *mut c_void) -> u32 {
-    if handle.is_null() {
-        return 0;
-    }
-    let header_ptr = handle as *mut HandleHeader;
-    let kind = unsafe { Kind::from_u32((*header_ptr).kind) };
-    let previous = unsafe { (*header_ptr).refcount.fetch_sub(1, Ordering::AcqRel) };
-    if previous > 1 {
-        return previous - 1;
-    }
-    let device_ptr = unsafe { (*header_ptr).device };
-    match kind {
-        Kind::Device => {
-            let device = handle as *mut DeviceHandle;
-            let alloc = unsafe { (*device).alloc };
-            unsafe { handle_free(alloc, device) };
-        }
-        Kind::Buffer => {
-            let ptr = handle as *mut BufferHandle;
-            let alloc = unsafe { device_alloc(device_ptr) };
-            unsafe { handle_free(alloc, ptr) };
-            release_device_reference(device_ptr);
-        }
-        Kind::Texture => {
-            let ptr = handle as *mut TextureHandle;
-            let alloc = unsafe { device_alloc(device_ptr) };
-            unsafe { handle_free(alloc, ptr) };
-            release_device_reference(device_ptr);
-        }
-        Kind::Pipeline => {
-            let ptr = handle as *mut PipelineHandle;
-            let alloc = unsafe { device_alloc(device_ptr) };
-            unsafe { handle_free(alloc, ptr) };
-            release_device_reference(device_ptr);
-        }
-        Kind::Swapchain => {
-            let ptr = handle as *mut SwapchainHandle;
-            let alloc = unsafe { device_alloc(device_ptr) };
-            unsafe { handle_free(alloc, ptr) };
-            release_device_reference(device_ptr);
-        }
-        Kind::CommandList => {
-            let ptr = handle as *mut CommandListHandle;
-            let alloc = unsafe { device_alloc(device_ptr) };
-            unsafe { handle_free(alloc, ptr) };
-            release_device_reference(device_ptr);
-        }
-        Kind::Fence => {
-            let ptr = handle as *mut FenceHandle;
-            let alloc = unsafe { device_alloc(device_ptr) };
-            unsafe { handle_free(alloc, ptr) };
-            release_device_reference(device_ptr);
-        }
-    }
-    0
-}
-
-unsafe fn device_alloc(device: *mut DeviceHandle) -> HostAlloc {
-    if device.is_null() {
-        return HostAlloc::system();
-    }
-    unsafe { (*device).alloc }
-}
-
-unsafe fn release_device_reference(device: *mut DeviceHandle) {
-    if device.is_null() {
-        return;
-    }
-    // SAFETY: the child held a reference, so the device is alive.
-    unsafe { reconlRelease(device as *mut c_void) };
-}
 

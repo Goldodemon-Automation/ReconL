@@ -1,0 +1,14 @@
+[package]
+name = "reconl-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl-core = { workspace = true }
+reconl-raster = { workspace = true }
+reconl-shadow = { workspace = true }
+
+[lib]
+name = "reconl_contract"
+path = "src/lib.rs"

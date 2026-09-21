@@ -13,7 +13,8 @@
 //! floor at a position that can be computed by hand and checked at a pixel
 //! coordinate computed by the same projection matrix the renderer used.
 
-use reconl_backend_softcpu::{caps_for, FrameInput, FramePolicy, ShadowRequest, SoftCpuConfig, SoftCpuDevice};
+use reconl_backend_softcpu::{caps_for, FramePolicy, SoftCpuConfig, SoftCpuDevice};
+use reconl_contract::{FrameInput, ShadowRequest};
 use reconl_core::alloc::HostAlloc;
 use reconl_core::budget::{Budget, BudgetCaps};
 use reconl_core::error::{Code, Error};
@@ -164,9 +165,6 @@ struct Options {
     refresh: u32,
     spill_dir: Option<PathBuf>,
     require_geometry: bool,
-    frame_time_override_ns: Option<u64>,
-    over_target_frames: u32,
-    target_frame_ms: u32,
 }
 
 impl Default for Options {
@@ -181,9 +179,6 @@ impl Default for Options {
             refresh: 1,
             spill_dir: None,
             require_geometry: false,
-            frame_time_override_ns: None,
-            over_target_frames: 8,
-            target_frame_ms: 250,
         }
     }
 }
@@ -219,9 +214,6 @@ fn new_device(options: &Options) -> Result<SoftCpuDevice, Error> {
         spill_dir: options.spill_dir.clone(),
         arena_bytes: if options.spill_dir.is_some() { 16 << 20 } else { 0 },
         shadow: options.shadow_request(),
-        target_frame_ms: options.target_frame_ms,
-        over_target_frames_to_downgrade: options.over_target_frames,
-        frame_time_override_ns: options.frame_time_override_ns,
         frame_policy: FramePolicy {
             require_geometry: options.require_geometry,
             ..FramePolicy::default()
@@ -231,16 +223,29 @@ fn new_device(options: &Options) -> Result<SoftCpuDevice, Error> {
     SoftCpuDevice::new(alloc, budget, config)
 }
 
+/// One frame with its colour checksum asked for, which is what these tests
+/// compare frames by.
 fn render_one<'a>(
     device: &mut SoftCpuDevice,
     frame_index: u64,
     draws: &'a [DrawItem<'a>],
+) -> Result<FrameNumbers, Error> {
+    render_with(device, frame_index, draws, true)
+}
+
+/// One frame, with the frame's colour checksum asked for or not.
+fn render_with<'a>(
+    device: &mut SoftCpuDevice,
+    frame_index: u64,
+    draws: &'a [DrawItem<'a>],
+    checksum: bool,
 ) -> Result<FrameNumbers, Error> {
     let (view, _proj) = camera();
     let input = FrameInput {
         frame_index,
         width: WIDTH,
         height: HEIGHT,
+        viewport: (0, 0),
         camera_view: view,
         fov_y_deg: 60.0,
         aspect: WIDTH as f32 / HEIGHT as f32,
@@ -256,6 +261,7 @@ fn render_one<'a>(
         clear_depth_enabled: true,
         world_revision: WORLD_REVISION,
         static_geometry_revision: STATIC_REVISION,
+        checksum,
         draws,
     };
     device.render(&input)
@@ -266,7 +272,6 @@ struct Outcome {
     color: Vec<f32>,
     shadows: ShadowCounters,
     tier: Tier,
-    downgrades: Vec<(Tier, Tier, TierReason)>,
     map_max_depth: f32,
 }
 
@@ -298,13 +303,11 @@ fn run(options: &Options, frames: u64) -> Result<Outcome, Error> {
             }
         }
     }
-    let downgrades = device.downgrades().iter().map(|d| (d.from, d.to, d.reason)).collect();
     Ok(Outcome {
         checksums,
         color: device.color_slice().to_vec(),
         shadows: device.shadows(),
         tier: device.tier(),
-        downgrades,
         map_max_depth: max_depth,
     })
 }
@@ -510,6 +513,7 @@ fn a_frozen_cascade_still_updates_when_the_geometry_it_holds_changes() {
         frame_index: 1,
         width: WIDTH,
         height: HEIGHT,
+        viewport: (0, 0),
         camera_view: view,
         fov_y_deg: 60.0,
         aspect: 1.0,
@@ -525,6 +529,7 @@ fn a_frozen_cascade_still_updates_when_the_geometry_it_holds_changes() {
         clear_depth_enabled: true,
         world_revision: WORLD_REVISION + 1,
         static_geometry_revision: STATIC_REVISION,
+        checksum: true,
         draws: &draws2,
     };
     device.render(&input).unwrap();
@@ -559,23 +564,94 @@ fn an_empty_frame_is_reported_rather_than_counted() {
 }
 
 #[test]
-fn the_tier_ladder_steps_down_when_the_frame_target_is_blown() {
-    let options = Options {
-        tier: Tier::CpuRam,
-        target_frame_ms: 1,
-        over_target_frames: 2,
-        frame_time_override_ns: Some(20_000_000),
-        ..Options::default()
-    };
+fn a_frame_that_draws_less_than_the_one_before_it_leaves_no_stale_entries() {
+    // The lists a frame fills outlive the frame - the frame's draws, the cascade
+    // list and the colour list are cleared and refilled instead of reallocated -
+    // so the failure this pins is a stale tail: an entry the frame before left
+    // behind, still being visited. A frame that draws a floor where the previous
+    // frame drew a floor and a caster must render the floor alone, and render it
+    // exactly as a device that never saw the caster does.
+    let options = Options::default();
+    let mut device = new_device(&options).unwrap();
+    let floor = floor_quad();
+    let (cube_verts, cube_indices) = cube([0.0, 0.6, 0.0], 0.5);
+    let (view, proj) = camera();
+    let pv = math::mul(&proj, &view);
+
+    let full = [floor_draw(&floor, pv), caster_draw(&cube_verts, &cube_indices, pv, false)];
+    let lean = [floor_draw(&floor, pv)];
+
+    render_one(&mut device, 0, &full).unwrap();
+    device.on_frame_end().unwrap();
+    let long_checksum = device.color_checksum();
+
+    let numbers = render_one(&mut device, 1, &lean).unwrap();
+    device.on_frame_end().unwrap();
+    let short_checksum = device.color_checksum();
+
+    // The same lean frame on a device whose storage never held the caster is the
+    // definition of what the lean frame is.
+    let mut fresh = new_device(&options).unwrap();
+    render_one(&mut fresh, 1, &lean).unwrap();
+    fresh.on_frame_end().unwrap();
+    assert_eq!(
+        short_checksum,
+        fresh.color_checksum(),
+        "a frame that draws less than the one before it rendered storage the earlier frame left behind"
+    );
+    assert_ne!(
+        short_checksum, long_checksum,
+        "the two frames must differ, or this check proves nothing"
+    );
+    assert_eq!(numbers.triangles_in, 2, "the lean frame visited a triangle it never drew");
+}
+
+#[test]
+fn the_reference_backend_does_not_decide_its_own_tier() {
+    // The tier ladder has one owner: the device (`ffi/src/offload.rs`). A backend
+    // holds no target, no threshold, no counter and no record of its own, because
+    // the number the ladder judges - the frame the host waited for - cannot be
+    // measured from inside a render pass, and a second decider is how the
+    // host-visible tier and its log came to disagree. This backend renders the
+    // tier it was created with, whatever the frames cost here, until the device
+    // tells it otherwise.
+    let options = Options { tier: Tier::CpuRam, ..Options::default() };
     let outcome = run(&options, 3).unwrap();
-    assert_eq!(outcome.tier, Tier::CpuThrifty, "two slow frames should cost exactly one tier");
-    assert_eq!(outcome.downgrades.len(), 1);
-    let (from, to, reason) = outcome.downgrades[0];
-    assert_eq!((from, to), (Tier::CpuRam, Tier::CpuThrifty));
-    assert_eq!(reason, TierReason::FrameTimeOverTarget);
-    // Stepping down did not stop the frames: every frame still produced an image.
+    assert_eq!(outcome.tier, Tier::CpuRam, "the backend relabelled itself for frame time");
     assert_eq!(outcome.checksums.len(), 3);
     assert!(outcome.checksums.iter().all(|c| *c != 0));
+}
+
+#[test]
+fn a_relabel_applies_the_tier_the_device_decided() {
+    let options = Options { tier: Tier::CpuRam, ..Options::default() };
+    let mut device = new_device(&options).unwrap();
+    let floor = floor_quad();
+    let (view, proj) = camera();
+    let pv = math::mul(&proj, &view);
+    let draws = vec![floor_draw(&floor, pv)];
+    render_one(&mut device, 0, &draws).unwrap();
+    assert!(device.counters().frames_since_tier_change > 0);
+
+    device.relabel(Tier::CpuThrifty, TierReason::FrameTimeOverTarget);
+    assert_eq!(device.tier(), Tier::CpuThrifty);
+    assert_eq!(device.tier_reason(), TierReason::FrameTimeOverTarget);
+    assert_eq!(
+        device.counters().frames_since_tier_change,
+        0,
+        "a tier change restarts the clock a host reads"
+    );
+
+    // The tier is applied, not queued: the next frame renders at it.
+    let numbers = render_one(&mut device, 1, &draws).unwrap();
+    assert!(numbers.triangles_in > 0);
+    assert_eq!(device.tier(), Tier::CpuThrifty);
+
+    // A relabel to the tier the device is already on is a no-op: the ladder
+    // steps down, so T4 has nothing below it to apply.
+    device.relabel(Tier::OutOfCore, TierReason::MemoryPressure);
+    device.relabel(Tier::OutOfCore, TierReason::MemoryPressure);
+    assert_eq!(device.tier(), Tier::OutOfCore);
 }
 
 #[test]
@@ -619,4 +695,69 @@ fn probing_a_tier_reports_capabilities_consistent_with_the_ladder() {
     assert!(plan_t4.disk_backed);
     assert_eq!(caps_for(Tier::CpuThrifty), caps_for(Tier::CpuRam) | reconl_core::tier::caps::DISK_SPILL);
     assert!(plan_t2.cascades <= 4 && plan_t4.cascades <= 4);
+}
+
+/// The bin a frame rasterises is that frame's, not every frame's so far.
+///
+/// The per-tile counts were sized but never zeroed, so each frame added its
+/// triangles on top of the previous frames' and the work per frame climbed with
+/// the frame count. It was invisible in the pixels - the stale entries
+/// re-rasterised the same geometry - and fatal to a long run.
+#[test]
+fn the_work_of_a_frame_does_not_grow_with_the_frame_count() {
+    let mut device = new_device(&Options::default()).unwrap();
+    let floor = floor_quad();
+    let (view, proj) = camera();
+    let pv = math::mul(&proj, &view);
+    let draws = vec![floor_draw(&floor, pv)];
+
+    let first = render_one(&mut device, 0, &draws).unwrap();
+    for frame in 1..32 {
+        render_one(&mut device, frame, &draws).unwrap();
+    }
+    let late = render_one(&mut device, 32, &draws).unwrap();
+    assert_eq!(
+        late.triangles_binned, first.triangles_binned,
+        "frame 33 binned {} triangles where frame 0 binned {}",
+        late.triangles_binned, first.triangles_binned
+    );
+    assert_eq!(late.tiles_rendered, first.tiles_rendered, "tiles rendered must not accumulate");
+    assert_eq!(late.pixels_shaded, first.pixels_shaded, "shaded pixels must not accumulate");
+}
+
+/// The frame's colour checksum is a full pass over the colour target, so it is
+/// computed only when the caller asks for one. It used to run on every submit,
+/// for callers that never read it - and leaving it out must not change the frame
+/// a host is handed.
+#[test]
+fn the_frame_checksum_is_computed_only_when_it_is_asked_for() {
+    let mut device = new_device(&Options::default()).unwrap();
+    let floor = floor_quad();
+    let (view, proj) = camera();
+    let pv = math::mul(&proj, &view);
+    let draws = vec![floor_draw(&floor, pv)];
+
+    render_with(&mut device, 0, &draws, true).unwrap();
+    assert_ne!(
+        device.color_checksum(),
+        0,
+        "a checksum that was asked for is a real fingerprint"
+    );
+    // The same call a present makes: the frame, as the host is handed it.
+    let mut frame = vec![0u8; device.frame_size().0 as usize * device.frame_size().1 as usize * 4];
+    device.read_frame_into(&mut frame, 0, 0).unwrap();
+
+    render_with(&mut device, 1, &draws, false).unwrap();
+    assert_eq!(
+        device.color_checksum(),
+        0,
+        "no caller reads a checksum, so none is computed"
+    );
+    let mut again = vec![0u8; frame.len()];
+    device.read_frame_into(&mut again, 0, 0).unwrap();
+    assert_eq!(
+        again.as_slice(),
+        frame.as_slice(),
+        "skipping the checksum must not change the frame"
+    );
 }

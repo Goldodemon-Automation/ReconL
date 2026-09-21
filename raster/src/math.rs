@@ -152,6 +152,49 @@ pub fn perspective_rh_reversed_z(fov_y_degrees: f32, aspect: f32, near: f32, far
     ]
 }
 
+/// The inverse of [`perspective_rh_reversed_z`]: clip space back to view space.
+///
+/// Frame generation reprojects pixels from one frame's camera into another's, so
+/// it needs the unprojection as a matrix - and it has to be *this* one, written
+/// from the same parameters as the forward map, or the two drift and a
+/// reprojected pixel lands somewhere plausible but wrong.
+///
+/// The forward map takes view `(x, y, z, 1)` to homogeneous clip
+/// `(f/aspect*x, f*y, a*z + b, -z)`. Inverting that row by row:
+///
+/// * `x = (aspect/f) * X`, `y = (1/f) * Y`
+/// * `z = -W`
+///
+/// The third row is then redundant - the forward map's `Z` is a function of `W`
+/// alone, `Z = -a*W + b` - which is exactly why an unprojection needs no divide
+/// and why the fused reprojection matrix in [`crate::framegen`] can be applied
+/// to `(ndc_x, ndc_y, depth, 1)` directly. The row is written as `-W` rather than
+/// dropped so the result is a square matrix that composes with the projections.
+pub fn perspective_rh_reversed_z_inverse(fov_y_degrees: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
+    let f = 1.0 / (fov_y_degrees * 0.5 * core::f32::consts::PI / 180.0).tan();
+    let nf = 1.0 / (near - far);
+    let a = -near * nf;
+    let b = -near * far * nf;
+    // Applied to the *normalised* clip point `(ndc_x, ndc_y, depth, 1)`, this
+    // returns `(x, y, z, 1) * (depth + a)`:
+    //
+    // * the view-space depth is `z = -b / (depth + a)`, whose numerator and
+    //   denominator are each linear in the input - which is what lets one
+    //   projective matrix carry an unprojection that is not affine in depth;
+    // * `x` and `y` are that same depth times `ndc_x * aspect / f` and
+    //   `ndc_y / f`, so they share the denominator.
+    //
+    // The result is only a representative until it is divided by its own `w`,
+    // exactly as the forward map's is - which is what makes a chain of these
+    // composable into one matrix per generated frame.
+    [
+        aspect * b / f, 0.0, 0.0, 0.0,
+        0.0, b / f, 0.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+        0.0, 0.0, -b, a,
+    ]
+}
+
 /// Right-handed orthographic projection, reversed-Z, `[0,1]` depth.
 pub fn ortho_rh_reversed_z(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> Mat4 {
     let rl = 1.0 / (right - left);
@@ -185,6 +228,44 @@ mod tests {
         let mid = mul_point(&p, [0.0, 0.0, -10.0]);
         let z_mid = mid[2] / mid[3];
         assert!(z_mid > z_far && z_mid < z_near, "mid {z_mid} not between");
+    }
+
+    /// The unprojection is checked against the projection, not against itself: a
+    /// view-space point pushed through the forward map and pulled back through
+    /// the inverse must come out where it started.
+    ///
+    /// This is what makes the fused reprojection matrix in `framegen` legal: the
+    /// inverse is applied to the *homogeneous* clip vector, so it has to be a
+    /// true projective inverse of this exact forward map, at every depth and
+    /// frustum shape.
+    #[test]
+    fn the_perspective_inverse_round_trips_the_projection() {
+        for (fov, aspect, near, far) in [
+            (60.0f32, 1.0f32, 0.1f32, 100.0f32),
+            (90.0, 16.0 / 9.0, 0.05, 1000.0),
+            (35.0, 0.75, 1.0, 40.0),
+        ] {
+            let p = perspective_rh_reversed_z(fov, aspect, near, far);
+            let inv = perspective_rh_reversed_z_inverse(fov, aspect, near, far);
+            for z in [-near, -1.0, -(near + far) * 0.5, -far * 0.999] {
+                for (x, y) in [(0.0f32, 0.0f32), (0.3, -0.7), (-1.2, 0.9)] {
+                    let view = [x, y, z];
+                    // Through the forward map and into normalised device
+                    // coordinates, which is the form the inverse is applied to
+                    // and the form a depth buffer holds.
+                    let clip = mul_point(&p, view);
+                    let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+                    let back = mul_point(&inv, ndc);
+                    let round_trip = [back[0] / back[3], back[1] / back[3], back[2] / back[3]];
+                    for i in 0..3 {
+                        assert!(
+                            (round_trip[i] - view[i]).abs() < 1.0e-4,
+                            "fov {fov}, aspect {aspect}: {view:?} round-tripped to {round_trip:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

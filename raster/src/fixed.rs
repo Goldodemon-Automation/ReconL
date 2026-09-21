@@ -7,7 +7,8 @@
 //!   subpixel produces the same coverage on every backend and every run.
 //! * **Top-left fill rule.** A pixel centre exactly on a shared edge belongs to
 //!   exactly one of the two triangles that share it: never doubled, never
-//!   dropped. Tested in `tests` below and in `tests/shared_edge.rs`.
+//!   dropped. Tested in `tests` below
+//!   (`top_left_rule_covers_a_shared_edge_exactly_once`).
 
 /// Subpixel bits: 8, i.e. a fixed-point unit of 1/256 px.
 pub const SUBPIXEL_BITS: u32 = 8;

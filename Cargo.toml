@@ -11,6 +11,7 @@ members = [
     "shadow",
     "resource",
     "scene",
+    "contract",
     "backends/null",
     "backends/soft-cpu",
     "backends/d3d11",
@@ -30,6 +31,7 @@ reconl-raster = { path = "raster" }
 reconl-shadow = { path = "shadow" }
 reconl-resource = { path = "resource" }
 reconl-scene = { path = "scene" }
+reconl-contract = { path = "contract" }
 reconl-backend-null = { path = "backends/null" }
 reconl-backend-softcpu = { path = "backends/soft-cpu" }
 reconl-backend-d3d11 = { path = "backends/d3d11" }
@@ -37,6 +39,9 @@ reconl-png = { path = "tools/png" }
 reconl-host = { path = "tools/host" }
 reconl = { package = "reconl-ffi", path = "ffi" }
 
+# The shipped profile aborts on panic: the crate's contract is that nothing
+# unwinds across the ABI boundary in a release build, and the release profile is
+# what ships.
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -48,3 +53,18 @@ panic = "unwind"
 
 [profile.test]
 opt-level = 2
+
+# Release-speed tests with one dependency graph.
+#
+# `cargo test --release` cannot be used with `panic = "abort"`: cargo forces
+# `panic = "unwind"` for test targets, so the whole graph - `reconl-ffi`
+# included - is built twice, an abort graph for the bins and examples and an
+# unwind graph for the test binaries. Both emit `reconl.dll`, `libreconl.a` and
+# `libreconl.rlib` under the same names in `deps/`, which cargo warns about
+# (issue 6313) and which makes a workspace test run fail every few tries, with
+# an unrelated tool reporting `can't find crate for reconl_host`. This profile
+# is release without the abort, so a test run builds one graph and cannot race
+# itself.
+[profile.tested]
+inherits = "release"
+panic = "unwind"

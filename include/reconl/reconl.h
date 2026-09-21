@@ -142,6 +142,7 @@ typedef enum ReconLStructType {
     RECONL_STRUCT_LIGHT_LIST = 19,
     RECONL_STRUCT_ERROR_INFO = 20,
     RECONL_STRUCT_CAMERA = 21,
+    RECONL_STRUCT_FRAME_GEN = 22,   /* ReconLFrameGenDesc */
     RECONL_STRUCT_SOFTCPU_DESC = 64,
     RECONL_STRUCT_NULL_DESC = 65,
     RECONL_STRUCT_D3D11_DESC = 66
@@ -441,7 +442,8 @@ typedef struct ReconLDeviceDesc {
     uint32_t            flags;
     ReconLMemoryBudget* budget;          /* optional, may be NULL                     */
     ReconLAllocator     allocator;       /* required; zeroed allocator = refuse start */
-    const void*         backend_desc;    /* ReconLBase-derived backend descriptor     */
+    const void*         backend_desc;    /* ReconL*Desc from reconl_backends.h;       */
+                                         /* reserved: accepted and never read in v0.1 */
 } ReconLDeviceDesc;
 
 typedef struct ReconLSwapchainDesc {
@@ -483,7 +485,7 @@ typedef struct ReconLTextureLevel {
     ReconLBase  base;
     uint32_t    mip;
     uint32_t    layer;
-    uint32_t    row_pitch;   /* bytes per row                              */
+    uint32_t    row_pitch;   /* bytes per row; < width*4 is INVALID_ARGUMENT  */
     uint32_t    row_count;   /* rows in this level                          */
     const void* data;
     uint64_t    data_size;
@@ -629,6 +631,14 @@ typedef struct ReconLMemoryStats {
     uint32_t    reserved;
 } ReconLMemoryStats;
 
+/* The cost of one frame, as the device measured it.
+ *
+ * `total_ns` is the whole frame the host asked for, not just the rendering in
+ * it: when a backend copies the frame out of the device because the host
+ * presents to memory, that copy counts here, because a host reading the frame
+ * waited for it and the tier ladder decides on this number. The boundary that
+ * made the host wait composes this number, once, for every backend; the stage
+ * fields below are the parts the backend itself instruments. */
 typedef struct ReconLFrameTiming {
     ReconLBase  base;
     uint64_t    frame_index;
@@ -667,6 +677,22 @@ typedef struct ReconLStatsDesc {
     uint32_t    reserved;
 } ReconLStatsDesc;
 
+/* Frame generation, as it was asked for and as it was delivered.
+ *
+ * `generated` is not part of `frames_presented`: that stays the number of frames
+ * the host *rendered*, which is the number the tier ladder judges. A host's
+ * presented rate is `frames_presented + generated` over the same interval. */
+typedef struct ReconLFrameGenStats {
+    uint32_t    ready;          /* 1 = a generated frame can be asked for now
+                                 *     (the newest frame enabled it and kept
+                                 *     its depth)                              */
+    uint32_t    generated;      /* images handed over so far                   */
+    uint64_t    generated_ns;   /* total cost of generating them               */
+    float       last_ahead;     /* look-ahead of the last one, in intervals    */
+    uint32_t    reserved;
+    uint32_t    reserved2;
+} ReconLFrameGenStats;
+
 typedef struct ReconLStats {
     ReconLBase          base;
     ReconLBackendId     backend;
@@ -688,6 +714,11 @@ typedef struct ReconLStats {
     ReconLResult        last_result;
     char                tier_reason_text[RECONL_MAX_MESSAGE];
     char                device_name[RECONL_MAX_NAME];
+    /* Appended: a caller whose `struct_size` stops before this field is filled
+     * with everything above and nothing here, so a host compiled against an
+     * older header keeps working. `reconlGetStats` writes no more than the
+     * caller declared. */
+    ReconLFrameGenStats framegen;
 } ReconLStats;
 
 typedef struct ReconLErrorInfo {
@@ -747,6 +778,18 @@ typedef struct ReconLRenderPassDesc {
     uint32_t              reserved;
     ReconLColorAttachment color[RECONL_MAX_ATTACHMENTS];
     ReconLTexture*        depth;
+    /* The pass's viewport, in *frame* pixels (the units `ReconLFrameDesc.width`
+     * and `height` use), or 0 in an axis for the whole frame - which is what a
+     * host that leaves both at 0 asked for before this field meant anything, and
+     * still gets. Clip space maps onto this rect, anchored top-left, and no
+     * pixel of the target outside it is written by this pass: the rect confines
+     * both tiers, and `clear_color` still covers the whole target.
+     *
+     * A tier that renders at a fraction of the frame (`resolution_scale`, T3 and
+     * T4) confines the same fraction, so a host asking for half its window gets
+     * the same half at every tier. A viewport larger than the frame is clamped
+     * to it rather than refused; a viewport can never draw outside the target.
+     * Shadow passes ignore it and always draw their whole map. */
     uint32_t              viewport_width;
     uint32_t              viewport_height;
     uint32_t              load_color;      /* 1 = clear on load        */
@@ -786,6 +829,26 @@ typedef struct ReconLCamera {
     float      reserved;
 } ReconLCamera;
 
+/* Frame generation: the images *between* the frames a host renders.
+ *
+ * A host that can draw 60 frames a second and display 120 asks the library for
+ * the frames in between instead of rendering them. The generator reprojects the
+ * newest presented frame along the camera motion the host declares - no shaders,
+ * no second render, and nothing about how a frame is drawn changes. What it
+ * cannot do is invent what was never on screen; see `reconlPresentGenerated`.
+ *
+ * It is off unless a frame asks for it, and a frame that does not is byte for
+ * byte the frame it always was: no buffer is kept, no depth is read back and no
+ * counter moves. That is what makes the feature a toggle a game can flip with
+ * its own quality settings, and what keeps every existing scene identical. */
+typedef struct ReconLFrameGenDesc {
+    ReconLBase base;
+    uint32_t   enabled;     /* 1 = keep this frame's pixels, depth and camera so
+                             *     reconlPresentGenerated can warp it forward;
+                             *     0 = keep nothing (the default)               */
+    uint32_t   reserved;
+} ReconLFrameGenDesc;
+
 typedef struct ReconLFrameDesc {
     ReconLBase          base;
     uint32_t            width;
@@ -804,13 +867,29 @@ typedef struct ReconLFrameDesc {
      * after `shadows` is read as if this field were NULL. Raise `struct_size`
      * to sizeof(ReconLFrameDesc) to be read. */
     const ReconLCamera* camera;
+    /* Frame generation for this frame, or NULL to keep nothing. The generator
+     * needs the frame's camera (`camera` above) to have any motion to work with,
+     * so a host that enables this without declaring one gets each generated
+     * frame as a copy of the frame it came from.
+     *
+     * `framegen` is the end of the struct: a caller whose `struct_size` stops
+     * after `camera` is read as if this field were NULL. Raise `struct_size` to
+     * sizeof(ReconLFrameDesc) to be read. */
+    const ReconLFrameGenDesc* framegen;
 } ReconLFrameDesc;
 
+/* Headless readback. `out_pixels` receives the frame in `out_format`, RGBA8,
+ * `out_row_pitch` bytes per row (0 = tightly packed, i.e. `width * 4`), `flip`
+ * reversing the row order. The buffer must hold `out_row_pitch * height` bytes:
+ * `out_row_pitch < width * 4` is refused with RECONL_ERR_INVALID_ARGUMENT and
+ * nothing is written, because a narrower pitch cannot hold a row and the rows
+ * would overwrite each other. Rows past `width * 4` are left untouched, so a
+ * host may present into a padded surface. */
 typedef struct ReconLPresentDesc {
     ReconLBase  base;
     void*       out_pixels;      /* headless readback, RGBA8, may be NULL        */
     uint64_t    out_pixels_size;
-    uint32_t    out_row_pitch;
+    uint32_t    out_row_pitch;   /* 0 = tight; < width*4 is INVALID_ARGUMENT      */
     ReconLFormat out_format;
     uint32_t    flip;            /* 1 = present bottom-up (D3D style)             */
 } ReconLPresentDesc;
@@ -844,6 +923,14 @@ RECONL_API ReconLResult RECONL_CALL reconlCreateBuffer(ReconLDevice* device, con
 RECONL_API ReconLResult RECONL_CALL reconlWriteBuffer(ReconLDevice* device, ReconLBuffer* buffer, uint64_t offset, const void* data, uint64_t size);
 RECONL_API ReconLResult RECONL_CALL reconlCreateTexture(ReconLDevice* device, const ReconLTextureDesc* desc, ReconLTexture** out);
 RECONL_API ReconLResult RECONL_CALL reconlWriteTexture(ReconLDevice* device, ReconLTexture* texture, const ReconLTextureLevel* level);
+/* Texture readback: one mip of one layer comes back as RGBA8 rows of
+ * `width * 4` bytes, `out_row_pitch` bytes apart (0 = tightly packed). It is
+ * the same rule a present's readback follows, and it is enforced on every route
+ * that takes a host pitch: `out_row_pitch < width * 4` is refused with
+ * RECONL_ERR_INVALID_ARGUMENT and nothing is written, because a narrower pitch
+ * cannot hold a row and the rows would overwrite each other. `out_size` must
+ * hold `out_row_pitch * height`; bytes past `width * 4` in each row are left
+ * untouched, so a host may read into a padded surface. */
 RECONL_API ReconLResult RECONL_CALL reconlReadTexture(ReconLDevice* device, ReconLTexture* texture, uint32_t mip, uint32_t layer, void* out, uint64_t out_size, uint32_t out_row_pitch);
 RECONL_API ReconLResult RECONL_CALL reconlGenerateMips(ReconLDevice* device, ReconLTexture* texture);
 RECONL_API ReconLResult RECONL_CALL reconlCreatePipeline(ReconLDevice* device, const ReconLPipelineDesc* desc, ReconLPipeline** out);
@@ -949,12 +1036,86 @@ RECONL_API uint32_t RECONL_CALL reconlCmdCount(const ReconLCommandList* list); /
  * fault-offloaded device recovers the same way, except that with
  * target_frame_ms = 0 there is no window to settle in: the offload then lasts
  * until the host destroys the device. Either return is logged with
- * RECONL_TIER_REASON_RECOVERY. */
+ * RECONL_TIER_REASON_RECOVERY.
+ *
+ * The tier ladder has two layers and one decider, and both watch the same timer:
+ * the cost of the frame the host read, the readback it blocked on included. A
+ * frame that misses target_frame_ms steps this device's own quality tier one
+ * place down (T1 -> T2 on hardware, T2 -> T3 on the reference tier) and is
+ * recorded in the downgrade ring with RECONL_TIER_REASON_FRAME_TIME_OVER_TARGET
+ * and a detail naming it as the device's own tier; that step is visible on the
+ * frame *after* the one that missed. It is the only response a host that left
+ * RECONL_ALLOW_DOWNGRADE_TIER out of allow_downgrade ever sees, and it never
+ * changes ReconLStats.backend. A frame that misses and may offload hands the
+ * *next* frame to the reference tier instead - that frame is the calibration -
+ * and the change is recorded after the tier step the same frame earned, so the
+ * entry names the tier the device stands at when it moves. Both layers judge the
+ * same number and the device writes both, so ReconLStats.downgrades is every tier
+ * change this device has made, in the order they happened, and downgrade_count is
+ * how many that is. */
 RECONL_API ReconLResult RECONL_CALL reconlBeginFrame(ReconLDevice* device, ReconLFrameDesc* desc);
 RECONL_API ReconLResult RECONL_CALL reconlSubmit(ReconLDevice* device, const ReconLCommandList* list, ReconLFence* fence);
 RECONL_API ReconLResult RECONL_CALL reconlPresent(ReconLDevice* device, ReconLSwapchain* swapchain, ReconLPresentDesc* desc);
 
 RECONL_API ReconLResult RECONL_CALL reconlGetStats(ReconLDevice* device, ReconLStats* out);
+
+/* A generated frame: the last presented frame, warped forward by `ahead` frame
+ * intervals along the camera motion the host declared.
+ *
+ * This is how a host presents more images than it renders. A frame that asked
+ * for generation (`ReconLFrameGenDesc.enabled`) is kept - pixels, depth and
+ * camera - and each call hands over one image projected `ahead` intervals past
+ * it, into `desc.out_pixels` under the same layout rules `reconlPresent`
+ * follows. `ahead` is in (0, 1]: one interval is the camera motion between the
+ * two frames the host last presented. A still camera generates the frame itself.
+ *
+ * A host that renders N frames per second and wants M asks for `M/N - 1` of
+ * these per frame, at `ahead` = 1/k, 2/k, ... for k = M/N: 2, 3 or 4 rendered
+ * frames per image are exact multipliers, and ratios in between (1.5x = two
+ * images on every second frame, 2.5x = three on every second, and so on) are a
+ * schedule the host owns. Which ratio is worth it is a measurement: a generated
+ * frame costs one reprojection plus the present, so the multiplier is bounded by
+ * how much of a frame its render was.
+ *
+ * It is not a frame: nothing about the frame state machine changes and nothing is
+ * rendered, so a failure here never leaves the device unable to render. It counts
+ * in ReconLStats.framegen and not in frames_presented, and the tier ladder
+ * continues to judge only rendered frames - a host cannot make a slow GPU look
+ * fast by generating more images from its frames.
+ *
+ * The order its answers are decided in is fixed, so a host reads one code per
+ * call and not a choice between two: the tier speaks first (a tier that keeps no
+ * depth has nothing to offer whatever the arguments are, RECONL_ERR_NOT_SUPPORTED),
+ * then whether there is anything to generate from - whether the last presented
+ * frame asked for generation, which is the same question `reconlBeginFrame`
+ * answers for the next one - and only then the descriptor and `ahead`. So with
+ * nothing to generate from the call is RECONL_ERR_NO_FRAME whatever its
+ * arguments are, exactly as `reconlPresent` is RECONL_ERR_NO_FRAME with no frame
+ * to present; once a frame is being kept, the descriptor and `ahead` are read:
+ * a descriptor the ABI cannot read is refused with the structure codes its own
+ * `struct_size`/`type` earn, and a buffer that cannot hold the frame, no
+ * `out_pixels` at all, or an `ahead` outside (0, 1] with
+ * RECONL_ERR_INVALID_ARGUMENT - nothing is written in any of them. A frame kept
+ * for generation is the whole precondition of that second group, which is why
+ * the buffer rules are checked with the frame they have to hold in hand and not
+ * before it.
+ *
+ * Because the order is fixed, `desc` is only read by the question that owns it:
+ * a call refused before that question (RECONL_ERR_NOT_SUPPORTED,
+ * RECONL_ERR_NO_FRAME) has not dereferenced the pointer, so a host may pass
+ * anything there - including NULL - and read the code rather than take a fault.
+ * `reconlPresent` is the same: any `desc` at all is answered by
+ * RECONL_ERR_NO_FRAME while no frame is submitted. Once its argument question
+ * does run, a NULL `desc` is a present with no readback, which a swapchain
+ * created with `present_to_memory` cannot deliver - pixels are what that call is
+ * for - so it is refused with RECONL_ERR_INVALID_ARGUMENT.
+ *
+ * What it is not: the image is the last frame's pixels *moved*. Content that was
+ * not on screen - behind the camera, or revealed by a disocclusion - cannot be
+ * generated, and geometry that moved independently of the camera is warped as if
+ * it had not. Quality falls as `ahead` grows, which is the trade the host's
+ * schedule makes. */
+RECONL_API ReconLResult RECONL_CALL reconlPresentGenerated(ReconLDevice* device, ReconLSwapchain* swapchain, ReconLPresentDesc* desc, float ahead);
 RECONL_API ReconLResult RECONL_CALL reconlResetStats(ReconLDevice* device);
 
 /* Last error. `device` may be NULL, in which case a process-wide (mutex-guarded)

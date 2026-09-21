@@ -7,7 +7,8 @@
 //! * **Reversed-Z, `[0,1]` depth, GREATER test, clear to 0.0** ([`math`]).
 //! * **Tiles are independent.** A tile's pixels are written by exactly one
 //!   thread, in a fixed triangle order, so the frame is bit-identical for 1, 2, 4
-//!   or 8 workers. That is a test, not a hope (`tests/thread_determinism.rs`).
+//!   or 8 workers. That is a test, not a hope
+//!   (`tests/render.rs::frame_is_bit_identical_for_1_2_4_and_8_workers`).
 //! * **No allocation inside a frame.** All storage is reserved in
 //!   [`tile::Rasterizer::prepare`] before the first draw; `prepare` must be sized
 //!   by the host, and anything that still needs to grow is counted and reported.
@@ -17,6 +18,7 @@
 
 pub mod clip;
 pub mod fixed;
+pub mod framegen;
 pub mod math;
 pub mod shade;
 pub mod simd;
@@ -24,6 +26,7 @@ pub mod texture;
 pub mod tile;
 
 pub use clip::ClipVertex;
+pub use framegen::{generate as generate_frame, Camera as FrameCamera, History as FrameHistory};
 pub use tile::{Rasterizer, RasterStats};
 
 use reconl_core::alloc::{HostAlloc, HostVec};
@@ -37,6 +40,34 @@ pub const ATTR_UV: usize = 6;
 pub const ATTR_COLOR: usize = 8;
 
 pub const MAX_TEXTURE_SLOTS: usize = 8;
+
+/// Resolves a pass's viewport to the pixel area of a render target.
+///
+/// This is the single rule every tier maps clip space through, so a host that
+/// asks for a sub-rect gets the same one on hardware and on the reference tier.
+///
+/// The viewport is in *frame* pixels - the units the host sized its own window
+/// and swapchain in - and is scaled to `target` so that a tier which renders at
+/// a fraction of the frame (`resolution_scale`) confines the same fraction.
+///
+/// * `(0, 0)` means the whole target. That is the documented default, so a host
+///   that never sets a viewport keeps the full-frame path byte for byte.
+/// * A viewport larger than the frame is clamped to the target rather than
+///   refused: mapping to more than the target can hold is a no-op region, and
+///   the binner's tiles are the target's, not the request's.
+/// * The result is never zero in either axis, so an empty viewport cannot make a
+///   pass silently draw nothing.
+pub fn rendered_viewport(viewport: (u32, u32), frame: (u32, u32), target: (u32, u32)) -> (u32, u32) {
+    let axis = |vp: u32, frame: u32, target: u32| -> u32 {
+        if vp == 0 {
+            return target;
+        }
+        let frame = frame.max(1) as u64;
+        let scaled = (vp as u64 * target as u64 + frame / 2) / frame;
+        scaled.clamp(1, target as u64) as u32
+    };
+    (axis(viewport.0, frame.0, target.0), axis(viewport.1, frame.1, target.1))
+}
 
 /// Mirrors `ReconLVertex`, and is what a host uploads.
 #[repr(C)]
@@ -213,19 +244,36 @@ impl Target {
     /// Converts colour to tightly packed RGBA8, the format present-to-memory
     /// hands back.
     pub fn to_rgba8(&self, out: &mut [u8]) -> Result<()> {
+        self.to_rgba8_rows(out, self.width as usize * 4, false)
+    }
+
+    /// Converts colour into a destination with a row pitch, optionally flipped,
+    /// row by row.
+    ///
+    /// This is the whole of how a frame becomes the host's bytes: the conversion
+    /// and the presentation layout happen in one pass, so a present-to-memory
+    /// host never pays for a second, tightly packed copy of the frame between
+    /// this target and its own buffer. `pitch` is the destination's row length in
+    /// bytes and must be at least one row wide.
+    pub fn to_rgba8_rows(&self, out: &mut [u8], pitch: usize, flip: bool) -> Result<()> {
         let color = match self.color_slice() {
             Some(c) => c,
             None => return Err(Error::new(Code::NotReady, "target has no colour buffer")),
         };
-        let needed = self.pixels() * 4;
-        if out.len() < needed {
+        let rows = self.height as usize;
+        let row_bytes = self.width as usize * 4;
+        let needed = rows
+            .saturating_sub(1)
+            .saturating_mul(pitch)
+            .saturating_add(row_bytes);
+        if pitch < row_bytes || out.len() < needed {
             return Err(Error::new(Code::InvalidArgument, "readback buffer is too small"));
         }
-        for (i, px) in color.chunks_exact(4).enumerate() {
-            out[i * 4] = to_u8(px[0]);
-            out[i * 4 + 1] = to_u8(px[1]);
-            out[i * 4 + 2] = to_u8(px[2]);
-            out[i * 4 + 3] = to_u8(px[3]);
+        for row in 0..rows {
+            let source = if flip { rows - 1 - row } else { row };
+            let src = &color[source * row_bytes..(source + 1) * row_bytes];
+            let at = row * pitch;
+            simd::rgba_f32_to_unorm8(src, &mut out[at..at + row_bytes]);
         }
         Ok(())
     }
@@ -302,6 +350,91 @@ mod tests {
         t.to_rgba8(&mut out).unwrap();
         assert_eq!(&out[0..4], &[0, 128, 255, 255]);
         assert!(t.depth_slice().unwrap().iter().all(|d| *d == 0.0));
+    }
+
+    /// The readback's row layout is what a host with a pitched or bottom-up
+    /// buffer depends on, and what the backends now apply as they write. A wrong
+    /// stride and a wrong flip are both invisible in a tight, top-down buffer,
+    /// so each boundary gets asserted here rather than inferred: a pitch wider
+    /// than a row, a flip, a single row, and the two refusals that must be errors
+    /// rather than a panic or overlapping rows.
+    #[test]
+    fn readback_rows_honour_the_pitch_and_the_flip() {
+        let alloc = HostAlloc::system();
+        let mut t = Target::new_color(alloc, 2, 2).unwrap();
+        // Two rows, distinguishable per row: row 0 red, row 1 blue.
+        let color = t.color_slice_mut().unwrap();
+        for (i, px) in color.chunks_exact_mut(4).enumerate() {
+            let red = i < 2;
+            px[0] = if red { 1.0 } else { 0.0 };
+            px[2] = if red { 0.0 } else { 1.0 };
+            px[3] = 1.0;
+        }
+
+        let row_bytes = 2 * 4;
+        let pitch = row_bytes + 8;
+        let mut out = vec![0xABu8; pitch * 2];
+        t.to_rgba8_rows(&mut out, pitch, true).unwrap();
+        // Flipped: the buffer's first row is the image's last - blue, then red.
+        assert_eq!(&out[0..4], &[0, 0, 255, 255], "row 0 is the image's last row");
+        assert_eq!(&out[pitch..pitch + 4], &[255, 0, 0, 255]);
+        assert!(
+            out[row_bytes..pitch].iter().all(|b| *b == 0xAB)
+                && out[pitch + row_bytes..].iter().all(|b| *b == 0xAB),
+            "the pitch is the host's, not ours to write"
+        );
+
+        // The same frame unflipped, tight: the two must be row-reversals of each
+        // other, which is the whole of what `flip` means.
+        let mut tight = vec![0u8; row_bytes * 2];
+        t.to_rgba8_rows(&mut tight, row_bytes, false).unwrap();
+        assert_eq!(&tight[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&tight[row_bytes..row_bytes + 4], &[0, 0, 255, 255]);
+        assert_eq!(&out[0..row_bytes], &tight[row_bytes..row_bytes * 2]);
+
+        // A single row: a flip is a no-op, not an underflow.
+        let mut one = Target::new_color(alloc, 2, 1).unwrap();
+        one.clear_color([0.25, 0.25, 0.25, 1.0]);
+        let mut buf = vec![0u8; row_bytes];
+        one.to_rgba8_rows(&mut buf, row_bytes, true).unwrap();
+        assert_eq!(&buf[0..4], &[64, 64, 64, 255]);
+
+        // Refusals, not panics: a destination too small for the last row, and a
+        // pitch narrower than a row (which would make rows overlap).
+        let too_small = vec![0u8; row_bytes * 2 - 1];
+        assert_eq!(
+            t.to_rgba8_rows(&mut too_small.clone(), row_bytes, false).unwrap_err().code,
+            Code::InvalidArgument
+        );
+        let mut narrow = vec![0u8; row_bytes * 2];
+        assert_eq!(
+            t.to_rgba8_rows(&mut narrow, row_bytes - 1, false).unwrap_err().code,
+            Code::InvalidArgument
+        );
+    }
+
+    /// The viewport rule, which both tiers and both grid sizes go through, so a
+    /// mistake here is a cross-tier difference rather than a rounding detail.
+    #[test]
+    fn the_viewport_resolves_to_a_sub_rect_of_the_target() {
+        // Unset means the whole target, in either axis.
+        assert_eq!(rendered_viewport((0, 0), (64, 64), (64, 64)), (64, 64));
+        assert_eq!(rendered_viewport((0, 48), (64, 64), (64, 64)), (64, 48));
+        // The whole frame, asked for explicitly, is the whole target to the byte.
+        assert_eq!(rendered_viewport((64, 64), (64, 64), (64, 64)), (64, 64));
+        assert_eq!(rendered_viewport((1920, 1080), (1920, 1080), (1920, 1080)), (1920, 1080));
+        // A tier that renders at half the frame confines the same fraction.
+        assert_eq!(rendered_viewport((32, 32), (64, 64), (32, 32)), (16, 16));
+        assert_eq!(rendered_viewport((0, 0), (64, 64), (32, 32)), (32, 32));
+        // Rounding: half of an odd frame goes to the nearer target pixel, never
+        // to zero and never past the target.
+        assert_eq!(rendered_viewport((33, 33), (64, 64), (32, 32)), (17, 17));
+        assert_eq!(rendered_viewport((1, 1), (64, 64), (32, 32)), (1, 1));
+        assert_eq!(rendered_viewport((1, 1), (1920, 1080), (960, 540)), (1, 1));
+        // An oversized viewport is clamped to the target, not refused and not
+        // allowed to bin tiles that do not exist.
+        assert_eq!(rendered_viewport((128, 128), (64, 64), (64, 64)), (64, 64));
+        assert_eq!(rendered_viewport((u32::MAX, u32::MAX), (1920, 1080), (960, 540)), (960, 540));
     }
 
     #[test]

@@ -33,63 +33,24 @@ pub mod policy;
 
 pub use policy::{Emptiness, FrameClassifier, FramePolicy};
 
+use reconl_contract::{FrameInput, ShadowRequest};
 use reconl_core::alloc::{HostAlloc, HostVec};
 use reconl_core::budget::{Budget, Reservation};
 use reconl_core::error::{Code, Error, Result};
-use reconl_core::stats::{Counters, Downgrade, DowngradeLog, FrameNumbers, ShadowCounters};
+use reconl_core::stats::{Counters, FrameNumbers, ShadowCounters};
 use reconl_core::tier::{caps, rules, shadow_plan, Backend, ShadowFilter, ShadowPlan, Tier, TierReason};
-use reconl_raster::math::{self, Mat4, Vec3};
-use reconl_raster::shade::{LightSet, ShadowMapRef, SurfaceShader};
+use reconl_raster::math;
+use reconl_raster::shade::{LightSet, ShadowLookup, ShadowMapRef, SurfaceShader};
 use reconl_raster::tile::RasterConfig;
 use reconl_raster::{
-    checksum_f32, DrawItem, PipelineState, RasterStats, Rasterizer, ShaderRef, Target, COMPARE_GREATER, CULL_BACK,
+    checksum_f32, rendered_viewport, DrawItem, PipelineState, RasterStats, Rasterizer, ShaderRef, Target,
+    COMPARE_GREATER, CULL_BACK,
 };
 use reconl_resource::spill::{Hit, SpillArena, SpillConfig};
 use reconl_shadow as shadow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-
-/// A frame's worth of requests that the host is allowed to vary per frame.
-#[derive(Clone, Copy, Debug)]
-pub struct ShadowRequest {
-    pub enabled: bool,
-    pub cascades: u32,
-    /// Texel budget for the shadow maps, in bytes.
-    pub texel_budget_bytes: u64,
-    pub filter: ShadowFilter,
-    pub max_distance: f32,
-    pub blend_band: f32,
-    /// Frames between static-cascade refreshes. `1` = every frame.
-    pub refresh_interval_frames: u32,
-    /// Allow the static cascade cache to live in the disk arena (T4).
-    pub allow_disk_cache: bool,
-    /// Bias to use instead of the tier's preset, when the host pins one.
-    ///
-    /// `None` is the documented policy: [`shadow::bias_preset`] derives the
-    /// values from the tier, the map size and the filter, so a weaker tier gets
-    /// more slack. `Some` is the ABI's `normal_bias`/`depth_bias`/`slope_bias`,
-    /// used as given - which is what lets a scene render the same image on two
-    /// tiers, since the presets differ by design and that difference lands on a
-    /// shadow's edge as a pixel of coverage.
-    pub bias: Option<shadow::BiasPreset>,
-}
-
-impl Default for ShadowRequest {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            cascades: 3,
-            texel_budget_bytes: 24 << 20,
-            filter: ShadowFilter::Pcf3x3,
-            max_distance: 120.0,
-            blend_band: 4.0,
-            refresh_interval_frames: 1,
-            allow_disk_cache: true,
-            bias: None,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct SoftCpuConfig {
@@ -105,16 +66,6 @@ pub struct SoftCpuConfig {
     pub frame_policy: FramePolicy,
     /// Cascade split lambda: 0 = uniform, 1 = logarithmic.
     pub split_lambda: f32,
-    /// Frames over target before the device steps down a tier.
-    pub over_target_frames_to_downgrade: u32,
-    /// The frame time the ladder compares against the target, in nanoseconds.
-    ///
-    /// `None` means "measure it", which is what a real-time host wants. A host
-    /// that renders offline drives its own clock and does not want a batch job
-    /// to downgrade itself for being slower than 60Hz; a test sets it so the
-    /// ladder is exercised without depending on how fast the machine is.
-    /// The *reported* `total_ns` is always the real measurement either way.
-    pub frame_time_override_ns: Option<u64>,
     /// Cap on the arena. `0` = the budget's disk cap only.
     pub arena_bytes: u64,
     pub shadow: ShadowRequest,
@@ -133,39 +84,10 @@ impl Default for SoftCpuConfig {
             spill_dir: None,
             frame_policy: FramePolicy::default(),
             split_lambda: 0.75,
-            over_target_frames_to_downgrade: 8,
-            frame_time_override_ns: None,
             arena_bytes: 0,
             shadow: ShadowRequest::default(),
         }
     }
-}
-
-/// One frame's input. Borrowed, so recording a frame allocates nothing.
-pub struct FrameInput<'a> {
-    pub frame_index: u64,
-    pub width: u32,
-    pub height: u32,
-    pub camera_view: Mat4,
-    pub fov_y_deg: f32,
-    pub aspect: f32,
-    pub near: f32,
-    pub far: f32,
-    /// The shadow-casting directional light's direction, for cascade fitting.
-    pub light_dir: Vec3,
-    /// Hash of every shadow-relevant light parameter; part of the cache key.
-    pub light_hash: u64,
-    pub lights: LightSet,
-    pub shadow: ShadowRequest,
-    pub clear_color: [f32; 4],
-    pub clear_depth: f32,
-    pub clear_color_enabled: bool,
-    pub clear_depth_enabled: bool,
-    /// Camera-space world revision and static-geometry revision, both already
-    /// folded into the cascade cache key by `reconl-scene`.
-    pub world_revision: u64,
-    pub static_geometry_revision: u64,
-    pub draws: &'a [DrawItem<'a>],
 }
 
 /// Everything the device reports to the host in one struct, so the FFI layer
@@ -177,7 +99,6 @@ pub struct SoftCpuSnapshot {
     pub frame: FrameNumbers,
     pub classifier: policy::FrameClassifier,
     pub color_checksum: u64,
-    pub depth_checksum: u64,
     pub resident_bytes: u64,
     pub arena_entries: u64,
     pub arena_bytes: u64,
@@ -198,19 +119,33 @@ pub struct SoftCpuDevice {
     /// Which cascade's map holds valid content from the same light.
     maps_valid: [bool; shadow::MAX_CASCADES],
     map_light_hash: u64,
+    /// The cascade pass's draw list, owned by the device.
+    ///
+    /// The shadow pass writes this frame's casters into it, one cascade at a
+    /// time, so the storage is a frame's to reuse rather than a frame's to
+    /// allocate. `DrawItem<'static>` is the *type* of the storage, not a claim
+    /// about what is in it: an entry is a copy of the frame's own draw, whose
+    /// vertex slices point into the host's buffer storage - kept alive for the
+    /// frame's use by the host's own references (the ABI's handle rules) - and
+    /// whose shading state is nothing at all (a depth pass shades no colour).
+    /// `fill_cascade` clears the list before it writes, so no entry is read
+    /// after the frame that put it there.
+    cascade: HostVec<DrawItem<'static>>,
+    /// The colour pass's draw list, owned by the device for the same reason and
+    /// under the same rule as `cascade`: an entry is this frame's draw with this
+    /// backend's lighting state stamped into it, cleared by the next frame's
+    /// fill, so nothing here outlives the frame whose data it copies.
+    colors: HostVec<DrawItem<'static>>,
     plan: Option<ShadowPlan>,
     arena: Option<SpillArena>,
     arena_reservation: Option<Reservation>,
     color_reservation: Option<Reservation>,
     map_reservation: Option<Reservation>,
     classifier: FrameClassifier,
-    downgrades: DowngradeLog,
     counters: Counters,
     shadows: ShadowCounters,
     frame: FrameNumbers,
-    frames_over_target: u32,
     color_checksum: u64,
-    depth_checksum: u64,
     spill_io_bytes: u64,
     arena_error: Option<Error>,
 }
@@ -246,6 +181,8 @@ impl SoftCpuDevice {
             raster,
             color,
             maps: HostVec::new(alloc),
+            cascade: HostVec::new(alloc),
+            colors: HostVec::new(alloc),
             map_size: 0,
             map_count: 0,
             maps_valid: [false; shadow::MAX_CASCADES],
@@ -256,13 +193,10 @@ impl SoftCpuDevice {
             color_reservation: None,
             map_reservation: None,
             classifier: FrameClassifier::new(frame_policy),
-            downgrades: DowngradeLog::new(),
             counters: Counters::default(),
             shadows: ShadowCounters::default(),
             frame: FrameNumbers::default(),
-            frames_over_target: 0,
             color_checksum: 0,
-            depth_checksum: 0,
             spill_io_bytes: 0,
             arena_error: None,
         })
@@ -320,10 +254,6 @@ impl SoftCpuDevice {
         self.map_size
     }
 
-    pub fn downgrades(&self) -> &DowngradeLog {
-        &self.downgrades
-    }
-
     pub fn budget(&self) -> &Arc<Budget> {
         &self.budget
     }
@@ -349,14 +279,15 @@ impl SoftCpuDevice {
             + self.map_reservation.as_ref().map(|r| r.bytes()).unwrap_or(0)
     }
 
-    /// Steps down one tier, recording why. Returns the new tier.
-    pub fn step_down(&mut self, reason: TierReason, frame_index: u64, detail: &str) -> Tier {
-        let from = self.tier;
-        let to = from.step_down();
-        if to == from {
-            return from;
-        }
-        self.downgrades.record(Downgrade::new(from, to, reason, frame_index, 0, detail));
+    /// Applies a tier the *device* decided on: the same backend at a lower
+    /// quality tier, with everything a tier change invalidates dropped.
+    ///
+    /// The backend does not decide this and does not record it. A device's tier
+    /// has one owner - the frame-time ladder the device runs
+    /// (`ffi/src/offload.rs`, `docs/offload.md`) - and one log, because a
+    /// backend's own ring dies with the backend while the tier it changed does
+    /// not.
+    pub fn relabel(&mut self, to: Tier, reason: TierReason) {
         self.tier = to;
         self.tier_reason = reason;
         self.counters.frames_since_tier_change = 0;
@@ -365,8 +296,6 @@ impl SoftCpuDevice {
         for slot in self.maps_valid.iter_mut() {
             *slot = false;
         }
-        self.frames_over_target = 0;
-        to
     }
 
     fn ensure_targets(&mut self, width: u32, height: u32) -> Result<()> {
@@ -410,6 +339,77 @@ impl SoftCpuDevice {
         self.map_count = cascades;
         self.maps_valid = [false; shadow::MAX_CASCADES];
         self.map_reservation = Some(reservation);
+        Ok(())
+    }
+
+    /// Fills the cascade list with this frame's casters, for one cascade.
+    ///
+    /// Owned storage, written per pass: clearing keeps the capacity, so a frame
+    /// whose casters fit in the storage an earlier frame grew allocates nothing.
+    /// Growth is counted in `frame.allocations_in_frame`, the way the rasteriser
+    /// counts its own tables - so a steady state reports zero rather than a
+    /// number nobody can check.
+    /// Takes the list rather than `&mut self` on purpose: the colour pass fills
+    /// its list while a view of the shadow maps - this device's `maps` - is still
+    /// live, and a `&mut self` here would end that borrow.
+    fn fill_cascade<'s>(
+        list: &mut HostVec<DrawItem<'static>>,
+        casters: impl Iterator<Item = &'s DrawItem<'s>>,
+        view_proj: &math::Mat4,
+        pipeline: PipelineState,
+        frame: &mut FrameNumbers,
+    ) -> Result<()> {
+        list.clear();
+        for draw in casters {
+            let mut shadow_draw = *draw;
+            shadow_draw.transform = math::mul(view_proj, &draw.model);
+            shadow_draw.shader = ShaderRef::DepthOnly;
+            shadow_draw.pipeline = pipeline;
+            if list.len() == list.capacity() {
+                frame.allocations_in_frame += 1;
+            }
+            // SAFETY: the two `DrawItem`s differ only in the lifetimes their
+            // slices carry, so no byte of the entry changes. What is stored was
+            // copied from this frame's draws and is dropped - on the `clear`
+            // above - before the next frame begins, so the shortened lifetime
+            // never outlives the borrow it was copied from.
+            let entry = unsafe { core::mem::transmute::<DrawItem<'s>, DrawItem<'static>>(shadow_draw) };
+            list.push(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Fills the colour pass's list from the frame's draws, stamping in the
+    /// lighting state this backend owns.
+    ///
+    /// Owned storage, written once per frame: clearing keeps the capacity, so a
+    /// frame no larger than an earlier one allocates nothing. Growth is counted
+    /// the same way `fill_cascade` counts it.
+    fn fill_colors<'s>(
+        list: &mut HostVec<DrawItem<'static>>,
+        items: impl Iterator<Item = &'s DrawItem<'s>>,
+        lights: &'s LightSet,
+        lookup: Option<&'s ShadowLookup<'s>>,
+        frame: &mut FrameNumbers,
+    ) -> Result<()> {
+        list.clear();
+        for draw in items {
+            let mut item = *draw;
+            if let ShaderRef::Surface(surface) = item.shader {
+                let mut surface = surface;
+                surface.lights = if surface.lit { Some(lights) } else { None };
+                surface.shadows = if surface.receives_shadow { lookup } else { None };
+                item.shader = ShaderRef::Surface(surface);
+            }
+            if list.len() == list.capacity() {
+                frame.allocations_in_frame += 1;
+            }
+            // SAFETY: as in `fill_cascade` - the entry is a copy of this frame's
+            // draw with this frame's lighting state in it, and the `clear` above
+            // drops it before the next frame is filled.
+            let entry = unsafe { core::mem::transmute::<DrawItem<'s>, DrawItem<'static>>(item) };
+            list.push(entry)?;
+        }
         Ok(())
     }
 
@@ -460,7 +460,6 @@ impl SoftCpuDevice {
             frame: self.frame,
             classifier: self.classifier,
             color_checksum: self.color_checksum,
-            depth_checksum: self.depth_checksum,
             resident_bytes: self.resident_bytes(),
             arena_entries: self.arena.as_ref().map(|a| a.stats().entries).unwrap_or(0),
             arena_bytes: self.arena.as_ref().map(|a| a.stats().bytes).unwrap_or(0),
@@ -474,9 +473,12 @@ impl SoftCpuDevice {
 
     /// Renders one frame into the internal target.
     ///
-    /// Everything the frame needs was reserved by `ensure_*` first, so the frame
-    /// body itself only allocates the two draw-list scratch vectors - and it
-    /// counts those.
+    /// Everything the frame needs was reserved by `ensure_*` first, and every
+    /// draw list a pass writes into is owned before the frame starts: the
+    /// cascade list and the colour list are the device's ([`SoftCpuDevice`]'s
+    /// `cascade` and `colors`). A steady-state frame therefore takes nothing from
+    /// the host allocator - what can still grow, a frame with more casters than
+    /// any before it, is counted in `frame.allocations_in_frame`.
     pub fn render(&mut self, input: &FrameInput<'_>) -> Result<FrameNumbers> {
         let frame_start = Instant::now();
         let mut frame = FrameNumbers {
@@ -548,19 +550,11 @@ impl SoftCpuDevice {
 
             let cache_enabled = plan.disk_backed && request.allow_disk_cache;
 
-            let mut static_draws = HostVec::<DrawItem<'_>>::with_capacity(self.alloc, input.draws.len())?;
-            let mut dynamic_draws = HostVec::<DrawItem<'_>>::with_capacity(self.alloc, input.draws.len())?;
-            frame.allocations_in_frame += 2;
-            for draw in input.draws.iter() {
-                if !draw.casts_shadow {
-                    continue;
-                }
-                if draw.dynamic {
-                    dynamic_draws.push(*draw)?;
-                } else {
-                    static_draws.push(*draw)?;
-                }
-            }
+            // Which casters this frame has, asked rather than gathered: the two
+            // lists this pass used to build were a copy of the frame's draws,
+            // and the cascade sub-passes read the frame's own list instead.
+            let has_static = input.draws.iter().any(|d| d.casts_shadow && !d.dynamic);
+            let has_dynamic = input.draws.iter().any(|d| d.casts_shadow && d.dynamic);
 
             let shadow_pipeline = PipelineState {
                 // Back-face culling on the light's view: the surface facing the
@@ -609,7 +603,7 @@ impl SoftCpuDevice {
                 // the counters it feeds stay outside it.
                 let mut loaded: Option<Vec<u8>> = None;
                 let mut load_hit = Hit::Miss;
-                if cache_enabled && !static_draws.is_empty() {
+                if cache_enabled && has_static {
                     if let Some(arena) = self.ensure_arena() {
                         let mut bytes = Vec::new();
                         load_hit = arena.get(key, &mut bytes);
@@ -642,28 +636,29 @@ impl SoftCpuDevice {
                         self.shadows.cache_corrupt += 1;
                     }
                     Hit::Miss => {
-                        if cache_enabled && !static_draws.is_empty() {
+                        if cache_enabled && has_static {
                             self.shadows.cache_misses += 1;
                         }
                     }
                 }
 
                 let pass_start = Instant::now();
-                let mut cascade_draws = HostVec::<DrawItem<'_>>::with_capacity(self.alloc, static_draws.len())?;
                 if !from_cache {
                     if let Some(map) = self.maps.get_mut(index) {
                         map.clear_depth(0.0);
                     }
-                    for draw in static_draws.iter() {
-                        let mut shadow_draw = *draw;
-                        shadow_draw.transform = math::mul(&fit.view_proj, &draw.model);
-                        shadow_draw.shader = ShaderRef::DepthOnly;
-                        shadow_draw.pipeline = shadow_pipeline;
-                        cascade_draws.push(shadow_draw)?;
-                    }
-                    rendered_statics = !cascade_draws.is_empty();
+                    Self::fill_cascade(
+                        &mut self.cascade,
+                        input.draws.iter().filter(|d| d.casts_shadow && !d.dynamic),
+                        &fit.view_proj,
+                        shadow_pipeline,
+                        &mut frame,
+                    )?;
+                    rendered_statics = !self.cascade.is_empty();
                     if let Some(map) = self.maps.get_mut(index) {
-                        let stats = self.raster.rasterize(map, cascade_draws.as_slice())?;
+                        // The shadow pass draws the whole map: the viewport the
+                        // host set applies to the colour pass, not to a cascade.
+                        let stats = self.raster.rasterize(map, self.cascade.as_slice(), (0, 0))?;
                         accumulate_raster(&mut shadow_stats, &stats);
                     }
                 }
@@ -687,17 +682,16 @@ impl SoftCpuDevice {
                     }
                 }
 
-                if !dynamic_draws.is_empty() {
-                    cascade_draws.clear();
-                    for draw in dynamic_draws.iter() {
-                        let mut shadow_draw = *draw;
-                        shadow_draw.transform = math::mul(&fit.view_proj, &draw.model);
-                        shadow_draw.shader = ShaderRef::DepthOnly;
-                        shadow_draw.pipeline = shadow_pipeline;
-                        cascade_draws.push(shadow_draw)?;
-                    }
+                if has_dynamic {
+                    Self::fill_cascade(
+                        &mut self.cascade,
+                        input.draws.iter().filter(|d| d.casts_shadow && d.dynamic),
+                        &fit.view_proj,
+                        shadow_pipeline,
+                        &mut frame,
+                    )?;
                     if let Some(map) = self.maps.get_mut(index) {
-                        let stats = self.raster.rasterize(map, cascade_draws.as_slice())?;
+                        let stats = self.raster.rasterize(map, self.cascade.as_slice(), (0, 0))?;
                         accumulate_raster(&mut shadow_stats, &stats);
                     }
                 }
@@ -748,17 +742,23 @@ impl SoftCpuDevice {
             };
             let cascade_array = fits.as_lookup_cascades();
 
-            let mut map_refs = HostVec::<ShadowMapRef<'_>>::with_capacity(self.alloc, self.map_count as usize)?;
-            frame.allocations_in_frame += 1;
-            for index in 0..self.map_count as usize {
+            // A cascade set is bounded by `MAX_CASCADES`, so what the shading
+            // step sees is a fixed array on the stack: this is a *view* of maps
+            // the device already owns, and a view needs no allocation.
+            let mut map_refs: [ShadowMapRef<'_>; shadow::MAX_CASCADES] =
+                [ShadowMapRef { width: 0, height: 0, depth: &[] }; shadow::MAX_CASCADES];
+            let mut map_count = 0usize;
+            for index in 0..self.map_count.min(shadow::MAX_CASCADES as u32) as usize {
                 if let Some(map) = self.maps.get(index) {
-                    map_refs.push(ShadowMapRef {
+                    map_refs[index] = ShadowMapRef {
                         width: map.width,
                         height: map.height,
                         depth: map.depth_slice().unwrap_or(&[]),
-                    })?;
+                    };
+                    map_count = index + 1;
                 }
             }
+            let map_refs = &map_refs[..map_count];
 
             let filter = plan.map(|p| p.filter).unwrap_or(ShadowFilter::Hard);
             let bias = request
@@ -766,7 +766,7 @@ impl SoftCpuDevice {
                 .unwrap_or_else(|| shadow::bias_preset(self.tier, self.map_size.max(1), filter));
             let lookup = shadow::lookup(
                 &cascade_array,
-                map_refs.as_slice(),
+                map_refs,
                 &input.camera_view,
                 filter,
                 bias,
@@ -775,25 +775,28 @@ impl SoftCpuDevice {
             );
             let lookup_opt = if plan.is_some() { Some(lookup) } else { None };
 
-            let mut draws = HostVec::<DrawItem<'_>>::with_capacity(self.alloc, input.draws.len())?;
-            frame.allocations_in_frame += 1;
-            for draw in input.draws.iter() {
-                let mut item = *draw;
-                if let ShaderRef::Surface(surface) = item.shader {
-                    let mut surface = surface;
-                    surface.lights = if surface.lit { Some(&input.lights) } else { None };
-                    surface.shadows = if surface.receives_shadow {
-                        lookup_opt.as_ref()
-                    } else {
-                        None
-                    };
-                    item.shader = ShaderRef::Surface(surface);
-                }
-                draws.push(item)?;
-            }
+            // The host's draws carry the shading *intent*; the lighting state
+            // (fits, maps, bias) is supplied here, so a host cannot pass a shadow
+            // map the backend did not produce. It goes into this device's own
+            // list rather than into a fresh one per frame.
+            Self::fill_colors(
+                &mut self.colors,
+                input.draws.iter(),
+                &input.lights,
+                lookup_opt.as_ref(),
+                &mut frame,
+            )?;
 
             let rasterize_start = Instant::now();
-            let stats = self.raster.rasterize(&mut self.color, draws.as_slice())?;
+            // The host's viewport is in frame pixels; this tier may be rendering
+            // a scaled target, so resolve it against that target. `(0, 0)` - the
+            // documented default - resolves to the whole target.
+            let render = rendered_viewport(
+                input.viewport,
+                (input.width, input.height),
+                (self.color.width, self.color.height),
+            );
+            let stats = self.raster.rasterize(&mut self.color, self.colors.as_slice(), render)?;
             accumulate_raster(&mut color_stats, &stats);
             let _ = rasterize_start;
 
@@ -814,28 +817,20 @@ impl SoftCpuDevice {
         frame.pixels_shaded = (color_stats.pixels_shaded + shadow_stats.pixels_shaded).min(u32::MAX as u64) as u32;
         frame.total_ns = frame_start.elapsed().as_nanos() as u64;
 
-        self.color_checksum = checksum_f32(self.color.color_slice().unwrap_or(&[]));
-        self.depth_checksum = checksum_f32(self.color.depth_slice().unwrap_or(&[]));
+        // The frame fingerprint the audit compares, computed only when it is
+        // asked for: it is a full pass over the colour target and nothing else
+        // reads it.
+        self.color_checksum = if input.checksum {
+            checksum_f32(self.color.color_slice().unwrap_or(&[]))
+        } else {
+            0
+        };
 
         // Classification and the frame-time ladder. Both are telemetry: neither
         // changes a pixel, they only decide what gets counted and what steps
         // down.
         self.classifier.record(emptiness, input.frame_index)?;
         self.counters.frames_since_tier_change += 1;
-        let target_ns = u64::from(self.config.target_frame_ms) * 1_000_000;
-        let comparable_ns = self.config.frame_time_override_ns.unwrap_or(frame.total_ns);
-        if target_ns > 0 && comparable_ns > target_ns {
-            self.frames_over_target += 1;
-            self.counters.frames_over_target += 1;
-            if self.config.over_target_frames_to_downgrade > 0
-                && self.frames_over_target >= self.config.over_target_frames_to_downgrade
-            {
-                self.step_down(TierReason::FrameTimeOverTarget, input.frame_index, "frame time over target");
-            }
-        } else {
-            self.frames_over_target = 0;
-        }
-
         self.frame = frame;
         self.shadows.cascades_active = plan.map(|p| p.cascades).unwrap_or(0);
         Ok(frame)
@@ -885,18 +880,37 @@ impl SoftCpuDevice {
         }
     }
 
-    /// The presented image as tightly packed RGBA8, plus its checksum.
-    pub fn readback(&self, out: &mut [u8]) -> Result<u64> {
-        self.color.to_rgba8(out)?;
-        Ok(self.color_checksum)
+    /// Copies the frame's depth out of the target into `out`, tightly packed,
+    /// `width * height` values, for frame generation.
+    ///
+    /// The reference tier's depth is a slice it already owns, so this costs a
+    /// copy and no driver round trip - the same buffer the rasteriser wrote.
+    pub fn depth_into(&mut self, out: &mut [f32]) -> Result<()> {
+        let depth = self.color.depth_slice().ok_or_else(|| {
+            Error::new(Code::NotSupported, "the frame target has no depth buffer to reproject")
+        })?;
+        if out.len() < depth.len() {
+            return Err(Error::new(Code::InvalidArgument, "the depth buffer is too small for the frame"));
+        }
+        out[..depth.len()].copy_from_slice(depth);
+        Ok(())
+    }
+
+    /// Writes the last rendered frame into the host's presentation buffer, in
+    /// the layout the present asked for: `pitch` is the destination's row length
+    /// in bytes and `flip` reverses the row order.
+    ///
+    /// The conversion happens straight into those rows. There is no tightly
+    /// packed intermediate: a frame crossed the target->host boundary once, and
+    /// the buffer the host handed over is the only one involved.
+    pub fn read_frame_into(&mut self, out: &mut [u8], pitch: u32, flip: u32) -> Result<()> {
+        let row_bytes = self.color.width as usize * 4;
+        let pitch = if pitch == 0 { row_bytes } else { pitch as usize };
+        self.color.to_rgba8_rows(out, pitch, flip != 0)
     }
 
     pub fn color_checksum(&self) -> u64 {
         self.color_checksum
-    }
-
-    pub fn depth_checksum(&self) -> u64 {
-        self.depth_checksum
     }
 
     pub fn frame_size(&self) -> (u32, u32) {

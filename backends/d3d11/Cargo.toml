@@ -10,7 +10,7 @@ crate-type = ["rlib"]
 reconl-core = { path = "../../core" }
 reconl-raster = { path = "../../raster" }
 reconl-shadow = { path = "../../shadow" }
-reconl-backend-softcpu = { path = "../soft-cpu" }
+reconl-contract = { path = "../../contract" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
