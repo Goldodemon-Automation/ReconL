@@ -158,6 +158,43 @@ fn every_run_carries_its_configuration_and_its_split() {
     );
 }
 
+/// A generation run reports the rate the feature exists to raise, and says which
+/// frame its wall line times.
+///
+/// The failure this pins is a report that reads as a regression: the wall line is
+/// per *rendered* frame, so a run delivering twice the images printed a lower
+/// frame rate than the same run without generation, and the multiplier was only
+/// derivable by hand. A host quoting that number would turn the feature off.
+#[test]
+fn a_generation_run_reports_the_rate_it_achieved() {
+    let (stdout, stderr, code) = bench(&[
+        "--backend=soft-cpu",
+        "--resolution=64x64",
+        "--frames=4",
+        "--warmup=1",
+        "--framegen=2",
+    ]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    for expected in [
+        "frame generation",
+        "2.00 images per rendered frame",
+        "images/s against",
+        "presented per rendered",
+        "generated cost  min",
+        "per rendered frame:",
+    ] {
+        assert!(stdout.contains(expected), "missing `{expected}` in:\n{stdout}");
+    }
+
+    // Without generation, one frame is one image: the wall line is the run's rate
+    // and the report claims nothing about images.
+    let (plain, _, code) = bench(&["--backend=soft-cpu", "--resolution=64x64", "--frames=4", "--warmup=1"]);
+    assert_eq!(code, 0);
+    assert!(plain.contains("fps at the mean"), "{plain}");
+    assert!(!plain.contains("per rendered frame:"), "{plain}");
+    assert!(!plain.contains("frame generation"), "{plain}");
+}
+
 /// A mistyped option is an error, not a silently ignored default - and an option
 /// whose value was written as a separate argument says so.
 #[test]
@@ -169,4 +206,42 @@ fn a_mistyped_option_is_refused() {
     let (_, stderr, code) = bench(&["--png", "out.png"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("take their value with `=`"), "{stderr}");
+}
+
+/// A steady-state frame takes nothing from the host allocator.
+///
+/// This is PROMPT §12's criterion and `docs/determinism.md` §5's rule: storage
+/// is reserved before a frame, never during it. The number is the host's own
+/// ledger - the counters of the allocator this tool hands the device, in this
+/// tool's process - so it counts what the device really took, however it took
+/// it. Every list a frame needs (the frame's draws, the reference tier's colour
+/// entries and cascade entries) is owned before the frame starts, which is why
+/// the line reads zero: a list built per frame puts a number above zero here at
+/// once, and that is the regression this pin exists to catch.
+#[test]
+fn a_steady_state_frame_allocates_nothing() {
+    for backend in ["soft-cpu", "d3d11"] {
+        let arg = format!("--backend={backend}");
+        let (stdout, stderr, code) = bench(&[&arg, "--resolution=64x64", "--frames=40", "--warmup=5"]);
+        if code != 0 {
+            // No usable device for this backend on this host: the d3d11 legs in
+            // `ffi/tests/tiers.rs` and `probes/run.sh` skip the same way. The
+            // reference tier is always runnable, so it may not skip.
+            assert_eq!(
+                backend, "d3d11",
+                "the soft-cpu leg must run:\n{stdout}\n{stderr}"
+            );
+            eprintln!("skipping the {backend} leg: {}", stderr.trim());
+            continue;
+        }
+        let line = stdout
+            .lines()
+            .find(|l| l.trim_start().starts_with("allocations "))
+            .unwrap_or_else(|| panic!("no allocations line in the {backend} run:\n{stdout}"));
+        assert!(
+            line.contains("(0 per frame;"),
+            "{backend}: a steady-state frame must allocate nothing, but the ledger says `{}`\n{stdout}",
+            line.trim()
+        );
+    }
 }

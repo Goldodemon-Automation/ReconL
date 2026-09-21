@@ -25,3 +25,6 @@
 
 # C example build output
 /examples/c/build/
+
+# C probe build output: the copied library, the compiled probes, their logs
+/probes/.build/

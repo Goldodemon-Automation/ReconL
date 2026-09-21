@@ -63,7 +63,7 @@ fn render(threads: u32, tile_size: u32, samples: &[[f32; 2]; 3]) -> Render {
         dynamic: false,
         casts_shadow: true,
     }];
-    let stats = raster.rasterize(&mut target, &draws).unwrap();
+    let stats = raster.rasterize(&mut target, &draws, (0, 0)).unwrap();
     Render { target, stats }
 }
 
@@ -101,6 +101,39 @@ fn triangle_covers_its_interior_and_nothing_else() {
         (drawn - analytic).abs() <= bound,
         "drawn {drawn} px, analytic {analytic} px, bound {bound}"
     );
+}
+
+/// The pixel counters are published once per tile, not once per pixel. That is
+/// only a performance change if the totals are *identical* - so this pins them
+/// against a count that owes nothing to the batching: a triangle that covers the
+/// whole viewport must report exactly one shaded pixel per pixel of the target,
+/// and one tested pixel wherever the depth test ran, at any worker count and any
+/// tile size.
+///
+/// Every pixel centre is strictly inside the triangle's edges (the diagonal
+/// leaves the [0,1] box through the corners), so the expected count is exact and
+/// does not depend on the fill rule or on where tile boundaries fall.
+#[test]
+fn the_pixel_counters_total_exactly_the_pixels_covered() {
+    let full_screen = [[-1.0, -1.0], [3.0, -1.0], [-1.0, 3.0]];
+    let pixels = WIDTH as u64 * HEIGHT as u64;
+    for (threads, tile) in [(1, 64), (8, 64), (4, 16), (8, 32)] {
+        let r = render(threads, tile, &full_screen);
+        assert_eq!(
+            r.stats.pixels_shaded, pixels,
+            "{threads} workers, {tile}px tiles: shaded {} of {pixels} covered pixels",
+            r.stats.pixels_shaded
+        );
+        assert_eq!(
+            r.stats.pixels_tested, pixels,
+            "{threads} workers, {tile}px tiles: tested {} of {pixels} covered pixels",
+            r.stats.pixels_tested
+        );
+        assert_eq!(
+            r.stats.tiles_rendered, r.stats.tiles_total,
+            "{threads} workers, {tile}px tiles: every tile must publish its work"
+        );
+    }
 }
 
 fn triangle_area() -> f32 {
@@ -193,7 +226,7 @@ fn back_faces_are_culled_and_two_sided_draws_them_flipped() {
         dynamic: false,
         casts_shadow: true,
     }];
-    let stats = raster.rasterize(&mut target, &draws).unwrap();
+    let stats = raster.rasterize(&mut target, &draws, (0, 0)).unwrap();
     assert_eq!(stats.pixels_shaded, front.stats.pixels_shaded, "two-sided coverage differs");
     assert_eq!(target.color_slice().unwrap(), front.target.color_slice().unwrap());
 }
@@ -244,7 +277,7 @@ fn depth_prefers_the_nearer_triangle_in_either_draw_order() {
                 casts_shadow: true,
             },
         ];
-        raster.rasterize(&mut target, &draws).unwrap();
+        raster.rasterize(&mut target, &draws, (0, 0)).unwrap();
         let color = target.color_slice().unwrap();
         let mid = (32 * WIDTH as usize + 32) * 4;
         assert_eq!(&color[mid..mid + 3], &[0.0, 1.0, 0.0], "nearer quad lost with order {order:?}");
@@ -270,7 +303,7 @@ fn indexed_draws_match_the_unindexed_ones() {
         dynamic: false,
         casts_shadow: true,
     }];
-    let stats = raster.rasterize(&mut target, &draws).unwrap();
+    let stats = raster.rasterize(&mut target, &draws, (0, 0)).unwrap();
     let direct = render(1, 64, &TRI);
     assert_eq!(stats.pixels_shaded, direct.stats.pixels_shaded);
     assert_eq!(target.color_slice().unwrap(), direct.target.color_slice().unwrap());
@@ -295,7 +328,7 @@ fn prepare_then_rasterize_allocates_nothing_in_the_frame() {
     }];
     for frame in 0..4 {
         target.clear_color([0.0, 0.0, 0.0, 1.0]);
-        let stats = raster.rasterize(&mut target, &draws).unwrap();
+        let stats = raster.rasterize(&mut target, &draws, (0, 0)).unwrap();
         assert_eq!(stats.allocations_in_frame, 0, "frame {frame} allocated");
     }
 }
@@ -324,7 +357,7 @@ fn identity_transform_puts_geometry_where_the_maths_says() {
         dynamic: false,
         casts_shadow: true,
     }];
-    let stats = raster.rasterize(&mut target, &draws).unwrap();
+    let stats = raster.rasterize(&mut target, &draws, (0, 0)).unwrap();
     assert_eq!(stats.pixels_shaded, 4, "the 2x2 target should be fully covered");
     for px in target.color_slice().unwrap().chunks_exact(4) {
         assert_eq!(px, [1.0, 1.0, 1.0, 1.0]);

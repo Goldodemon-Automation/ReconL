@@ -147,7 +147,9 @@ mod tests {
     }
 
     // One test, not two: the sink and the level are process-wide, so two tests
-    // touching them in parallel would race. See docs/abi.md, "Threading".
+    // touching them in parallel would race - which is the same state the
+    // header's logging note declares: one process-wide sink, safe from any
+    // thread.
     #[test]
     fn sink_receives_formatted_lines_and_long_lines_truncate() {
         set_sink(Some(capture), core::ptr::null_mut());

@@ -58,11 +58,16 @@ pub struct Options {
     pub repeat: u32,
     /// The most draws one frame will record; 0 sizes for `repeat` whole scenes.
     pub max_draws: u32,
+    /// Ask the device to keep each frame so `present_generated` can warp one
+    /// forward. This is the toggle a game flips with its own quality settings:
+    /// off, a frame keeps nothing and pays a depth readback it does not make;
+    /// on, it keeps its pixels, its depth and its camera.
+    pub framegen: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { width: 64, height: 64, present_to_memory: true, repeat: 1, max_draws: 0 }
+        Self { width: 64, height: 64, present_to_memory: true, repeat: 1, max_draws: 0, framegen: false }
     }
 }
 
@@ -94,6 +99,7 @@ pub struct Renderer {
     width: u32,
     height: u32,
     repeat: u32,
+    framegen: bool,
     swapchain: *mut reconl::SwapchainHandle,
     pipeline: *mut reconl::PipelineHandle,
     commands: *mut reconl::CommandListHandle,
@@ -106,6 +112,7 @@ impl Renderer {
         let device_ptr = device.handle();
         let (width, height) = (options.width.max(1), options.height.max(1));
         let present_to_memory = options.present_to_memory;
+        let framegen = options.framegen;
         // SAFETY: the device is live for this call; every descriptor is filled
         // from the Rust type and outlives the call that reads it.
         unsafe {
@@ -205,6 +212,7 @@ impl Renderer {
                 width,
                 height,
                 repeat: options.repeat.max(1),
+                framegen,
                 swapchain,
                 pipeline,
                 commands,
@@ -276,6 +284,11 @@ impl Renderer {
             };
             let shadows = scene.shadows.abi();
             let camera = scene.camera.abi();
+            let framegen = abi::ReconLFrameGenDesc {
+                base: hdr::<abi::ReconLFrameGenDesc>(),
+                enabled: u32::from(self.framegen),
+                reserved: 0,
+            };
             let fd = abi::ReconLFrameDesc {
                 base: hdr::<abi::ReconLFrameDesc>(),
                 width: self.width,
@@ -285,6 +298,11 @@ impl Renderer {
                 lights: &lights,
                 shadows: &shadows,
                 camera: &camera,
+                // A host's choice, per frame: the request is always declared,
+                // with the toggle off unless the host asked for generated
+                // frames, so switching it off costs a frame exactly what it
+                // cost before the feature existed.
+                framegen: &framegen,
             };
 
             let mut cost = FrameCost::default();
@@ -370,6 +388,44 @@ impl Renderer {
                 return Err(failed("reconlPresent", r));
             }
             Ok(cost)
+        }
+    }
+
+    /// Presents one *generated* image - the newest frame warped `ahead` frame
+    /// intervals along its camera's motion - and returns what it cost.
+    ///
+    /// This is a host's other half of the schedule: it renders fewer frames and
+    /// presents more images. Nothing is rendered here, so a failure leaves the
+    /// device able to render; the caller gets the error and may present a real
+    /// frame next, which is why this returns `Result` rather than a cost alone.
+    pub fn present_generated(&self, pixels: &mut [u8], ahead: f32) -> Result<u64, String> {
+        if pixels.len() < self.frame_bytes() {
+            return Err(format!(
+                "present buffer is {} bytes, a {}x{} frame needs {}",
+                pixels.len(),
+                self.width,
+                self.height,
+                self.frame_bytes()
+            ));
+        }
+        // SAFETY: the device and swapchain are live, and the descriptor is
+        // filled from Rust data that outlives the call.
+        unsafe {
+            let mut prd = abi::ReconLPresentDesc {
+                base: hdr::<abi::ReconLPresentDesc>(),
+                out_pixels: pixels.as_mut_ptr() as *mut core::ffi::c_void,
+                out_pixels_size: pixels.len() as u64,
+                out_row_pitch: self.width * 4,
+                out_format: 1,
+                flip: 0,
+            };
+            let started = Instant::now();
+            let r = reconl::reconlPresentGenerated(self.device, self.swapchain, &mut prd, ahead);
+            let took = started.elapsed().as_nanos() as u64;
+            if r != abi::result::OK {
+                return Err(failed("reconlPresentGenerated", r));
+            }
+            Ok(took)
         }
     }
 }

@@ -9,6 +9,7 @@ reconl-core = { workspace = true }
 reconl-raster = { workspace = true }
 reconl-shadow = { workspace = true }
 reconl-resource = { workspace = true }
+reconl-contract = { workspace = true }
 
 [lib]
 name = "reconl_backend_softcpu"

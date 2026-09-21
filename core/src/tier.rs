@@ -2,8 +2,11 @@
 //! pick one.
 //!
 //! Selection is explicit and logged. A tier is never inferred quietly at the end
-//! of a frame: [`resolve_tier`] returns the tier *and* the reason, and every step
-//! down appends to [`crate::stats::DowngradeLog`].
+//! of a frame: [`resolve_tier`] returns the tier *and* the reason, and the device
+//! (the only owner of a tier change and of the log that records one) appends to
+//! [`crate::stats::DowngradeLog`]. [`FrameLadder`] is that owner's arithmetic -
+//! the run of frames that decides a step - so both layers that act on a tier
+//! answer "was this frame over target?" from one counter rather than one each.
 
 use crate::text::Text;
 
@@ -144,6 +147,91 @@ impl TierReason {
             TierReason::NoGpuApi => "no usable GPU API on this host",
             TierReason::Recovery => "the hardware was rebuilt after the settle window",
         }
+    }
+}
+
+/// The frame-time ladder's arithmetic: a target, a threshold, and the run of
+/// consecutive frames over the target that decides a step down.
+///
+/// Two layers act on a device's tier (`docs/offload.md`, "Two layers, one
+/// number"): the *relabel*, which keeps the backend and lowers its quality tier,
+/// and the *offload*, which changes the backend. They answer the same question
+/// from the same number, so they count the same run: this type is the one
+/// counter, and the device holds the one instance of it. What to do when the run
+/// reaches the threshold is the device's policy (`ffi/src/offload.rs`); this
+/// type only keeps the count and says when the ladder acts.
+///
+/// The run is the *device's*, over the costs it composed in frame order: it is
+/// not restarted when the renderer changes, because the frames a rebuilt backend
+/// presents were paid for by the device that handed them over. The one thing
+/// that ends a run is a frame inside the target.
+pub struct FrameLadder {
+    target_ms: u32,
+    threshold: u32,
+    over: u32,
+    last_over_ns: u64,
+}
+
+impl FrameLadder {
+    pub const fn new(target_ms: u32, threshold: u32) -> Self {
+        Self { target_ms, threshold, over: 0, last_over_ns: 0 }
+    }
+
+    /// The target a frame is judged against, in milliseconds. Zero means the
+    /// ladder is off: a host that set no target has said "do not decide for me".
+    pub const fn target_ms(&self) -> u32 {
+        self.target_ms
+    }
+
+    /// `desc.downgrade_after_frames`: how many consecutive over-target frames
+    /// make the ladder act. Zero disables it as well.
+    pub const fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    pub const fn target_ns(&self) -> u64 {
+        self.target_ms as u64 * 1_000_000
+    }
+
+    /// Consecutive frames over the target so far - the number a relabel's own
+    /// detail reports.
+    pub const fn over_target(&self) -> u32 {
+        self.over
+    }
+
+    /// The cost of the most recent frame the run counted. The run is a run *of a
+    /// number*, so the record of it names that number: a relabel's detail reports
+    /// it, which is how a host reads the frame cost the ladder acted on instead of
+    /// taking the device's word for it. Zero when no frame is counted.
+    pub const fn last_over_ns(&self) -> u64 {
+        self.last_over_ns
+    }
+
+    /// Records one frame by its complete cost - the number the host waited for,
+    /// readback and all, which only the boundary that made the host wait can
+    /// compose. Returns true on the frame the run reaches the threshold: the one
+    /// the offload layer acts on. A frame inside the target, or a ladder that is
+    /// off, ends the run.
+    pub fn observe(&mut self, cost_ns: u64) -> bool {
+        if self.target_ms == 0 || cost_ns <= self.target_ns() {
+            self.over = 0;
+            self.last_over_ns = 0;
+            return false;
+        }
+        self.over = self.over.saturating_add(1);
+        self.last_over_ns = cost_ns;
+        self.acting()
+    }
+
+    /// Whether the run already stands at the threshold - without counting `cost`.
+    ///
+    /// This is the question the relabel layer answers, and it is asked before the
+    /// frame's own observation: the device's own ladder acts on the frame *after*
+    /// the cost that armed it (`docs/offload.md`, "Two layers, one number"), so a
+    /// host sees a tier change on the frame that follows the over-target frame,
+    /// at the render the backend it names then performs.
+    pub const fn acting(&self) -> bool {
+        self.target_ms > 0 && self.threshold > 0 && self.over >= self.threshold
     }
 }
 
@@ -551,6 +639,75 @@ mod tests {
             working_set_bytes: 1 << 20,
             caps: caps::MULTITHREAD | caps::SHADOWS | caps::TEXTURES | caps::MIPMAPS,
         }
+    }
+
+    #[test]
+    fn the_ladder_acts_on_the_frame_its_run_reaches_the_threshold() {
+        let mut ladder = FrameLadder::new(10, 3);
+        // Inside the target: no run to speak of.
+        assert!(!ladder.observe(9_000_000));
+        assert_eq!(ladder.over_target(), 0);
+        // Three consecutive misses, and the third is the frame it acts on.
+        assert!(!ladder.observe(11_000_000));
+        assert!(!ladder.observe(12_000_000));
+        assert!(ladder.observe(11_000_000));
+        assert_eq!(ladder.over_target(), 3);
+        // The frame exactly at the target is inside it: the ladder steps for a
+        // frame the host was told was *over* budget, not one that met it.
+        assert!(!ladder.observe(10_000_000));
+        assert_eq!(ladder.over_target(), 0);
+    }
+
+    #[test]
+    fn the_run_remembers_the_cost_it_is_a_run_of() {
+        let mut ladder = FrameLadder::new(10, 2);
+        // Nothing counted: no number to report.
+        assert_eq!(ladder.last_over_ns(), 0);
+        assert!(!ladder.observe(11_000_000));
+        assert_eq!(ladder.last_over_ns(), 11_000_000);
+        // The number follows the run: the most recent frame it counted.
+        assert!(ladder.observe(13_000_000));
+        assert_eq!(ladder.over_target(), 2);
+        assert_eq!(ladder.last_over_ns(), 13_000_000);
+        // A frame inside the target ends the run, and the run's number with it -
+        // the entry a relabel writes names the frame it acted on, not a stale one.
+        assert!(!ladder.observe(9_000_000));
+        assert_eq!(ladder.over_target(), 0);
+        assert_eq!(ladder.last_over_ns(), 0);
+    }
+
+    #[test]
+    fn a_ladder_with_no_target_or_no_threshold_never_acts() {
+        let mut no_target = FrameLadder::new(0, 4);
+        for _ in 0..8 {
+            assert!(!no_target.observe(1_000_000_000));
+        }
+        let mut no_threshold = FrameLadder::new(1, 0);
+        for _ in 0..8 {
+            assert!(!no_threshold.observe(1_000_000_000));
+        }
+        // The run is counted either way - "how many frames over target" is a
+        // question a host may ask of a device that was told not to act on it -
+        // but a ladder that does not act is a ladder that does not act.
+        assert_eq!(no_threshold.over_target(), 8);
+    }
+
+    #[test]
+    fn the_run_answers_the_relabel_before_the_frame_that_arms_it_is_counted() {
+        let mut ladder = FrameLadder::new(10, 2);
+        // Two misses: the second is the frame the offload layer acts on, and it
+        // is only after it that the relabel layer's question is true. So the
+        // relabel lands on frame 2 while the frame the host read over target was
+        // frame 1 - the order every backend's own ladder used before these two
+        // layers shared one run.
+        assert!(!ladder.observe(20_000_000));
+        assert!(!ladder.acting(), "one miss does not arm a two-frame threshold");
+        assert!(ladder.observe(20_000_000));
+        assert!(ladder.acting(), "the second miss arms it");
+        // A frame inside the target ends the run: the relabel has nothing to
+        // answer either.
+        assert!(!ladder.observe(1_000_000));
+        assert!(!ladder.acting());
     }
 
     #[test]

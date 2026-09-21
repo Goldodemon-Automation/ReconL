@@ -16,7 +16,13 @@
 //! * **shadow cost attributed**: pass nanoseconds, cascades, map resolution,
 //!   filter active against requested, and the cache counters;
 //! * **allocations during the measured frames**, from the host allocator's own
-//!   ledger - the steady-state claim, measured.
+//!   ledger - the steady-state claim, measured;
+//! * with `--framegen=R`, the **rate the schedule achieved**: images a second
+//!   against rendered frames a second, the presented-per-rendered ratio, and the
+//!   multiplier over rendering alone, measured end to end rather than assumed
+//!   from `R`. The wall line is per *rendered* frame either way, and says so
+//!   when generation is on, because a run that delivers twice the images must not
+//!   read as a run that got slower.
 //!
 //! `--trace=FILE` writes the per-frame record and a per-second summary, so a
 //! result can be re-read rather than re-run; `--png=FILE` writes the last frame,
@@ -55,6 +61,10 @@ OPTIONS:
   --disk-cap=SIZE       spill arena size cap
   --spill=0|1           allow the disk spill arena
   --spill-dir=PATH      directory the arena may use
+  --framegen=R          present images instead of frames at R per rendered
+                        frame (1.0 = off, up to 4.0): the device reprojects
+                        the newest frame along its camera's motion, and the run
+                        reports the presented rate it actually achieved
   --target-ms=N         frame-time target for the tier ladder; 0 disables it
   --audit=N             re-verify tier and budget every N frames (expensive)
   --trace=PATH          write the per-frame trace and per-second summary
@@ -73,9 +83,7 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
-}
-
-const FLAGS: [&str; 20] = [
+}  const FLAGS: [&str; 21] = [
     "--backend",
     "--tier",
     "--frames",
@@ -91,6 +99,7 @@ const FLAGS: [&str; 20] = [
     "--disk-cap",
     "--spill",
     "--spill-dir",
+    "--framegen",
     "--target-ms",
     "--audit",
     "--trace",
@@ -110,6 +119,9 @@ struct Options {
     audit_every: Option<u32>,
     trace: Option<String>,
     png: Option<String>,
+    /// Images per rendered frame, as a reduced fraction, or `None` when the
+    /// run renders and presents one image per frame as it always did.
+    framegen: Option<(u32, u32)>,
 }
 
 fn options_from(args: &[String]) -> Result<Options, String> {
@@ -125,6 +137,7 @@ fn options_from(args: &[String]) -> Result<Options, String> {
         audit_every: None,
         trace: None,
         png: None,
+        framegen: None,
     };
     if let Some(name) = units::value_of(args, "--backend") {
         config.backend = Config::backend_from_name(name)
@@ -184,10 +197,55 @@ fn options_from(args: &[String]) -> Result<Options, String> {
     if let Some(v) = units::value_of(args, "--audit") {
         options.audit_every = Some(units::parse_u32(v, "audit interval")?.max(1));
     }
+    if let Some(v) = units::value_of(args, "--framegen") {
+        options.framegen = Some(parse_ratio(v)?);
+    }
     options.trace = units::value_of(args, "--trace").map(str::to_string);
     options.png = units::value_of(args, "--png").map(str::to_string);
     options.config = config;
     Ok(options)
+}
+
+/// `--framegen=R` as a reduced fraction of presented images per rendered frame.
+///
+/// The ratio is kept exact because a host's schedule is built from it: a run at
+/// 1.5 presents three images for every two frames it renders, and the schedule
+/// spreads them the way a 1.5x display would rather than bunching them.
+fn parse_ratio(text: &str) -> Result<(u32, u32), String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|_| format!("`{text}` is not a ratio: expected a number like 2 or 1.5"))?;
+    if !value.is_finite() || !(1.0..=4.0).contains(&value) {
+        return Err(format!(
+            "`{text}` is outside the range this can schedule: 1.0 (off) to 4.0\
+             {}",
+            if value > 4.0 { " - beyond four images per frame the reprojection is extrapolating past its own interval" } else { "" }
+        ));
+    }
+    let hundredths = (value * 100.0).round() as u32;
+    let divisor = gcd(hundredths, 100);
+    Ok((hundredths / divisor, 100 / divisor))
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a.max(1)
+}
+
+/// How many images the host presents in the interval that ends at rendered frame
+/// `index`: the difference between the running totals the ratio implies, so the
+/// schedule never drifts and the last image of an interval is always one whole
+/// interval ahead of the newest frame.
+fn images_in_interval(index: u32, num: u32, den: u32) -> u32 {
+    let total_through = |n: u32| -> u32 {
+        let scaled = u64::from(n) * u64::from(num);
+        ((scaled + u64::from(den) - 1) / u64::from(den)) as u32
+    };
+    total_through(index + 1).saturating_sub(total_through(index))
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -279,6 +337,7 @@ fn run(args: &[String]) -> Result<(), String> {
             present_to_memory: true,
             repeat: options.repeat,
             max_draws: 0,
+            framegen: options.framegen.is_some(),
         },
     )?;
     let mut pixels = vec![0u8; renderer.frame_bytes()];
@@ -287,8 +346,8 @@ fn run(args: &[String]) -> Result<(), String> {
     // where the backend's real cause lives: the result code alone says *that* a
     // call failed, and the last-error text is the only place the detail (an
     // HRESULT, a limit, a rejected descriptor) survives.
-    let mut render = |seed: u32| -> Result<FrameCost, String> {
-        renderer.frame(&scene, seed, &mut pixels).map_err(|e| match device.last_error() {
+    let render = |seed: u32, pixels: &mut [u8]| -> Result<FrameCost, String> {
+        renderer.frame(&scene, seed, pixels).map_err(|e| match device.last_error() {
             Some(detail) => format!("{e} — device reported: {detail}"),
             None => e,
         })
@@ -298,7 +357,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // allocation, shader compilation and cache misses that a steady state does
     // not, and quoting them as the result is the mistake §13 is about.
     for i in 0..options.warmup {
-        render(1 + i)?;
+        render(1 + i, &mut pixels)?;
     }
     device.reset_stats()?;
     if let Some(n) = options.audit_every {
@@ -307,15 +366,41 @@ fn run(args: &[String]) -> Result<(), String> {
     reconl_host::alloc::reset();
 
     let mut run = Run::default();
+    // The host's schedule: it renders one frame per interval and presents the
+    // images the ratio asks for on top of it, each one `ahead` a fraction of the
+    // interval so the last of them lands where the next rendered frame would.
+    let mut presented: Vec<u64> = Vec::new();
+    let mut images: u64 = 0;
+    let mut interval_ns: u64 = 0;
     for i in 0..options.frames {
-        let cost = render(1 + options.warmup + i)?;
+        let cost = render(1 + options.warmup + i, &mut pixels)?;
+        interval_ns += cost.total_ns();
+        images += 1;
         let stats = device.stats()?;
         run.record(cost, &stats);
+        if let Some((num, den)) = options.framegen {
+            let count = images_in_interval(i, num, den);
+            for j in 1..count {
+                let took = renderer.present_generated(&mut pixels, j as f32 / count as f32)?;
+                interval_ns += took;
+                images += 1;
+                presented.push(took);
+            }
+        }
     }
     let ledger = reconl_host::alloc::counters();
     let stats = device.stats()?;
 
-    run.report(&stats, &options, &ledger, &limits);
+    run.report(
+        &stats,
+        &options,
+        &ledger,
+        &limits,
+        options.framegen.map(|_| Images { total: images, interval_ns }),
+    );
+    if options.framegen.is_some() {
+        run.report_framegen(&stats, &options, images, interval_ns, &presented);
+    }
     if let Some(path) = &options.trace {
         std::fs::write(path, run.trace(&stats, &options)).map_err(|e| format!("{path}: {e}"))?;
         println!("\ntrace written to {path} ({} frames)", run.frames());
@@ -362,6 +447,38 @@ struct Second {
     frames: u32,
     total_ns: u64,
     worst_ns: u64,
+}
+
+/// Every image a run handed over - rendered and generated alike - and the wall
+/// time that took.
+///
+/// [`Run::report`]'s wall line is per *rendered* frame, which is the whole story
+/// only when one frame is one image. With generation on, the run hands over the
+/// images in between as well, so a reader comparing that line against a run
+/// without generation reads a slowdown that did not happen (66 rendered fps
+/// while 130 images a second were delivered). This is the same measured window
+/// counted per image, which is what lets the wall line say what it is.
+#[derive(Clone, Copy)]
+struct Images {
+    total: u64,
+    interval_ns: u64,
+}
+
+impl Images {
+    /// Whether this window delivered anything to divide by.
+    fn measured(&self) -> bool {
+        self.total > 0 && self.interval_ns > 0
+    }
+
+    /// Images per second over the window, through the same mean-frame-time
+    /// conversion every other rate in this tool uses: one definition, so the
+    /// two sections of one report cannot state different rates for one window.
+    fn per_second(&self) -> String {
+        if !self.measured() {
+            return "0".into();
+        }
+        fps(self.interval_ns / self.total)
+    }
 }
 
 /// Every measured frame, kept whole.
@@ -431,16 +548,101 @@ impl Run {
         (min, self.mean(|s| s.total_ns), max)
     }
 
-    fn report(&self, stats: &abi::ReconLStats, options: &Options, ledger: &reconl_host::alloc::Counters, limits: &abi::ReconLDeviceLimits) {
+    /// What the frame-generation schedule actually delivered.
+    ///
+    /// Measured end to end, not implied by the ratio: the presented rate is the
+    /// images handed over divided by the wall time it took to render and warp
+    /// them, and the multiplier is that against rendering alone. This scene's
+    /// camera does not move, so a generated image is the frame itself warped by
+    /// no motion - a cost measurement, which is what a rate needs, and not a
+    /// quality one.
+    fn report_framegen(
+        &self,
+        stats: &abi::ReconLStats,
+        options: &Options,
+        images: u64,
+        interval_ns: u64,
+        generated: &[u64],
+    ) {
+        let (num, den) = options.framegen.unwrap_or((1, 1));
+        let rendered = self.frames() as u64;
+        if rendered == 0 || images == 0 || interval_ns == 0 {
+            return;
+        }
+        let rendered_ns = self.mean(|s| s.total_ns).max(1);
+        let per_image_ns = interval_ns / images;
+        let multiplier = rendered_ns as f64 / per_image_ns.max(1) as f64;
+        println!("\nframe generation");
+        println!(
+            "  schedule        {:.2} images per rendered frame ({} in {}): {} rendered, {} generated",
+            num as f64 / den as f64,
+            num,
+            den,
+            rendered,
+            generated.len()
+        );
+        println!(
+            "  presented       {} images in {} — {} images/s against {} rendered frames/s alone: {:.2}x at {} presented per rendered",
+            images,
+            ns(interval_ns),
+            fps(per_image_ns),
+            fps(rendered_ns),
+            multiplier,
+            images as f64 / rendered as f64
+        );
+        if !generated.is_empty() {
+            let mut sorted = generated.to_vec();
+            sorted.sort_unstable();
+            let mean = sorted.iter().sum::<u64>() / sorted.len() as u64;
+            let share = mean as f64 / rendered_ns as f64 * 100.0;
+            println!(
+                "  generated cost  min {}  avg {}  max {}   ({share:.2}% of a rendered frame each)",
+                ns(sorted[0]),
+                ns(mean),
+                ns(sorted[sorted.len() - 1])
+            );
+        }
+        println!(
+            "  counters        generated {}  ready {}  last ahead {}  device-reported generation time {}",
+            stats.framegen.generated,
+            stats.framegen.ready,
+            stats.framegen.last_ahead,
+            ns(stats.framegen.generated_ns)
+        );
+    }
+
+    fn report(
+        &self,
+        stats: &abi::ReconLStats,
+        options: &Options,
+        ledger: &reconl_host::alloc::Counters,
+        limits: &abi::ReconLDeviceLimits,
+        images: Option<Images>,
+    ) {
         let (min, avg, max) = self.bounds();
         println!("\nsteady state, {} measured frames", self.frames());
-        println!(
-            "  wall            min {}  avg {}  max {}   ({} fps at the mean)",
-            ns(min),
-            ns(avg),
-            ns(max),
-            fps(avg)
-        );
+        match images.filter(|images| images.measured()) {
+            // One frame, one image: the mean frame time is the run's rate.
+            None => println!(
+                "  wall            min {}  avg {}  max {}   ({} fps at the mean)",
+                ns(min),
+                ns(avg),
+                ns(max),
+                fps(avg)
+            ),
+            // Generation on: this line is per *rendered* frame, and the run's
+            // rate is the images it handed over - which is the number a host
+            // comparing features wants, and the one the "frame generation"
+            // section below breaks down.
+            Some(images) => println!(
+                "  wall            min {}  avg {}  max {}   (per rendered frame: {} rendered frames/s, {} images/s presented in all - see \"frame generation\")",
+                ns(min),
+                ns(avg),
+                ns(max),
+                fps(avg),
+                images.per_second()
+            ),
+        }
         println!(
             "  host split      begin {}  submit {}  present {}   (mean)",
             ns(self.mean(|s| s.begin_ns)),

@@ -13,6 +13,7 @@ reconl-raster = { workspace = true }
 reconl-shadow = { workspace = true }
 reconl-resource = { workspace = true }
 reconl-scene = { workspace = true }
+reconl-contract = { workspace = true }
 reconl-backend-null = { workspace = true }
 reconl-backend-softcpu = { workspace = true }
 reconl-backend-d3d11 = { workspace = true }

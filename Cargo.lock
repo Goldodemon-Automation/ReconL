@@ -127,7 +127,7 @@ dependencies = [
 name = "reconl-backend-d3d11"
 version = "0.1.0"
 dependencies = [
- "reconl-backend-softcpu",
+ "reconl-contract",
  "reconl-core",
  "reconl-raster",
  "reconl-shadow",
@@ -145,6 +145,7 @@ dependencies = [
 name = "reconl-backend-softcpu"
 version = "0.1.0"
 dependencies = [
+ "reconl-contract",
  "reconl-core",
  "reconl-raster",
  "reconl-resource",
@@ -159,6 +160,15 @@ dependencies = [
  "reconl-ffi",
  "reconl-host",
  "reconl-png",
+]
+
+[[package]]
+name = "reconl-contract"
+version = "0.1.0"
+dependencies = [
+ "reconl-core",
+ "reconl-raster",
+ "reconl-shadow",
 ]
 
 [[package]]
@@ -181,6 +191,7 @@ dependencies = [
  "reconl-backend-d3d11",
  "reconl-backend-null",
  "reconl-backend-softcpu",
+ "reconl-contract",
  "reconl-core",
  "reconl-raster",
  "reconl-resource",

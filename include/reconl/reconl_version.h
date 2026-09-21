@@ -5,9 +5,9 @@
  * struct_size/type do not match, and reports RECONL_ERR_ABI_VERSION when the
  * linked library's ABI version differs from the header's.
  *
- * Growth policy (see docs/abi.md): new fields arrive through the `next` chain
- * or at the end of a struct with a bumped struct_size. Fields are never
- * reordered, retyped, or removed in a minor release.
+ * Growth policy (see the struct rules in reconl.h): new fields arrive through
+ * the `next` chain or at the end of a struct with a bumped struct_size. Fields
+ * are never reordered, retyped, or removed in a minor release.
  */
 #ifndef RECONL_VERSION_H
 #define RECONL_VERSION_H

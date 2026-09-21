@@ -1,7 +1,16 @@
 /* ReconL - backend descriptor catalogue.
  *
- * A backend descriptor is passed to reconlCreateDevice through
- * ReconLDeviceDesc::backend_desc and is read only for the duration of the call.
+ * A backend descriptor may be passed to reconlCreateDevice through
+ * ReconLDeviceDesc::backend_desc.
+ *
+ * RESERVED IN THIS REVISION (ABI 100): the library accepts the pointer and does
+ * not read it. Every backend starts with its documented defaults, passing a
+ * descriptor changes nothing, and passing a wild pointer is as harmless as
+ * passing NULL - so a host may fill one in today. The structs below are the
+ * contract for the revision that reads them: a field is never repurposed, so a
+ * descriptor written against this header keeps meaning the same thing when the
+ * knobs start to be honored. Until then their values are not observable.
+ *
  * A backend that is asked for a capability it does not have reports it in
  * ReconLBackendProbe / ReconLDeviceLimits; it never fails the device creation
  * over a missing optional feature - the tier resolver falls back instead.
@@ -19,6 +28,7 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------- soft-cpu
+ * Reserved this revision: see the note at the top of this header.
  *
  * The reference tier (T2/T3/T4). Bit-identical output for a given
  * (scene, seed, tier, worker count) is the contract, so every knob here is part
@@ -40,14 +50,15 @@ typedef struct ReconLSoftCpuDesc {
 } ReconLSoftCpuDesc;
 
 /* ---------------------------------------------------------------------- null
+ * Reserved this revision: see the note at the top of this header.
  *
  * Deterministic no-op backend. It answers every query, records every command,
  * counts everything, and writes nothing. It exists so that ABI conformance,
  * refcounting, budget accounting and error-path tests run with no GPU, no
  * threads and no disk - the CI tier.
  *
- * With RECONL_NULL_DESC_FAKE_TIER set, it reports a chosen tier and lets the
- * downgrade ladder be exercised end to end without hardware.
+ * With `fake_tier` set, it reports a chosen tier and lets the downgrade ladder
+ * be exercised end to end without hardware.
  */
 typedef struct ReconLNullDesc {
     ReconLBase  base;   /* type = RECONL_STRUCT_NULL_DESC */
@@ -63,6 +74,7 @@ typedef struct ReconLNullDesc {
 } ReconLNullDesc;
 
 /* --------------------------------------------------------------------- d3d11
+ * Reserved this revision: see the note at the top of this header.
  *
  * The first hardware tier. The same passes, the same cascade, reversed-Z, so
  * the goldens are comparable with soft-cpu line for line.
