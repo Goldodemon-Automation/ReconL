@@ -1245,17 +1245,38 @@ impl D3d11Device {
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe { context.Map(&target.color_staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
             .map_err(|e| err("map colour staging texture", e))?;
-        for row in 0..rows {
-            let source = if flip { rows - 1 - row } else { row };
-            let src = unsafe {
-                (mapped.pData as *const u8).add(source * mapped.RowPitch as usize)
-            };
-            let bytes = unsafe { std::slice::from_raw_parts(src, row_bytes) };
-            let at = row * pitch;
-            out[at..at + row_bytes].copy_from_slice(bytes);
+        if !flip && pitch == row_bytes && mapped.RowPitch as usize == row_bytes {
+            Self::copy_rows_contiguous(mapped.pData as *const u8, out, rows * row_bytes);
+        } else {
+            for row in 0..rows {
+                let source = if flip { rows - 1 - row } else { row };
+                let src = unsafe {
+                    (mapped.pData as *const u8).add(source * mapped.RowPitch as usize)
+                };
+                let bytes = unsafe { std::slice::from_raw_parts(src, row_bytes) };
+                let at = row * pitch;
+                out[at..at + row_bytes].copy_from_slice(bytes);
+            }
         }
         unsafe { context.Unmap(&target.color_staging, 0) };
         Ok(())
+    }
+
+    /// The same rows, through one contiguous copy when the layout allows it.
+    ///
+    /// A tight destination pitch over a tight mapped pitch makes the frame one
+    /// `rows * row_bytes` span on both sides - the common case, since a width
+    /// whose row is a multiple of the driver's pitch alignment lands there - and
+    /// one copy of the span beats a thousand row-wise ones from the same
+    /// uncached mapping. Anything else falls back to the per-row loop above,
+    /// which is what honours a padded pitch or a flip.
+    fn copy_rows_contiguous(mapped: *const u8, out: &mut [u8], count: usize) {
+        // SAFETY: `count` is `rows * row_bytes`, both sides are inside the
+        // mapped region and the destination (checked by the caller), and the
+        // two never alias - one is driver memory, the other the host's buffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(mapped, out.as_mut_ptr(), count);
+        }
     }
 
     /// (Re)lays tightly packed rows into a destination with a row pitch and
@@ -1540,6 +1561,13 @@ impl D3d11Device {
         } else {
             self.color_checksum = 0;
         }
+
+        // Every command of this frame is issued; hand them to the GPU now so
+        // it renders while the CPU is still finishing submit, instead of
+        // starting inside the present that waits for it. The host pays for the
+        // same work either way - the flush only decides how much of it overlaps
+        // the CPU, and it adds nothing a host that never presents would owe.
+        unsafe { self.context.Flush() };
 
         self.shadows.cascades_rendered = cascades_rendered;
         self.shadows.shadow_pass_ns = shadow_ns;

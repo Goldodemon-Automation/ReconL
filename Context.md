@@ -614,6 +614,91 @@ which drives both exit paths end to end on the null tier - a budget that fits
 must exit 0, a one-nanosecond budget must exit 3 - so the gate's contract is
 tested without making the suite's green depend on how fast this machine is.
 
+## The present path, profiled - 1080p and 1440p inside the budget
+
+The gate above said *where* the hardware tier stood; this pass asked *why*, on
+a branch stacked on the gate's own (`reconl/d3d11-readback` atop
+`reconl/fps-gate`) so the measuring tool is in the tree. The gate's own admission
+framed the method: with no GPU timestamp queries, the stage-level question is
+answered from the host side.
+
+* **The host's split said where to look.** Across the frame's three ABI
+  boundaries at 1080p, `present` was about 89% of the frame - submit 2.4 ms,
+  begin 7.8 us. The miss was not per-draw CPU work, not allocation churn (a
+  steady frame allocates nothing, above), not redundant state. It was
+  `reconlPresent` - the readback the host waits on.
+* **Inside the present, two legs** (temporary instrumentation in
+  `copy_target_rows`, behind an env var, removed before the commit): one `Map`
+  of the staging texture, then the row-copy loop out of it. At 1080p the
+  map-wait ran 11-26 ms across frames - `Map` on a staging resource blocks until
+  the GPU finishes the frame - and the loop 3-9 ms, streaming ~8.3 MB of
+  uncached GPU memory at roughly 1.8 GB/s. Both legs have a constant floor and
+  scale with bytes; at 4K the same instrumentation read 33-91 ms and 28-265 ms.
+
+Two costs, two changes, both in `backends/d3d11/src/imp.rs`, neither touching
+behaviour, the ABI, or a single pixel the reference tier defines:
+
+1. **The copy is one span when the layout says it is.** `copy_target_rows`
+   looped row by row even when there was no flip, the destination pitch was the
+   row bytes, and the mapped `RowPitch` was too - the common case, since a width
+   whose row is the driver's pitch alignment lands there. `copy_rows_contiguous`
+   now takes that case as one `copy_nonoverlapping` of `rows * row_bytes`; a
+   padded pitch or a flip still gets the per-row loop, unchanged. Measured
+   alone, this change already passes: 1080p 9.834 ms, 1440p 14.977 ms.
+2. **The frame's commands are flushed at the end of `render()`.** Without one,
+   the driver decides when the queued commands reach the GPU, and the map inside
+   present could be the first moment the frame's work really started - the tail
+   the old path showed that way is visible below. The flush hands the GPU the
+   whole frame while the CPU is still finishing submit; the host pays for the
+   same GPU work either way, only the overlap changes.
+
+Before and after, three runs each after the change (means, 5 + 60 frames per
+resolution, `--fps-gate --backend=d3d11`):
+
+| resolution | before (gate table above) | after: run 1 / run 2 / run 3 | verdict |
+|---|---|---|---|
+| 720p | 9.912 ms PASS | 7.026 / 6.168 / 7.635 ms | PASS x3 |
+| 1080p | 17.136 ms FAIL (+469.6 us) | 10.078 / 10.415 / 10.082 ms | PASS x3 |
+| 1440p | 25.842 ms FAIL (+9.176 ms) | 12.432 / 14.667 / 12.241 ms | PASS x3 |
+| 4K | 45.565 ms FAIL (+28.899 ms) | 24.998 / 25.601 / 27.277 ms | FAIL x3 |
+
+The honest reading, on a machine whose variance is wide enough that the old
+binary measured 17.136 ms in the gate table and 18.359 ms in this session's own
+baseline re-run:
+
+* **1080p passes the 60 FPS gate, with room.** 10.08-10.42 ms against a
+  16.667 ms budget - about a third spare, stable across runs, where the old path
+  missed by 469.6 us. 1440p passes too, at 12.2-14.7 ms. The soft-cpu tier is
+  untouched and remains what defines correctness: 277 workspace tests, the C
+  probes (24/24 rows), and the byte-identical golden all stay green.
+* **The tail is where the flush earns its place.** Interleaved runs of the old
+  binary on this machine showed max frames of 58 ms at 1080p and 269 ms at 4K -
+  whole frames spent inside the map-wait - while the runs above end at
+  11.4/14.6/35.5 ms max, 13-30% over their own means. The mean improvement is
+  the copy's; the flush is what stops an occasional frame from paying for the
+  GPU's whole queue inside the present the host is timing.
+* **4K stays over budget, and the data says it is the bytes.** The best 4K frame
+  this build produced is 23.301 ms - 6.6 ms above budget even if everything else
+  in the frame were free. The frame is a synchronous readback: 3840x2160x4 =
+  33.2 MB of uncached GPU memory must cross to system memory inside the present
+  the host waits on, and at the bandwidth the profiling loop showed (~1.8 GB/s)
+  that transfer alone is most of the budget. No in-place copy optimisation
+  closes a gap of that shape. Getting 4K under 60 means the readback stops being
+  synchronous with the frame the host waits for - a staging ring whose copy
+  overlaps the next frame's render, or a GPU-side downscale - which changes what
+  present *means*, not how it copies. Not attempted here; the gate exits 3 with
+  4K named, which is the honest verdict.
+* **What the numbers are:** single machine, release build, one device, min/avg/max
+  inside each run and the three runs side by side - the spread is the honest
+  uncertainty, as above. The gate is unchanged: this pass moved the work, not
+  the budget, the verdict rule or the exit codes.
+
+Validation: `cargo test --workspace` 277 passed / 0 failed; `probes/run.sh` 24
+rows, 24 pass, 0 fail, 0 skip; `reconl-diff compare tests/golden/soft-cpu-shadow.png`
+identical (4096 px); no new compiler warnings - the five on this base are the
+ones PR #2 removes, and none are in `d3d11`. The profiling instrumentation was
+temporary and is gone from `backends/d3d11/src/imp.rs`.
+
 ## Checks
 
 ```bash
