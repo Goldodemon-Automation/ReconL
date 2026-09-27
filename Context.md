@@ -466,6 +466,83 @@ library to read memory its host handed back. The cell now passes a live handle o
 wrong kind, which tests the property that is actually the ABI's — a handle is
 validated by its kind word and never followed.
 
+## The debug and fix pass
+
+The tree went through one full verification pass before anything was pushed, on
+the branch `reconl/debug-fix-phase`, as four commits:
+
+* **`frontend: Zig immediate-mode UI core rendered through the ReconL C ABI`** —
+  `frontend/` had never been committed; it went in with `.gitignore` rules for
+  its caches and outputs (`.zig-cache`, `zig-out`, `*.exe`, `__pycache__`), and
+  a compiled `spike/probe.exe` was kept out.
+* **`ReconL: ABI 101 adapter selection, a hard-capped spill arena, and the
+  band-streaming module`** — the working tree the sections above describe:
+  adapter selection end to end, the arena's hard cap, `filter_caps`, the move of
+  the out-of-core path into `backends/soft-cpu/src/stream.rs`, the 24-row probe
+  plan, and the docs that go with them.
+* **`probes: include reconl_backends.h in gpu_probe`** — the one *defect* the
+  pass found. `gpu_probe` pins device creation to an enumerated adapter LUID
+  through `ReconLD3D11Desc`, which lives in `reconl/reconl_backends.h`, but the
+  probe only included `reconl/reconl.h`, so it did not compile against the
+  shipped headers (`unknown type name`, and the `SETBASE` and selector fields
+  failed with it). One include; all 24 rows compile and pass again.
+* **`workspace: clear every compiler warning`** — 15 warnings to zero.
+  `Command::SetVertexBuffer` no longer stores the stream index the entry gate
+  already refuses to anything but 0; the descriptor test documents why its
+  assignments are only read through the FFI pointer (`#[allow]` with the reason
+  beside it, not a silent one); an unused `mut` in the sizing test, an unused
+  `mut` in `SpillArena::open`, an unused test import in `shadow/` and
+  unnecessary parens in `MipChain::bytes` go away; and `reconl-info`'s device
+  report now *prints* the adapter preference, which is what the parameter
+  threaded into `report_device` was for — `--adapter=` used to choose silently.
+  The one piece of new code is `Display for AdapterSelection` in `tools/host`.
+
+Every fix was verified by hash: the eight touched files were snapshotted,
+reversed to isolate the carried-in tree for its own commit, re-applied, and
+`sha256sum -c` confirmed them byte-identical to the state every test below ran
+against.
+
+### The build entry points
+
+Four, and only four — each language's *native* workflow, not a wrapper over
+another one:
+
+| entry point | command | what it gates |
+|---|---|---|
+| Cargo workspace | `cargo build`; `cargo test --workspace`; the same with `--profile tested` | unit, ABI host, tier matrix, golden, CLI |
+| Zig frontend | `cd frontend && zig build test` / `abi-test` / `shared` / `demo` | 42 core tests with no renderer linked; 11 through the C ABI against the debug DLL |
+| C probes | `probes/run.sh` | the *shipped* release DLL, freshly built and md5-confirmed; 24 rows |
+| Java spike | `cd frontend && python spike/verify_java.py` | the Panama FFM consumer against `reconl_ui.dll` (`javac --enable-preview --release 21`, because FFM is still a preview API on 21) |
+
+The rest of the multi-language surface is deliberately *not* an entry point.
+There is *no Gradle build and no Kotlin source* in the repository — the Java
+spike is one file compiled by `javac` directly. `cmake` is installed but owns
+nothing here: no `CMakeLists.txt` exists anywhere. And there are no C++
+sources: the C probes compile through the runner's own `cc` line (`gcc`/`cc`
+serves; `clang` is absent). `cargo check --workspace --all-targets` is the fast gate and currently answers
+0 errors, 0 warnings.
+
+### What comes next
+
+* **The 60 FPS gate.** Automated benchmarking hooks that run the reference
+  scene at 720p, 1080p, 1440p and 4K and record min/avg/max per configuration,
+  so "60 FPS" becomes a number the harness reads rather than a claim. The
+  baseline is the README's scaling table: d3d11 is at 2.30 ms for 512x512 and
+  its per-frame cost is dominated by a fixed readback, while soft-cpu is at
+  15.3 ms there and must be measured at each resolution before anything is
+  promised. The hooks belong beside `reconl-bench`'s existing fingerprint and
+  trace, and the ladder's `target_frame_ms` is where their verdict lands.
+* **From this file's own honest limits:** the fault path still cannot be
+  injected (no fault hook, so the offload's device-removal leg remains the one
+  step no pin takes), and a streamed frame is not byte-identical to a resident
+  one (an integer row origin instead of a re-projected clip space would make it
+  so).
+* **From the README's provisional list:** the backend matrix beyond
+  `d3d11`/`soft-cpu`/`null`, no GPU timestamp queries, the second copy of the
+  reference scene in `ffi/tests/tiers.rs`, the offload return trip's dependence
+  on a non-zero `target_frame_ms` (the benchmark's default is 0), and the
+  frontend's script shaping (no GSUB/GPOS, no kerning pairs).
+
 ## Checks
 
 ```bash
@@ -480,10 +557,15 @@ target/release/reconl-bench --backend=soft-cpu --tier=t4 --width=512 --height=51
     --spill-dir=spill --shadows=cached --png=streamed.png
 ```
 
-Last run on this machine: `cargo test --workspace` 279 passed / 0 failed across 35
-binaries; `probes/run.sh` 24 rows, 24 pass, 0 fail, 0 skip against the freshly built
-DLL (`md5 7fdb5fc0…`); the golden byte-identical (`sha256 7e8ecbab…`,
-`reconl-diff compare` → identical, 4096 px).
+Last run on this machine (the debug and fix pass, `reconl/debug-fix-phase`):
+`cargo check --workspace --all-targets` 0 errors, 0 warnings; `cargo test
+--workspace` 302 passed / 0 failed, and the same 302 / 0 under `cargo test
+--workspace --profile tested`; `probes/run.sh` 24 rows, 24 pass, 0 fail, 0 skip
+against the freshly built, md5-confirmed DLL (`md5 dd172d3d…`); `zig build
+test` 42/42 and `zig build abi-test` 11/11 against the current debug DLL, with
+`zig build shared` and `zig build demo` succeeding; `python
+spike/verify_java.py` all assertions passed; the golden byte-identical
+(`reconl-diff compare` → identical, 4096 px).
 
 **Do not run the suite with `--release`.** The release profile is `panic = "abort"`
 (that is the crate's ABI contract), and `cargo test --release` forces `panic =
