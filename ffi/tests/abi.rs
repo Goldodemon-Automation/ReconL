@@ -835,6 +835,10 @@ fn d3d11_backend_descriptor_validates_and_reads_adapter_selection() {
     assert!(device.is_null());
 }
 
+// `selection` is mutated in place while `desc.backend_desc` points at it: every
+// value assigned below is read by `reconlCreateDevice` through that raw pointer,
+// not by any Rust code, so rustc's dataflow cannot see the reads.
+#[allow(unused_assignments)]
 #[test]
 fn d3d11_backend_descriptor_rejects_bad_type_and_unknown_preference() {
     let mut selection = abi::ReconLD3D11Desc {
@@ -2394,7 +2398,7 @@ fn the_ceiling_holds_on_the_hardware_tier_too() {
     }
 
     // Host-side requests on an uncapped device: the library's own 512 MiB ceiling.
-    let mut rig = Rig::new_with(abi::backend::D3D11, 1);
+    let rig = Rig::new_with(abi::backend::D3D11, 1);
     assert_eq!(rig.limits().max_allocation_bytes, 512 << 20);
     let bd = abi::ReconLBufferDesc {
         base: hdr::<abi::ReconLBufferDesc>(),

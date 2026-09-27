@@ -116,7 +116,6 @@ enum Command {
         pipeline: *mut PipelineHandle,
     },
     SetVertexBuffer {
-        stream: u32,
         buffer: *mut BufferHandle,
         offset: u64,
     },
@@ -1810,7 +1809,9 @@ pub unsafe extern "C" fn reconlCmdSetVertexBuffer(list: *mut CommandListHandle, 
             return err!(Code::NotSupported, "this release has one vertex stream");
         }
         let list = unsafe { &mut *list };
-        push_command(list, Command::SetVertexBuffer { stream, buffer, offset })?;
+        // The entry gate above has already refused any other stream, so the
+        // command carries only what a submit reads.
+        push_command(list, Command::SetVertexBuffer { buffer, offset })?;
         Ok(())
     })
 }
@@ -2264,7 +2265,7 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     state.pipeline = Some(pipeline_state(pipeline));
                     state.pipeline_rec = Some(pipeline as *const PipelineHandle as *mut PipelineHandle);
                 }
-                Command::SetVertexBuffer { stream: _, buffer, offset } => {
+                Command::SetVertexBuffer { buffer, offset } => {
                     if buffer.is_null() {
                         return err!(Code::InvalidArgument, "null vertex buffer");
                     }

@@ -287,6 +287,9 @@ fn report_device(device: &Device, requested: &str, selection: device::AdapterSel
     if !device.device_name().is_empty() {
         println!("  device: {}  driver: {}", device.device_name(), device.driver());
     }
+    if limits.backend == abi::backend::D3D11 {
+        println!("  adapter preference: {selection}");
+    }
     println!(
         "  limits: vram {}  ram {}  disk {}  max allocation {}",
         bytes(limits.vram_bytes),

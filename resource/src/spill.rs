@@ -178,7 +178,7 @@ pub struct SpillArena {
 impl SpillArena {
     /// Opens (or creates) the arena and recovers whatever is intact.
     pub fn open(config: SpillConfig) -> Result<Self> {
-        let mut file = open_arena_file(&config)?;
+        let file = open_arena_file(&config)?;
 
         let len = file
             .metadata()

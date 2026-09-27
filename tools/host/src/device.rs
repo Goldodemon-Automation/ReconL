@@ -54,6 +54,18 @@ impl AdapterSelection {
     }
 }
 
+impl core::fmt::Display for AdapterSelection {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto (discrete first)"),
+            Self::Integrated => f.write_str("integrated"),
+            Self::Discrete => f.write_str("discrete"),
+            Self::Index(index) => write!(f, "index {index}"),
+            Self::Luid(luid) => write!(f, "LUID {luid:016x}"),
+        }
+    }
+}
+
 /// One call to the C ABI's two-call adapter enumeration contract.
 pub fn enumerate_adapters(backend: u32) -> Result<Vec<abi::ReconLAdapterInfo>, String> {
     let mut count = 0u32;
