@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "reconl/reconl.h"
+#include "reconl/reconl_backends.h"
 
 #define SETBASE(p, T)                                        \
     do {                                                     \
