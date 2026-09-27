@@ -8,6 +8,7 @@
 *.so
 *.dylib
 *.exp
+*.exe
 
 # Toolchain-local bits
 *.log
@@ -28,3 +29,10 @@
 
 # C probe build output: the copied library, the compiled probes, their logs
 /probes/.build/
+
+# Zig build cache and outputs (frontend/)
+/frontend/.zig-cache/
+/frontend/zig-out/
+
+# Python bytecode from the spike checks
+__pycache__/
