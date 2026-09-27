@@ -37,23 +37,29 @@ use reconl_core::alloc::HostAlloc;
 use reconl_core::budget::{Budget, Reservation};
 use reconl_core::error::{Code, Error, Result};
 use reconl_core::stats::{Counters, FrameNumbers, ShadowCounters};
-use reconl_core::tier::{caps, rules, shadow_plan, Backend, ShadowFilter, ShadowPlan, Tier, TierReason};
+use reconl_core::tier::{caps, filter_caps, rules, shadow_plan, Backend, ShadowFilter, ShadowPlan, Tier, TierReason};
 use reconl_raster::math::{self, Mat4};
 use reconl_raster::shade::LightSet;
 use reconl_raster::{
     checksum_bytes, rendered_viewport, DrawItem, ShaderRef, Vertex, CULL_BACK, CULL_FRONT, COMPARE_GREATER,
 };
 use reconl_shadow as shadow;
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
 
-use windows::core::PCSTR;
-use windows::Win32::Foundation::{BOOL, HMODULE};
+use windows::core::{Interface, PCSTR};
+use windows::Win32::Foundation::{FreeLibrary, BOOL, HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::{
     ID3DBlob, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0,
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D_SRV_DIMENSION_TEXTURE2DARRAY,
 };
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::DXCore::{
+    DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS, IDXCoreAdapter, IDXCoreAdapterFactory,
+    IDXCoreAdapterList, InstanceLuid, IsHardware, IsIntegrated,
+};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11BlendState, ID3D11Buffer, ID3D11ClassLinkage, ID3D11DepthStencilState,
     ID3D11DepthStencilView, ID3D11Device, ID3D11DeviceContext, ID3D11InputLayout,
@@ -85,6 +91,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
+use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+
+use crate::{select_adapter_index, AdapterInfo, AdapterSelection, AdapterType};
 
 use crate::shaders::{DrawCb, LightsCb, ShadowCb, PS_DEPTH_HLSL, PS_HLSL, VS_DEPTH_HLSL, VS_HLSL};
 
@@ -95,8 +104,7 @@ const UPLOAD_SLACK: u32 = 4 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct D3d11Config {
     pub tier: Tier,
-    /// Index into `probe_adapters`' list. The default adapter when out of range.
-    pub adapter_index: usize,
+    pub adapter_selection: AdapterSelection,
     pub resolution_scale: f32,
     pub target_frame_ms: u32,
     /// Cascade split lambda. Shared with the reference backend's config so both
@@ -109,22 +117,13 @@ impl Default for D3d11Config {
     fn default() -> Self {
         Self {
             tier: Tier::GpuShared,
-            adapter_index: 0,
+            adapter_selection: AdapterSelection::Auto,
             resolution_scale: 1.0,
             target_frame_ms: 16,
             split_lambda: 0.75,
             shadow: ShadowRequest::default(),
         }
     }
-}
-
-/// One GPU adapter, as `reconlProbe` reports it.
-#[derive(Clone, Debug)]
-pub struct AdapterInfo {
-    pub description: String,
-    pub dedicated_video_memory: u64,
-    pub vendor_id: u32,
-    pub feature_level_11: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -609,14 +608,10 @@ pub struct D3d11Device {
 impl D3d11Device {
     pub fn new(alloc: HostAlloc, budget: Arc<Budget>, config: D3d11Config) -> Result<Self> {
         alloc.self_check()?;
-        let adapters = enumerate_adapters()?;
-        let chosen = if config.adapter_index < adapters.len() {
-            &adapters[config.adapter_index]
-        } else {
-            adapters
-                .first()
-                .ok_or_else(|| Error::new(Code::BackendUnavailable, "no D3D11 adapter was found"))?
-        };
+        let adapters = enumerate_adapter_devices()?;
+        let metadata: Vec<_> = adapters.iter().map(|(_, info)| info.clone()).collect();
+        let chosen_index = select_adapter_index(&metadata, config.adapter_selection)?;
+        let chosen = &adapters[chosen_index].0;
         let desc = unsafe { chosen.GetDesc1() }.map_err(|e| err("adapter desc", e))?;
         let name_len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         let adapter_name = String::from_utf16_lossy(&desc.Description[..name_len]);
@@ -831,16 +826,16 @@ impl D3d11Device {
         caps_for(self.tier)
     }
 
-    pub fn device_name(&self) -> &'static str {
-        "d3d11 (hardware rasteriser)"
+    pub fn device_name(&self) -> &str {
+        &self.adapter_name
     }
 
     pub fn driver(&self) -> &'static str {
         "d3d11"
     }
 
-    /// The enumerator's own name for the adapter, so a host can tell which GPU
-    /// the tier actually landed on.
+    /// The enumerator's own name for the adapter, also used as the public
+    /// device name so hosts can identify the GPU that was actually selected.
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
     }
@@ -1754,22 +1749,19 @@ fn lights_cb(lights: &LightSet) -> LightsCb {
 /// Capabilities of the hardware tiers.
 ///
 /// Compared with the reference's `caps_for`: a GPU keeps the texture, mip,
-/// shadow, filter, compute and present capabilities and does not claim the
-/// SIMD, disk-spill or out-of-core ones, which describe CPU tiers rather than
-/// this API.
+/// shadow, compute and present capabilities and does not claim the SIMD,
+/// disk-spill or out-of-core ones, which describe CPU tiers rather than this
+/// API. The filter bits are the tier's own clamp read back
+/// (`reconl_core::tier::filter_caps`), so T1 advertises `pcf5x5` and not
+/// `pcss-lite` - the tier the policy holds to `pcf5x5` is not a tier a host
+/// should read `pcss-lite` off.
 pub fn caps_for(tier: Tier) -> u32 {
-    let mut caps = caps::TEXTURES
+    caps::TEXTURES
         | caps::MIPMAPS
         | caps::SHADOWS
-        | caps::PCF_5X5
         | caps::COMPUTE
-        | caps::PRESENT_TO_MEMORY;
-    if tier <= Tier::GpuShared {
-        // pcss-lite is a T0/T1 feature in the tier table: a hardware tier has
-        // the tap budget for it.
-        caps |= caps::PCSS_LITE;
-    }
-    caps
+        | caps::PRESENT_TO_MEMORY
+        | filter_caps(tier)
 }
 
 fn enumerate_adapters() -> Result<Vec<IDXGIAdapter1>> {
@@ -1785,20 +1777,138 @@ fn enumerate_adapters() -> Result<Vec<IDXGIAdapter1>> {
     Ok(out)
 }
 
-/// One adapter as `reconlProbe` should report it.
-pub fn probe_adapters() -> Result<Vec<AdapterInfo>> {
+/// Enumerates DXGI devices and joins exact DXCore properties by adapter LUID.
+/// DXCore is loaded dynamically: older Windows builds can still enumerate and
+/// use D3D11, but report adapter types as unknown.
+fn enumerate_adapter_devices() -> Result<Vec<(IDXGIAdapter1, AdapterInfo)>> {
+    let dxcore_types = dxcore_adapter_types();
     let mut out = Vec::new();
     for adapter in enumerate_adapters()? {
         let desc = unsafe { adapter.GetDesc1() }.map_err(|e| err("adapter desc", e))?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-        out.push(AdapterInfo {
-            description: String::from_utf16_lossy(&desc.Description[..len]),
-            dedicated_video_memory: desc.DedicatedVideoMemory as u64,
-            vendor_id: desc.VendorId,
-            feature_level_11: probe_feature_level(&adapter),
-        });
+        let luid = pack_luid(desc.AdapterLuid);
+        out.push((
+            adapter.clone(),
+            AdapterInfo {
+                description: String::from_utf16_lossy(&desc.Description[..len]),
+                adapter_type: dxcore_types.get(&luid).copied().unwrap_or(AdapterType::Unknown),
+                adapter_luid: luid,
+                dedicated_video_memory: desc.DedicatedVideoMemory as u64,
+                shared_system_memory: desc.SharedSystemMemory as u64,
+                vendor_id: desc.VendorId,
+                device_id: desc.DeviceId,
+                feature_level_11: probe_feature_level(&adapter),
+            },
+        ));
     }
     Ok(out)
+}
+
+/// One adapter as `reconlProbe` and the public adapter enumeration API report it.
+pub fn probe_adapters() -> Result<Vec<AdapterInfo>> {
+    Ok(enumerate_adapter_devices()?.into_iter().map(|(_, info)| info).collect())
+}
+
+fn pack_luid(luid: LUID) -> u64 {
+    (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart)
+}
+
+struct DxCoreModule(HMODULE);
+
+impl Drop for DxCoreModule {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FreeLibrary(self.0);
+        }
+    }
+}
+
+/// Dynamically calls DXCoreCreateAdapterFactory so the D3D11 backend remains
+/// loadable on Windows versions predating dxcore.dll.
+fn dxcore_adapter_types() -> HashMap<u64, AdapterType> {
+    type CreateFactory = unsafe extern "system" fn(*const windows::core::GUID, *mut *mut c_void) -> windows::core::HRESULT;
+
+    let module = match unsafe { LoadLibraryA(PCSTR(b"dxcore.dll\0".as_ptr())) } {
+        Ok(module) => DxCoreModule(module),
+        Err(_) => return HashMap::new(),
+    };
+    let Some(create_factory) = (unsafe {
+        GetProcAddress(module.0, PCSTR(b"DXCoreCreateAdapterFactory\0".as_ptr()))
+    }) else {
+        return HashMap::new();
+    };
+    // Both function pointers are WINAPI/system-call pointers. GetProcAddress
+    // returns FARPROC, so transmute only changes the declared parameter types.
+    let create_factory: CreateFactory = unsafe { std::mem::transmute(create_factory) };
+    let mut raw_factory = core::ptr::null_mut();
+    let result = unsafe { create_factory(&IDXCoreAdapterFactory::IID, &mut raw_factory) };
+    if result.is_err() || raw_factory.is_null() {
+        return HashMap::new();
+    }
+    let factory = unsafe { IDXCoreAdapterFactory::from_raw(raw_factory) };
+    let list: IDXCoreAdapterList = match unsafe {
+        factory.CreateAdapterList(&[DXCORE_ADAPTER_ATTRIBUTE_D3D11_GRAPHICS])
+    } {
+        Ok(list) => list,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut out = HashMap::new();
+    for index in 0..unsafe { list.GetAdapterCount() } {
+        let Ok(adapter) = (unsafe { list.GetAdapter::<IDXCoreAdapter>(index) }) else {
+            continue;
+        };
+        if !unsafe { adapter.IsPropertySupported(InstanceLuid) } {
+            continue;
+        }
+        let mut luid = LUID::default();
+        if unsafe {
+            adapter.GetProperty(
+                InstanceLuid,
+                std::mem::size_of::<LUID>(),
+                &mut luid as *mut LUID as *mut c_void,
+            )
+        }
+        .is_err()
+        {
+            continue;
+        }
+
+        let mut is_hardware = false;
+        if !unsafe { adapter.IsPropertySupported(IsHardware) }
+            || unsafe {
+                adapter.GetProperty(
+                    IsHardware,
+                    std::mem::size_of::<bool>(),
+                    &mut is_hardware as *mut bool as *mut c_void,
+                )
+            }
+            .is_err()
+            || !is_hardware
+        {
+            continue;
+        }
+        let adapter_type = if unsafe { adapter.IsPropertySupported(IsIntegrated) } {
+            let mut integrated = false;
+            if unsafe {
+                adapter.GetProperty(
+                    IsIntegrated,
+                    std::mem::size_of::<bool>(),
+                    &mut integrated as *mut bool as *mut c_void,
+                )
+            }
+            .is_ok()
+            {
+                if integrated { AdapterType::Integrated } else { AdapterType::Discrete }
+            } else {
+                AdapterType::Unknown
+            }
+        } else {
+            AdapterType::Unknown
+        };
+        out.insert(pack_luid(luid), adapter_type);
+    }
+    out
 }
 
 /// Whether the adapter will actually grant a device at the 11.0 feature level.
@@ -1826,7 +1936,30 @@ fn probe_feature_level(adapter: &IDXGIAdapter1) -> bool {
 /// Whether a D3D11 hardware device can be created at all, without keeping one.
 /// This is what the startup probe asks before it offers a GPU tier.
 pub fn hardware_available() -> bool {
-    enumerate_adapters()
-        .map(|adapters| adapters.first().map(probe_feature_level).unwrap_or(false))
+    probe_adapters()
+        .map(|adapters| adapters.iter().any(|adapter| adapter.feature_level_11))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dxgi_luid_packing_preserves_both_words() {
+        assert_eq!(pack_luid(LUID { LowPart: 0x89ab_cdef, HighPart: -19088744 }), 0xfedc_ba98_89ab_cdef);
+    }
+
+    #[test]
+    fn hardware_caps_advertise_exactly_the_filters_the_tier_runs() {
+        // Pure function, no device needed: T0 runs pcss-lite, while T1 is
+        // clamped to pcf5x5 and must not advertise a filter a host could ask
+        // for and never get.
+        let t0 = caps_for(Tier::GpuDiscrete);
+        assert_ne!(t0 & caps::PCF_5X5, 0, "T0 runs pcf5x5: {t0:#010x}");
+        assert_ne!(t0 & caps::PCSS_LITE, 0, "T0 runs pcss-lite: {t0:#010x}");
+        let t1 = caps_for(Tier::GpuShared);
+        assert_ne!(t1 & caps::PCF_5X5, 0, "T1 runs pcf5x5: {t1:#010x}");
+        assert_eq!(t1 & caps::PCSS_LITE, 0, "T1 clamps pcss-lite to pcf5x5: {t1:#010x}");
+    }
 }

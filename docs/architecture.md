@@ -41,12 +41,29 @@ are the next boundaries to draw. They are recorded here rather than left to be
 discovered, because a reader who finds a 3,000-line file should be told which
 parts of it are already claimed by a module and which are waiting.
 
+## The reference backend's own layout
+
+`backends/soft-cpu/src/lib.rs` owns the device: its config and reported state,
+the frame pipeline (shadow pass, colour pass, present, checksum), the arena
+reservation, and the tier helpers at the bottom. The *out-of-core frame* is not
+in it - the bands, their keys and the decision to stream are
+`backends/soft-cpu/src/stream.rs`, a child module because a band is drawn by the
+same rasteriser from the same draw list as a resident frame.
+
+The arena itself stays in `lib.rs` with the device, because it is *shared*: the
+streamed frame's bands and the static cascade cache both live in it, so it
+belongs to neither consumer. Still in `lib.rs` and not yet its own module: the
+static cascade cache's storage and validity (`maps`, `maps_valid`,
+`map_light_hash`), which the frame loop, `ensure_maps` and `relabel` each write.
+
 ## Owners
 
 | Decision | Owner | Everybody else |
 |---|---|---|
 | What a descriptor costs (texture chain, command slots, swapchain images) | `ffi/src/sizing.rs` | entry points *ask* it; nothing re-derives the arithmetic |
 | What is affordable: the single-allocation ceiling, the RAM cap, the accounting | `core/src/budget.rs` | every allocation path goes through `admit_ram` / `reserve_ram` / `check_allocation` |
+| How much disk the tier may keep, and the cap the spill line is reported against | `core/src/budget.rs::BudgetCaps::disk`, handed to the backend as the budget's declared disk and to the arena as `SpillConfig::max_bytes` | one number in one place: `SoftCpuConfig` carries no disk field (a second copy of the cap is what made a 2 MiB cap write 26 MB), and a record the cap cannot hold is refused by the arena's own room check, naming what it needed - `ffi/tests/tiers.rs::a_frame_the_disk_cap_cannot_hold_is_refused_naming_what_it_needed` |
+| Whether an arena can live at a path - the question a probe answers before any device exists | `resource/src/spill.rs::dir_usable`, which runs `open_arena_file` and gives back what it made | `ffi`'s probe asks it and reports the answer; it does not judge the filesystem itself, so it cannot claim a directory `SpillArena::open` would refuse - pinned by `dir_usable_answers_the_question_the_device_will_ask` and `ffi/tests/tiers.rs::the_probe_reports_the_disk_tier_only_where_an_arena_can_live` |
 | Which tier runs, and what the shadow system may do | `core/src/tier.rs` (`resolve_tier`, `shadow_plan` → `ShadowPlan`) | backends allocate `plan.map_size` and reserve `plan.resident_bytes`; they never size a cascade set themselves |
 | Whether a device continues on the reference tier, and what a tier change costs the host | `ffi/src/offload.rs` (`Origin` stays with the device; `Offload`, `apply_tier_policy`, `apply_tier`, `adopt_backend`) plus `core/src/tier.rs::FrameLadder` (the run a step is decided from), documented in `include/reconl/reconl.h` and `docs/offload.md` | backends never move a device between tiers or record one: a backend is told its tier (`relabel`) and applies its own part of the change. `apply_tier_policy` is the only decider, `DeviceHandle::downgrades` is the only log, and `desc.downgrade_after_frames` has one reader - the device's `FrameLadder` |
 | Whether a driver failure means the device is gone | `backends/d3d11` (`device_removed`, the driver's own `GetDeviceRemovedReason`) | the ffi asks; it does not infer a removal from an error code |
@@ -59,6 +76,7 @@ parts of it are already claimed by a module and which are waiting.
 | Handle lifetime and refcounting | `ffi/src/handle.rs` (the header, `header_of`, `reconlRetain`/`reconlRelease` and the destructor dispatch) | no entry point frees or retains by hand. `core` used to carry a second, never-called handle table; two representations of one concern is how a reader learns the wrong one, so it was deleted rather than kept in step |
 | What a host pitch means, and what a host gets when one is too narrow | `ffi/src/layout.rs` `host_row_layout` (the check) and `lay_out_rows` (the write) | every readback and upload path calls the check first; a path that lays rows out does not judge them |
 | Render mechanism: targets, passes, present, GPU state | `backends/*` (the reference rasteriser is `raster`) | core and ffi know no platform or graphics type |
+| The out-of-core frame: how a frame's rows divide into bands, how a band is keyed and packed in the arena, and the decision that a frame streams instead of being refused | `backends/soft-cpu/src/stream.rs` (`FrameStream`, `band_projection`, `stream_bands`, `read_bands_into`, `read_bands_depth`) | `lib.rs` asks for the frame's targets and reads bands back; nothing else knows how a band is cut, keyed or sized, and the band pass draws through the same rasteriser and pipeline as a resident frame |
 | The reference scene: geometry, light, camera, shadow spec, and the three shadow modes | `tools/host/src/scene.rs` | `reconl-diff` and `reconl-bench` both read it; neither carries a copy |
 | The host side of a frame (create the resources, begin, encode, submit, present, time the boundaries) | `tools/host/src/frame.rs` | tools encode a frame; they do not re-implement the order |
 | What a host allocator has been asked for, and what is still outstanding | `tools/host/src/alloc.rs` | tools read the ledger; the library is the only caller of it |
@@ -96,7 +114,7 @@ parts of it are already claimed by a module and which are waiting.
 | Which frame a tier change is visible on: the relabel on the frame after the cost that armed it, the backend change on the frame that missed | `ffi/tests/tiers.rs::the_ladder_charges_a_relabel_to_the_frame_after_the_cost` (revert-checked: fails when the relabel answers from the frame's own observation), measured through the shipped DLL by `%TEMP%\rlprobe\onewriter.c` |
 | The reference scene renders byte-for-byte what is committed | `reconl-diff compare` against `tests/golden/soft-cpu-shadow.png`, and independently `reconl-bench --png` compared to the same file (`tools/reconl-bench/tests/cli.rs`) |
 | No allocation inside a frame: every draw list a frame writes into has an owner that outlives it, and a steady state shows zero in the host's own ledger | `tools/reconl-bench/tests/cli.rs::a_steady_state_frame_allocates_nothing` (both tiers), documented in `docs/determinism.md` §5; the rasteriser's own tables are pinned by `raster/tests/render.rs` |
-| A probe creates no device and allocates nothing | `reconl-info --probe-only`, whose allocation ledger is checked in `tools/reconl-info/tests/cli.rs` |
+| A probe creates no device, allocates nothing, and leaves the filesystem as it found it | `reconl-info --probe-only`, whose allocation ledger is checked in `tools/reconl-info/tests/cli.rs`; the path probe by `resource/src/spill.rs::dir_usable_answers_the_question_the_device_will_ask` and `ffi/tests/tiers.rs::the_probe_reports_the_disk_tier_only_where_an_arena_can_live` |
 | A device gives every byte it took back at release | `reconl-info`'s host ledger, checked in the same test |
 | A run reports the configuration that produced it, and the per-frame record | `tools/reconl-bench/tests/cli.rs` |
 | A failed ABI call leaves the device able to make the call the state machine names next | `ffi/tests/abi.rs` frame-state tests; the `framestate` C probe |
@@ -106,9 +124,9 @@ parts of it are already claimed by a module and which are waiting.
 | A driver failure's code is the HRESULT's own class, decided in one place | `backends/d3d11/src/imp.rs::classify_hresult` (the only HRESULT→code mapping); `ffi/tests/tiers.rs::a_driver_rejected_frame_reports_an_argument_error_not_a_loss` (fails under a blanket `DEVICE_LOST`); the `offload` C probe's arm 4 asserts `-1`, not `-6`, against the shipped DLL |
 | An offloaded frame is the reference tier's frame | the calibration-frame comparison in `ffi/tests/tiers.rs`; `ffi/src/offload.rs::fault_tests::the_frame_that_faults_is_rerendered_out_of_its_own_draws` (a frame submitted on hardware, then the fault's own two steps, compared byte for byte with a reference-tier device rendering it - the driver's removal verdict is the one step no test can inject); `--png` from the `--repeat=200` fault run `cmp`-compared with a `--backend=soft-cpu` run |
 | A calibration is decided by the measurement it took, and the host can read that measurement afterwards | `ffi/tests/tiers.rs::an_overloaded_hardware_tier_offloads_and_the_measurement_decides` (fails with the comparison inverted); `reconl-bench`'s `final` line; the `offload` C probe |
-| The shipped header and the Rust mirror agree on every struct the ABI reads | `ffi/tests/abi_layout.rs`: it generates `_Static_assert`s from the Rust `size_of`/`offset_of` values - each struct's size, every field's offset and width, and its integer/float/pointer category - and asks a C compiler to compile them against `include/reconl/reconl.h` (33 structs, 899 asserts). A field added, removed, reordered or retyped on one side fails it; it skips, with a printed reason, where no C compiler exists |
-| Every number the ABI exports equals the Rust value the implementation uses | the same `ffi/tests/abi_layout.rs`: one more `_Static_assert` per exported macro and enumerator - result codes (against both `Code` and `abi::result`), struct types, backends, tiers and tier reasons, caps (against both copies), downgrade/log/format/usage/index/pipeline/texture/light/shadow/frame-state enums (219 asserts). A renumbered code, flag or enumerator fails it naming the constant |
-| The backend descriptors are reserved: accepted and never read | `ffi/tests/abi.rs::a_reserved_backend_descriptor_is_accepted_and_never_read` (a descriptor at a wild address must not fault, and the device must match one made with none); the status is stated in `include/reconl/reconl_backends.h` |
+| The shipped header and the Rust mirror agree on every struct the ABI reads | `ffi/tests/abi_layout.rs`: it generates `_Static_assert`s from the Rust `size_of`/`offset_of` values - each struct's size, every field's offset and width, and its integer/float/pointer category - and asks a C compiler to compile them against the shipped headers. A field added, removed, reordered or retyped on one side fails it; it skips, with a printed reason, where no C compiler exists |
+| Every number the ABI exports equals the Rust value the implementation uses | the same `ffi/tests/abi_layout.rs`: one more `_Static_assert` per exported macro and enumerator - result codes (against both `Code` and `abi::result`), struct types, backends, adapter types/preferences, tiers and tier reasons, caps, downgrade/log/format/usage/index/pipeline/texture/light/shadow/frame-state enums. A renumbered code, flag or enumerator fails it naming the constant |
+| Adapter selection and enumeration are checked through the public ABI | `ffi/tests/abi.rs::d3d11_backend_descriptor_validates_and_reads_adapter_selection`, `::adapter_enumeration_checks_arguments_and_reports_non_windows_empty_lists`; D3D11 parses a size-gated descriptor and exact LUID, while non-D3D11 descriptors remain unreadable/reserved |
 
 ## Verification surfaces
 
@@ -119,7 +137,7 @@ parts of it are already claimed by a module and which are waiting.
   the binaries, unwind for the test targets) and intermittently fails to link a
   tool on the duplicate `deps/` output names. The abort/unwind split is why the
   profile exists; `Context.md` has the details.
-- `reconl-diff render <png>` / `compare <png> [--tolerance=N]` — the real tool,
+- `reconl-diff render <png> [--size=N]` / `compare <png> [candidate.png] [--tolerance=N]` — the real tool,
   through the same ABI a host uses.
 - `reconl-info` / `reconl-bench` — the probe, the limit and ledger report, and
   the timed run with its fingerprint and trace. These run in their own process,

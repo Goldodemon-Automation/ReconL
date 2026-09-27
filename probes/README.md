@@ -36,28 +36,36 @@ a probe does not build.
    Each row's full output is left in `probes/.build/<row>.out`, so a red row is
    diagnosable without re-running anything.
 
-A row is red when the probe exits non-zero, when its output contains a `FAIL` or
-`FIND` marker, when the check count it prints does not match the expected count,
-or when a required line is missing. The expected counts are pinned per row on
-purpose: a probe that silently stops running its checks cannot pass by printing
-nothing.
+A row is red when the probe exits non-zero, its output contains a `FAIL` or
+`FIND` marker, its count is below the row's minimum without matching a declared
+alternate path, or a required line is missing. Counts above a minimum are allowed:
+`offload` prints 33 when the reference tier stays and 35 when the return-trip branch
+adds two checks. Under a different legitimate path, the first hardware frame may
+be within target; exactly 18 checks plus the probe's `no miss here for the trigger
+to act on` explanation is accepted and printed as a short run. If the overload rig cannot be created, it is not treated as a pass: this gate
+marks the offload row as hardware-dependent and skips it only when `gpu_probe`
+reports D3D11 unavailable. Any other count below 33 remains red, even if it prints
+an unrelated setup explanation.
 
-Rows that name `--backend=d3d11` (and `overtarget`, which is a hardware measurement)
-are skipped when `gpu_probe` reports no usable D3D11 device on the host, the same
-way the in-repo tests skip their d3d11 legs. Everything else is expected to hold on
-any host.
+The plan explicitly marks rows that require D3D11. Those rows are skipped (but
+remain in the 24-row total) only when `gpu_probe` reports no usable device. If the
+GPU is reported usable but a required setup later fails, the row is red. This keeps
+a failure in one probe from being excused by a different probe's capability result.
 
 ## The probes
 
 Each is a read-only audit of a surface, in the order they appear in the plan.
-"Checks" is what the row prints today.
+"Checks" is the minimum that row must reach; a run may print more, and `offload`
+can take the explicitly documented 18-check no-miss path. The plan's final
+column marks rows that require D3D11; the runner skips those rows only when
+`gpu_probe` reports no usable device.
 
 | probe | what it is for |
 |---|---|
 | `fghostile` (32) | frame generation under hostile conditions on both tiers: a malformed descriptor, a wrong-kind handle, a foreign device's swapchain, the history's allocation balance over 20 create/keep/release cycles |
 | `framegen` (21) | the feature as a host uses it: a per-frame toggle, the same scene with it off byte-for-byte, a generated image warped along real camera motion, counters that count it only in `ReconLStats.framegen` |
 | `framestate` (43) | the frame state machine and its recovery contract, including that an over-ceiling frame is refused before the driver and the next frame still renders |
-| `gpu_probe` | the backend/tier probe: what each backend reports, a frame that is not just the clear colour, determinism across two renders, and the camera-extension `struct_size` paths |
+| `gpu_probe` | the backend/tier probe, public D3D11 adapter enumeration and exact-LUID selection, a frame that is not just the clear colour, determinism across two renders, and the camera-extension `struct_size` paths |
 | `hostile` (11) | absurd requests that must not take the process down: absurd sizes, orphaned swapchains, null buffers |
 | `hostile2` (13) | zero-sized and zero-byte descriptors: refused, never coerced into something that allocates |
 | `hostile3` (11) | the size ceiling and the refusal codes it produces, and that an uncapped device reports a concrete ceiling |
@@ -65,7 +73,7 @@ Each is a read-only audit of a surface, in the order they appear in the plan.
 | `hostile5` (16) | malformed push-constant and draw commands: the frame completes without taking the process down |
 | `ladder` (6) | the tier ladder as the host sees it: every entry carries a reason and the measurement behind it, and the documented step order in `docs/offload.md` |
 | `narrowpitch` (11) | the row-pitch contract on every readback route and all three tiers: a pitch narrower than a row is refused and nothing is written |
-| `offload` (33) | the offload: fault failover, the calibration, the return to hardware, and that a refused frame takes no safe path |
+| `offload` (33 minimum) | the offload: fault failover, the calibration, the return to hardware, and that a refused frame takes no safe path; the host can add two return-trip checks (35), or take an explained 18-check no-miss path |
 | `onewriter` (8) | one decider and one record for tier changes: every change the device made is in the ring the host reads, in order |
 | `overtarget` | the over-target path on real hardware: 12 frames at 1920x1080 with the smallest target, and the host-visible composed frame cost that drove each decision |
 | `shadowconfig` (40) | `reconlConfigureShadows` and the per-frame override: filters, cascade counts and map sizes as a host sets them |

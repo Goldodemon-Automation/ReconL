@@ -43,8 +43,8 @@ pub const RECONL_TIER_COUNT: usize = 5;
 
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 0;
-pub const ABI_VERSION: u32 = 100;
+pub const VERSION_PATCH: u32 = 1;
+pub const ABI_VERSION: u32 = 101;
 
 // --------------------------------------------------------------------- results
 
@@ -98,14 +98,26 @@ pub mod struct_type {
     pub const FRAME_GEN: u32 = 22;
     pub const SOFTCPU_DESC: u32 = 64;
     pub const NULL_DESC: u32 = 65;
-    /// The three `ReconL*Desc` structs in `reconl_backends.h`. Reserved: this
-    /// revision accepts `ReconLDeviceDesc::backend_desc` and never reads it, so
-    /// the type ids exist for the header's catalogue and nothing dispatches on
-    /// them yet.
+    /// D3D11 is read when creating a D3D11 device; SoftCPU and Null remain reserved.
     pub const D3D11_DESC: u32 = 66;
+    pub const ADAPTER_INFO: u32 = 67;
 }
 
 // ------------------------------------------------------------------ backend ids
+
+pub mod adapter_type {
+    pub const UNKNOWN: u32 = 0;
+    pub const INTEGRATED: u32 = 1;
+    pub const DISCRETE: u32 = 2;
+}
+
+pub mod adapter_preference {
+    pub const AUTO: u32 = 0;
+    pub const INTEGRATED: u32 = 1;
+    pub const DISCRETE: u32 = 2;
+    pub const INDEX: u32 = 3;
+    pub const LUID: u32 = 4;
+}
 
 pub mod backend {
     pub const NONE: u32 = 0;
@@ -256,6 +268,40 @@ pub struct ReconLProbeInfo {
     pub recommended_backend: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReconLAdapterInfo {
+    pub base: StructHeader,
+    pub backend: u32,
+    pub adapter_type: u32,
+    pub usable: u32,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub reserved: u32,
+    pub adapter_luid: u64,
+    pub dedicated_video_memory: u64,
+    pub shared_system_memory: u64,
+    pub name: [u8; RECONL_MAX_NAME],
+}
+
+impl Default for ReconLAdapterInfo {
+    fn default() -> Self {
+        Self {
+            base: StructHeader::default(),
+            backend: 0,
+            adapter_type: 0,
+            usable: 0,
+            vendor_id: 0,
+            device_id: 0,
+            reserved: 0,
+            adapter_luid: 0,
+            dedicated_video_memory: 0,
+            shared_system_memory: 0,
+            name: [0; RECONL_MAX_NAME],
+        }
+    }
+}
+
 // ------------------------------------------------------------ limits and budget
 
 #[repr(C)]
@@ -306,6 +352,35 @@ pub struct ReconLDeviceDesc {
     pub budget: *const ReconLMemoryBudget,
     pub allocator: ReconLAllocator,
     pub backend_desc: *const c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReconLD3D11Desc {
+    pub base: StructHeader,
+    pub adapter_index: i32,
+    pub feature_level_min: u32,
+    pub debug_layer: u32,
+    pub allow_warp: u32,
+    pub prefer_flip_model: u32,
+    pub reserved: u32,
+    pub requested_vram_cap: u64,
+    pub adapter_preference: u32,
+    pub reserved2: u32,
+    pub adapter_luid: u64,
+}
+
+impl ABIStruct for ReconLD3D11Desc {
+    const STRUCT_TYPE: u32 = struct_type::D3D11_DESC;
+    const MIN_SIZE: u32 = Self::PREFIX_SIZE;
+}
+
+impl ReconLD3D11Desc {
+    pub const PREFIX_SIZE: u32 = core::mem::offset_of!(Self, adapter_preference) as u32;
+    pub const PREFERENCE_SIZE: u32 =
+        (core::mem::offset_of!(Self, adapter_preference) + core::mem::size_of::<u32>()) as u32;
+    pub const LUID_SIZE: u32 =
+        (core::mem::offset_of!(Self, adapter_luid) + core::mem::size_of::<u64>()) as u32;
 }
 
 #[repr(C)]
@@ -713,6 +788,7 @@ macro_rules! abi_struct {
 
 abi_struct!(ReconLProbeDesc, struct_type::PROBE_DESC);
 abi_struct!(ReconLProbeInfo, struct_type::PROBE_INFO);
+abi_struct!(ReconLAdapterInfo, struct_type::ADAPTER_INFO);
 abi_struct!(ReconLMemoryBudget, struct_type::MEMORY_BUDGET);
 abi_struct!(ReconLDeviceLimits, struct_type::DEVICE_LIMITS);
 abi_struct!(ReconLDeviceDesc, struct_type::DEVICE_DESC);
@@ -816,10 +892,27 @@ impl<const N: usize> Default for FixedString<N> {
 }
 
 pub fn set_str<const N: usize>(field: &mut [u8; N], text: &str) {
-    let bytes = text.as_bytes();
-    let n = bytes.len().min(N.saturating_sub(1));
-    field[..n].copy_from_slice(&bytes[..n]);
-    for slot in field.iter_mut().skip(n) {
+    // Keep the truncated prefix valid UTF-8. This matters for fixed-capacity
+    // adapter/device names because their source may contain multi-byte names.
+    let mut end = text.len().min(N.saturating_sub(1));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    field[..end].copy_from_slice(&text.as_bytes()[..end]);
+    for slot in field.iter_mut().skip(end) {
         *slot = 0;
+    }
+}
+
+#[cfg(test)]
+mod string_tests {
+    use super::set_str;
+
+    #[test]
+    fn fixed_string_truncation_preserves_valid_utf8() {
+        let mut field = [0u8; 5];
+        set_str(&mut field, "GPU 💻");
+        let end = field.iter().position(|byte| *byte == 0).unwrap();
+        assert_eq!(std::str::from_utf8(&field[..end]).unwrap(), "GPU ");
     }
 }

@@ -165,6 +165,13 @@ struct Options {
     refresh: u32,
     spill_dir: Option<PathBuf>,
     require_geometry: bool,
+    /// The RAM cap the device is given. A cap below what the frame's own targets
+    /// cost is the T4 case that streams, and it is a budget rather than an
+    /// on/off switch on purpose: the band height is what changes.
+    ram_budget: u64,
+    /// The pass's viewport, in frame pixels. `(0, 0)` is the documented default -
+    /// the whole target - which is what every other test uses.
+    viewport: (u32, u32),
 }
 
 impl Default for Options {
@@ -179,6 +186,8 @@ impl Default for Options {
             refresh: 1,
             spill_dir: None,
             require_geometry: false,
+            ram_budget: 512 << 20,
+            viewport: (0, 0),
         }
     }
 }
@@ -203,7 +212,7 @@ fn new_device(options: &Options) -> Result<SoftCpuDevice, Error> {
     let alloc = HostAlloc::system();
     let budget = Arc::new(Budget::new(BudgetCaps {
         vram: 0,
-        ram: 512 << 20,
+        ram: options.ram_budget,
         disk: 128 << 20,
         allow_disk_spill: options.spill_dir.is_some(),
     }));
@@ -212,7 +221,6 @@ fn new_device(options: &Options) -> Result<SoftCpuDevice, Error> {
         worker_threads: options.threads,
         scalar: options.scalar,
         spill_dir: options.spill_dir.clone(),
-        arena_bytes: if options.spill_dir.is_some() { 16 << 20 } else { 0 },
         shadow: options.shadow_request(),
         frame_policy: FramePolicy {
             require_geometry: options.require_geometry,
@@ -230,25 +238,29 @@ fn render_one<'a>(
     frame_index: u64,
     draws: &'a [DrawItem<'a>],
 ) -> Result<FrameNumbers, Error> {
-    render_with(device, frame_index, draws, true)
+    render_with(device, frame_index, draws, true, (0, 0), (WIDTH, HEIGHT))
 }
 
-/// One frame, with the frame's colour checksum asked for or not.
+/// One frame, with the frame's colour checksum asked for or not, the pass's
+/// viewport as the host sets it, and the frame's size - which is the host's to
+/// change between frames, and what the streamed path has to survive.
 fn render_with<'a>(
     device: &mut SoftCpuDevice,
     frame_index: u64,
     draws: &'a [DrawItem<'a>],
     checksum: bool,
+    viewport: (u32, u32),
+    (width, height): (u32, u32),
 ) -> Result<FrameNumbers, Error> {
     let (view, _proj) = camera();
     let input = FrameInput {
         frame_index,
-        width: WIDTH,
-        height: HEIGHT,
-        viewport: (0, 0),
+        width,
+        height,
+        viewport,
         camera_view: view,
         fov_y_deg: 60.0,
-        aspect: WIDTH as f32 / HEIGHT as f32,
+        aspect: width as f32 / height as f32,
         near: 0.1,
         far: 100.0,
         light_dir: LIGHT_DIR,
@@ -270,9 +282,16 @@ fn render_with<'a>(
 struct Outcome {
     checksums: Vec<u64>,
     color: Vec<f32>,
+    /// The frame as the host receives it: what `present` produced, which for a
+    /// streamed frame is read back out of the arena rather than out of RAM.
+    pixels: Vec<u8>,
+    depth: Vec<f32>,
     shadows: ShadowCounters,
     tier: Tier,
     map_max_depth: f32,
+    /// Bytes the frame moved through the disk arena, and what it held resident.
+    spill_bytes: u64,
+    resident_bytes: u64,
 }
 
 fn run(options: &Options, frames: u64) -> Result<Outcome, Error> {
@@ -289,7 +308,7 @@ fn run(options: &Options, frames: u64) -> Result<Outcome, Error> {
         if options.with_caster {
             draws.push(caster_draw(&cube_verts, &cube_indices, pv, options.caster_dynamic));
         }
-        let numbers = render_one(&mut device, frame_index, &draws)?;
+        let numbers = render_with(&mut device, frame_index, &draws, true, options.viewport, (WIDTH, HEIGHT))?;
         device.on_frame_end()?;
         checksums.push(device.color_checksum());
         if options.with_caster {
@@ -303,12 +322,21 @@ fn run(options: &Options, frames: u64) -> Result<Outcome, Error> {
             }
         }
     }
+    let mut pixels = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+    device.read_frame_into(&mut pixels, 0, 0)?;
+    let mut depth = vec![0.0f32; (WIDTH * HEIGHT) as usize];
+    device.depth_into(&mut depth)?;
+    let snapshot = device.snapshot();
     Ok(Outcome {
         checksums,
         color: device.color_slice().to_vec(),
+        pixels,
+        depth,
         shadows: device.shadows(),
         tier: device.tier(),
         map_max_depth: max_depth,
+        spill_bytes: snapshot.spill_io_bytes,
+        resident_bytes: snapshot.resident_bytes,
     })
 }
 
@@ -432,6 +460,182 @@ fn t4_serves_the_static_cascade_from_the_disk_arena_unchanged() {
 
     let again = run(&options, 2).unwrap();
     assert!(again.shadows.cache_hits > again.shadows.cache_misses);
+}
+
+/// The largest difference between two frames' depth values.
+fn depth_delta(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).fold(0.0f32, |worst, (x, y)| worst.max((x - y).abs()))
+}
+
+/// The largest per-channel difference between two presented frames, and how many
+/// of their pixels differ at all.
+fn pixel_delta(a: &[u8], b: &[u8]) -> (i32, usize) {
+    let mut worst = 0i32;
+    let mut differing = 0usize;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        if x != y {
+            differing += 1;
+        }
+        for k in 0..4 {
+            worst = worst.max((x[k] as i32 - y[k] as i32).abs());
+        }
+    }
+    (worst, differing)
+}
+
+#[test]
+fn a_frame_the_ram_cap_cannot_hold_streams_through_the_arena() {
+    // T4's promise: a frame larger than the RAM cap renders rather than being
+    // refused. Every band it writes is counted - that is the measurement - and the
+    // cut must not be visible: the same scene at a cap that holds it has to
+    // present the same pixels, the same depth and the same checksum.
+    let dir = TempDir::new("stream");
+    let options = |ram_budget: u64| Options {
+        tier: Tier::OutOfCore,
+        spill_dir: Some(dir.path()),
+        ram_budget,
+        shadows: false,
+        ..Options::default()
+    };
+    // The frame's own targets cost WIDTH * HEIGHT * 20 bytes; a quarter of that is
+    // a cap the frame cannot be held in, and one a band easily can.
+    let frame_bytes = (WIDTH as u64) * (HEIGHT as u64) * 20;
+    let cap = frame_bytes / 4;
+    let streamed = run(&options(cap), 1).unwrap();
+    let resident = run(&options(512 << 20), 1).unwrap();
+
+    assert_eq!(
+        resident.spill_bytes, 0,
+        "the resident run has no reason to move anything through the arena"
+    );
+    assert!(
+        streamed.spill_bytes >= frame_bytes,
+        "a streamed frame writes its whole self through the arena: {} of {} bytes",
+        streamed.spill_bytes,
+        frame_bytes
+    );
+    assert!(
+        streamed.resident_bytes <= cap,
+        "the device held {} bytes of a {} byte cap",
+        streamed.resident_bytes,
+        cap
+    );
+
+    // The bands are the frame's rows: a band boundary that put the wrong rows in a
+    // band, or a remap that missed by a row, would move whole rows of the image,
+    // and that is what this rules out. What it cannot demand is bit-for-bit
+    // equality of a *shaded* value, because a band's clip space is remapped and an
+    // f32 remap rounds: an interpolated value can land one ulp away from the
+    // frame's - one step of a colour quantised to 8 bits, and nothing at all in
+    // depth. Measured through the ABI on the reference scene `reconl-bench`
+    // renders, at 512x512 with `--png` and compared with `reconl-diff`: a streamed
+    // frame and a resident one differ on 2 of 262144 pixels, worst channel delta
+    // 46, at (372,304) and (197,387). What that measurement says is that it is the
+    // band cut's rounding and not a shadow-cache effect or a general nondeterminism:
+    // both settings are byte-identical run to run (three runs each), the two
+    // pinned pixels are the same ones with `--shadows=on` (dynamic, no cache
+    // involved) as with `--shadows=cached`, and the set moves with the band height -
+    // 256-row bands differ at (372,304) alone, 128-row bands at both. It needs a
+    // shadow term to be visible at all: with `--shadows=off` a streamed 512x512
+    // frame is byte-identical to a resident one, 0 of 262144, because the surfaces
+    // meeting at those edges are the same colour without one.
+    //
+    // The magnitude is the cross-tier class rather than a new one. Measured the same
+    // way at 512x512, `soft-cpu` against `d3d11` differs on 761 of 262144 pixels with
+    // the same worst channel delta of 46 and the same per-channel signature
+    // (R 12, G 16, B 46), which is the difference `reconl-diff --tolerance=48` is set
+    // for; a streamed frame sits well inside it.
+    let (worst, differing) = pixel_delta(&streamed.pixels, &resident.pixels);
+    assert!(worst <= 1, "a band moved a colour by {worst}: that is a seam, not rounding");
+    assert!(
+        differing * 100 < streamed.pixels.len() / 4,
+        "{differing} of {} pixels differ between the cut frame and the whole one",
+        streamed.pixels.len() / 4
+    );
+    let depth_delta = depth_delta(&streamed.depth, &resident.depth);
+    assert!(depth_delta < 1.0e-4, "a band moved a depth by {depth_delta}: that is a seam");
+
+    // And the cut frame is reproducible: a cold arena and a warm one - the second
+    // run below finds the bands the first one left - present the same pixels and
+    // the same checksum. That is what `PROMPT.md` section 8 rests on.
+    let warm = run(&options(cap), 1).unwrap();
+    assert_eq!(warm.pixels, streamed.pixels, "a warm arena changed the streamed frame");
+    assert_eq!(warm.checksums, streamed.checksums);
+}
+
+#[test]
+fn a_streamed_band_is_confined_to_the_viewport_like_the_frame_is() {
+    // The two things that decide where a pixel lands are the band cut and the
+    // pass's viewport, and they have to agree: the frame is cut at the viewport's
+    // edge so no band straddles it, a band outside it is written cleared, and the
+    // band's rows are where the frame's rows are - not squeezed into the patch.
+    let dir = TempDir::new("stream-viewport");
+    let options = |ram_budget: u64| Options {
+        tier: Tier::OutOfCore,
+        spill_dir: Some(dir.path()),
+        ram_budget,
+        shadows: false,
+        viewport: (48, 40),
+        ..Options::default()
+    };
+    let cap = (WIDTH as u64) * (HEIGHT as u64) * 20 / 4;
+    let streamed = run(&options(cap), 1).unwrap();
+    let resident = run(&options(512 << 20), 1).unwrap();
+
+    assert!(streamed.spill_bytes > 0, "this frame has to stream: it does not fit the cap");
+    let (worst, _) = pixel_delta(&streamed.pixels, &resident.pixels);
+    assert!(
+        worst <= 1,
+        "a sub-rect viewport came out of the band cut moved by {worst}"
+    );
+    let warm = run(&options(cap), 1).unwrap();
+    assert_eq!(warm.pixels, streamed.pixels);
+    assert_eq!(warm.checksums, streamed.checksums);
+    // What a viewport means: outside the patch is the clear colour, and inside it
+    // is the frame, scaled into the patch rather than cut out of it.
+    let clear = [0.02, 0.02, 0.03, 1.0];
+    assert_eq!(pixel(&resident.color, WIDTH as usize - 1, HEIGHT as usize - 1), clear);
+    assert_ne!(pixel(&resident.color, 24, 20), clear, "the patch is where the pass drew");
+}
+
+#[test]
+fn a_frame_that_fits_again_goes_back_to_the_target_it_started_in() {
+    // A device is not stuck in the streamed path: the frame after a streamed one
+    // is drawn into an ordinary target, and it must be the frame a device that
+    // never streamed would have produced.
+    let dir = TempDir::new("stream-then-fit");
+    let options = Options {
+        tier: Tier::OutOfCore,
+        spill_dir: Some(dir.path()),
+        ram_budget: 128 << 10,
+        shadows: false,
+        ..Options::default()
+    };
+    let floor = floor_quad();
+    let (view, proj) = camera();
+    let pv = math::mul(&proj, &view);
+    let draws = vec![floor_draw(&floor, pv)];
+
+    let mut streamed = new_device(&options).unwrap();
+    render_with(&mut streamed, 0, &draws, true, (0, 0), (256, 256)).unwrap();
+    assert!(
+        streamed.snapshot().spill_io_bytes > 0,
+        "a 256x256 frame does not fit a 128 KiB cap, so it has to stream"
+    );
+
+    let mut plain = new_device(&options).unwrap();
+    let mut after_stream = vec![0u8; 64 * 64 * 4];
+    let mut never_streamed = vec![0u8; 64 * 64 * 4];
+    render_with(&mut streamed, 1, &draws, true, (0, 0), (64, 64)).unwrap();
+    streamed.read_frame_into(&mut after_stream, 0, 0).unwrap();
+    render_with(&mut plain, 1, &draws, true, (0, 0), (64, 64)).unwrap();
+    plain.read_frame_into(&mut never_streamed, 0, 0).unwrap();
+
+    assert_eq!(streamed.frame_size(), (64, 64), "the frame after the streamed one is not a band");
+    assert_eq!(
+        after_stream, never_streamed,
+        "a device that streamed a frame went on to render the next one differently"
+    );
 }
 
 #[test]
@@ -695,6 +899,18 @@ fn probing_a_tier_reports_capabilities_consistent_with_the_ladder() {
     assert!(plan_t4.disk_backed);
     assert_eq!(caps_for(Tier::CpuThrifty), caps_for(Tier::CpuRam) | reconl_core::tier::caps::DISK_SPILL);
     assert!(plan_t2.cascades <= 4 && plan_t4.cascades <= 4);
+    // The filter bits follow the tier's own clamp: T2 and below run at most
+    // pcf3x3, so they advertise neither pcf5x5 nor pcss-lite - a host reading
+    // these caps cannot ask for a filter the tier will never run.
+    let fine = reconl_core::tier::caps::PCF_5X5 | reconl_core::tier::caps::PCSS_LITE;
+    assert_eq!(caps_t2 & fine, 0, "T2 is clamped to pcf3x3: {caps_t2:#010x}");
+    assert_eq!(caps_for(Tier::CpuThrifty) & fine, 0, "T3 is clamped to pcf3x3");
+    assert_eq!(caps_for(Tier::OutOfCore) & fine, 0, "T4 is clamped to pcf3x3");
+    // ... and a plan built with those caps still reports the downgrade it
+    // performs: pcss-lite requested, pcf3x3 active, downgrade counted.
+    let over = reconl_core::tier::shadow_plan(Tier::CpuRam, 1, 32 << 20, ShadowFilter::PcssLite, caps_t2);
+    assert_eq!(over.filter, ShadowFilter::Pcf3x3);
+    assert_eq!(over.clamp_event, Some(reconl_core::tier::ShadowEvent::FilterDowngraded));
 }
 
 /// The bin a frame rasterises is that frame's, not every frame's so far.
@@ -737,7 +953,7 @@ fn the_frame_checksum_is_computed_only_when_it_is_asked_for() {
     let pv = math::mul(&proj, &view);
     let draws = vec![floor_draw(&floor, pv)];
 
-    render_with(&mut device, 0, &draws, true).unwrap();
+    render_with(&mut device, 0, &draws, true, (0, 0), (WIDTH, HEIGHT)).unwrap();
     assert_ne!(
         device.color_checksum(),
         0,
@@ -747,7 +963,7 @@ fn the_frame_checksum_is_computed_only_when_it_is_asked_for() {
     let mut frame = vec![0u8; device.frame_size().0 as usize * device.frame_size().1 as usize * 4];
     device.read_frame_into(&mut frame, 0, 0).unwrap();
 
-    render_with(&mut device, 1, &draws, false).unwrap();
+    render_with(&mut device, 1, &draws, false, (0, 0), (WIDTH, HEIGHT)).unwrap();
     assert_eq!(
         device.color_checksum(),
         0,

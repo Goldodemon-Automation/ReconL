@@ -675,6 +675,9 @@ impl<'a> TriJob<'a> {
         };
         let write_color = surface.is_some() && !shared.color.is_null();
         let textured = surface.as_ref().map(|s| s.textured).unwrap_or(false);
+        // Unlit, untextured surfaces only consume vertex colour. Avoid
+        // perspective-interpolating position, normal and UV for every fragment.
+        let simple_unlit = surface.as_ref().map(|s| !s.lit && !s.textured).unwrap_or(false);
         let mut row = self.setup.eval_at_pixel(x0, y0);
 
         for py in y0..y1 {
@@ -714,14 +717,28 @@ impl<'a> TriJob<'a> {
                         }
                         if keep {
                             if let (true, Some(surface)) = (write_color, surface.as_ref()) {
-                                let rcp = 1.0 / iw;
-                                let mut attr = [0.0f32; ATTR_COUNT];
-                                for k in 0..ATTR_COUNT {
-                                    attr[k] = (l[0] * self.aw[0][k] + l[1] * self.aw[1][k] + l[2] * self.aw[2][k]) * rcp;
-                                }
-                                let lod = if textured { self.lod(&attr, l, iw) } else { 0.0 };
                                 let mut out = [0.0f32; 4];
-                                surface.shade(&attr, lod, &mut out);
+                                if simple_unlit {
+                                    let rcp = 1.0 / iw;
+                                    for (channel, value) in out.iter_mut().enumerate() {
+                                        let k = crate::ATTR_COLOR + channel;
+                                        let base = l[0] * self.aw[0][k]
+                                            + l[1] * self.aw[1][k]
+                                            + l[2] * self.aw[2][k];
+                                        *value = shade::clamp01(base * rcp);
+                                    }
+                                } else {
+                                    let rcp = 1.0 / iw;
+                                    let mut attr = [0.0f32; ATTR_COUNT];
+                                    for k in 0..ATTR_COUNT {
+                                        attr[k] = (l[0] * self.aw[0][k]
+                                            + l[1] * self.aw[1][k]
+                                            + l[2] * self.aw[2][k])
+                                            * rcp;
+                                    }
+                                    let lod = if textured { self.lod(&attr, l, iw) } else { 0.0 };
+                                    surface.shade(&attr, lod, &mut out);
+                                }
                                 // SAFETY: as above, this pixel belongs to this tile.
                                 let dst = unsafe { std::slice::from_raw_parts_mut(shared.color.add(pixel * 4), 4) };
                                 shade::blend(self.pipeline.blend, out, dst);

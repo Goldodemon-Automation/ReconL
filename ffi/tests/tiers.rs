@@ -18,6 +18,7 @@ use reconl::abi::{ReconLLight, ReconLLightList, ReconLShadowConfig, ReconLVertex
 use reconl_core::{ABIStruct, StructHeader};
 use reconl_raster::math::{look_at, mul, perspective_rh_reversed_z, IDENTITY};
 use reconl_raster::{CULL_BACK, CULL_FRONT};
+use std::ffi::CString;
 
 const W: u32 = 64;
 const H: u32 = 64;
@@ -152,6 +153,28 @@ struct Run {
     width: u32,
     height: u32,
     expect: Expect,
+    /// Whether the scene's geometry is declared static: `RECONL_BUFFER_STATIC`
+    /// on every vertex and index buffer this run creates. The reference tier's
+    /// cascade cache is keyed on that declaration and nothing else, so a leg
+    /// that leaves it off is the control - the same scene, the same frames, the
+    /// same budget, and no cache.
+    static_geometry: bool,
+    /// Whether the host asks for the cached cascade, which at T4 is the disk
+    /// tier's own reason to exist: freeze the cascade between refreshes, and let
+    /// the arena hold it instead of RAM.
+    cached: bool,
+    /// The name of a directory under the temp directory the device may put its
+    /// spill arena in. `Some` is also the host's opt-in to disk at all
+    /// (`allow_disk_spill`): without it there is no arena to cache in, however
+    /// static the geometry and however cached the plan.
+    spill: Option<&'static str>,
+    /// The RAM cap the device is given. `0` is the header's "unlimited" and the
+    /// default, because most runs are not about the frame's own memory. A run
+    /// that wants the frame to *stream* names a cap the frame cannot be held in.
+    ram_cap: u64,
+    /// The disk budget the device is given: the arena's hard cap, and the number
+    /// every claim about bytes on disk is measured against.
+    disk_cap: u64,
 }
 
 /// What a run expects of its frames. The two refusals are here because they are
@@ -166,6 +189,11 @@ enum Expect {
     /// A valid frame presented into a buffer too small for it, so the frame is
     /// dropped at present.
     PresentTooSmall,
+    /// A frame whose own targets cannot be held inside the budgets this run
+    /// declares, so `reconlBeginFrame` refuses it before anything is written. The
+    /// outcome then carries the ABI's error text in place of pixels: the refusal
+    /// *is* the finding, and its text is what a host has to act on.
+    RefusesAtBegin,
 }
 
 impl Run {
@@ -181,6 +209,11 @@ impl Run {
             width: W,
             height: H,
             expect: Expect::Frame,
+            static_geometry: false,
+            cached: false,
+            spill: None,
+            ram_cap: 0,
+            disk_cap: 64 << 20,
         }
     }
 }
@@ -194,12 +227,38 @@ fn render(backend: u32, tier: u32, scene: &Scene) -> (Vec<u8>, abi::ReconLStats)
 /// frame's presented RGBA8 pixels and stats, in order. Per-frame state is the
 /// only way to see the offload policy, which `reconlPresent` steps and nothing
 /// else does. Panics with the ABI's own error text on failure.
+///
+/// A run that names a spill directory gets a memory budget that allows the disk
+/// spill and points at it, which is the host's opt-in to the arena the T4 static
+/// cascade lives in.
 fn run(run: Run, scene: &Scene) -> Vec<(Vec<u8>, abi::ReconLStats)> {
     let mut frames: Vec<(Vec<u8>, abi::ReconLStats)> = Vec::new();
+    // The arena's directory, held for the run's life: a device drops its arena
+    // when the last handle to it goes, and a host that removed the directory
+    // under it would be testing the error path rather than the cache.
+    let spill_dir = run.spill.map(|name| {
+        let path = spill_path(name);
+        std::fs::create_dir_all(&path).expect("the spill directory");
+        path
+    });
+    let spill_c = spill_dir
+        .as_ref()
+        .map(|path| CString::new(path.to_string_lossy().as_bytes()).expect("the spill path"));
+    // SAFETY: an all-zero budget is the documented "no budget", and every field
+    // this run sets is set before the descriptor points at it.
+    let mut budget: abi::ReconLMemoryBudget = unsafe { core::mem::zeroed() };
+    if let Some(dir) = &spill_c {
+        budget.base = hdr::<abi::ReconLMemoryBudget>();
+        budget.ram_cap_bytes = run.ram_cap;
+        budget.disk_cap_bytes = run.disk_cap;
+        budget.allow_disk_spill = 1;
+        budget.spill_dir = dir.as_ptr();
+    }
     unsafe {
         let mut dd: abi::ReconLDeviceDesc = core::mem::zeroed();
         dd.base = hdr::<abi::ReconLDeviceDesc>();
         dd.backend_hint = run.backend;
+        dd.budget = if spill_c.is_some() { &budget as *const _ } else { core::ptr::null() };
         dd.tier_hint = run.tier;
         dd.allow_downgrade = run.allow_downgrade;
         dd.worker_threads = 1;
@@ -266,7 +325,7 @@ fn run(run: Run, scene: &Scene) -> Vec<(Vec<u8>, abi::ReconLStats)> {
             let mut vbd: abi::ReconLBufferDesc = core::mem::zeroed();
             vbd.base = hdr::<abi::ReconLBufferDesc>();
             vbd.size_bytes = (draw.verts.len() * core::mem::size_of::<ReconLVertex>()) as u64;
-            vbd.usage = 1; // VERTEX
+            vbd.usage = buffer_usage(1, run.static_geometry); // VERTEX
             vbd.data = draw.verts.as_ptr() as *const core::ffi::c_void;
             vbd.data_size = vbd.size_bytes;
             let mut vb: *mut reconl::BufferHandle = core::ptr::null_mut();
@@ -279,7 +338,7 @@ fn run(run: Run, scene: &Scene) -> Vec<(Vec<u8>, abi::ReconLStats)> {
             let mut ibd: abi::ReconLBufferDesc = core::mem::zeroed();
             ibd.base = hdr::<abi::ReconLBufferDesc>();
             ibd.size_bytes = (draw.indices.len() * 4) as u64;
-            ibd.usage = 2; // INDEX
+            ibd.usage = buffer_usage(2, run.static_geometry); // INDEX
             ibd.data = draw.indices.as_ptr() as *const core::ffi::c_void;
             ibd.data_size = ibd.size_bytes;
             let mut ib: *mut reconl::BufferHandle = core::ptr::null_mut();
@@ -320,8 +379,11 @@ fn run(run: Run, scene: &Scene) -> Vec<(Vec<u8>, abi::ReconLStats)> {
         scfg.normal_bias = scene.shadow.normal_bias;
         scfg.depth_bias = scene.shadow.depth_bias;
         scfg.slope_bias = scene.shadow.slope_bias;
-        scfg.refresh_interval_frames = 1;
-        scfg.allow_disk_cache = 0;
+        // The cached cascade, as the ABI asks for it: the cascade is frozen
+        // between refreshes, and the arena is allowed to hold it.
+        scfg.refresh_interval_frames = if run.cached { 60 } else { 1 };
+        scfg.freeze_static_cascade = u32::from(run.cached);
+        scfg.allow_disk_cache = u32::from(run.cached);
 
         let fd: abi::ReconLFrameDesc = abi::ReconLFrameDesc {
             base: hdr::<abi::ReconLFrameDesc>(),
@@ -341,12 +403,27 @@ fn run(run: Run, scene: &Scene) -> Vec<(Vec<u8>, abi::ReconLStats)> {
             let mut pixels = vec![0u8; (run.width * run.height * 4) as usize];
             let mut stats: abi::ReconLStats = core::mem::zeroed();
             stats.base = hdr::<abi::ReconLStats>();
-            assert_eq!(
-                reconl::reconlBeginFrame(device, &fd as *const _ as *mut _),
-                abi::result::OK,
-                "begin frame: {}",
-                global_error()
-            );
+            let began = reconl::reconlBeginFrame(device, &fd as *const _ as *mut _);
+            if run.expect == Expect::RefusesAtBegin {
+                // The refusal is recorded against the device, which is the handle the
+                // caller still holds: read it before anything can clear it.
+                let refusal = device_error(device);
+                assert_eq!(
+                    began,
+                    abi::result::BUDGET_EXCEEDED,
+                    "a frame the declared budgets cannot hold has to be refused with the budget \
+                     code: {refusal}"
+                );
+                assert_eq!(
+                    reconl::reconlGetStats(device, &mut stats),
+                    abi::result::OK,
+                    "stats: {}",
+                    device_error(device)
+                );
+                frames.push((refusal.into_bytes(), stats));
+                break;
+            }
+            assert_eq!(began, abi::result::OK, "begin frame: {}", global_error());
 
             reconl::reconlCmdReset(commands);
             let mut rp: abi::ReconLRenderPassDesc = core::mem::zeroed();
@@ -2289,6 +2366,398 @@ fn a_refused_call_does_not_offload_the_device() {
         assert_eq!(
             stats.frames_dropped, 1,
             "a refused call ({expect:?}) must still drop the frame, as before the offload existed"
+        );
+    }
+}
+
+/// A buffer usage word for a run's geometry: the usage bit the draw needs, plus
+/// `RECONL_BUFFER_STATIC` when the run declares its geometry stationary.
+fn buffer_usage(base: u32, static_geometry: bool) -> u32 {
+    base | if static_geometry { abi::buffer_usage::STATIC } else { 0 }
+}
+
+/// Where a run's spill arena lives: the temp directory, named for the test that
+/// asked for it and the process running it, so two test binaries cannot share
+/// one arena by accident.
+fn spill_path(name: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!("reconl-tiers-{}-{name}", std::process::id()));
+    path
+}
+
+/// A spill directory a test owns for as long as it runs. The arena file *is* the
+/// cache, so the directory is emptied before the test and removed after it: a
+/// run that inherited an arena another one left would be measuring that arena
+/// rather than its own, and a cache hit in a test that never filled it is
+/// exactly the false pass this exists to rule out.
+struct SpillDir(&'static str);
+
+impl SpillDir {
+    fn new(name: &'static str) -> Self {
+        let _ = std::fs::remove_dir_all(spill_path(name));
+        Self(name)
+    }
+
+    fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(spill_path(self.0));
+    }
+}
+
+/// The ABI's one statement about whether geometry moves is `RECONL_BUFFER_STATIC`
+/// - "eligible for the disk cache arena" - and the reference tier's cascade
+/// cache is keyed on nothing else. Before that bit was read, every draw reached
+/// the backend as dynamic, so the cache this header advertises
+/// (`RECONL_CAP_CACHED_CASCADE` alongside `RECONL_CAP_OUT_OF_CORE`) was
+/// unreachable from any host, the project's own bench included: `--shadows=cached`
+/// there measured `hits 0 misses 0` and `spill 0 B`.
+///
+/// Three legs, one scene, one budget: a device that declares its geometry static
+/// and finds nothing yet, the same device again against the arena the first one
+/// filled, and a control whose buffers say the geometry moves. The first leg is
+/// what fills the disk cache, the second is a hit off it, and the control has no
+/// cache at all - which is the declaration, not the scene, being measured. What
+/// the cache serves has to be the same image the fill chose: all three legs
+/// present the same pixels, in the same order.
+/// What a frame's own targets cost per pixel: RGBA32F colour (16 bytes) plus f32
+/// depth (4). The same number the reference backend's `target_bytes` reserves
+/// with, so a test can say what a frame needs without asking the backend.
+const FRAME_BYTES_PER_PIXEL: u64 = 20;
+
+/// The frame these disk-cap tests render. Measured: at 256x256 with a 1 MiB RAM
+/// cap the frame streams as 3 bands of 128 rows and needs 1,310,792 bytes on
+/// disk, which is small enough to render in milliseconds and large enough that
+/// nothing about the cap is incidental.
+const CAP_W: u32 = 256;
+const CAP_H: u32 = 256;
+
+/// A RAM cap that holds the cascade maps and one band of the frame above, and not
+/// the frame itself: what makes it stream.
+const CAP_RAM: u64 = 1 << 20;
+
+/// The bytes a `width x height` frame's own targets cost.
+fn frame_target_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width) * u64::from(height) * FRAME_BYTES_PER_PIXEL
+}
+
+/// What the arena file for spill directory `name` measures on disk, or 0 where
+/// the arena never created one.
+fn arena_file_bytes(name: &str) -> u64 {
+    std::fs::metadata(spill_path(name).join("arena.rcls"))
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// The reference backend's probe row for a host that named `spill_dir`: its
+/// capability word and the best tier it claims, as `reconlProbe` reports them.
+fn probe_soft_cpu(spill_dir: Option<&std::path::Path>) -> (u32, u32) {
+    let dir = spill_dir.map(|p| CString::new(p.to_string_lossy().as_bytes()).expect("spill path"));
+    let mut desc: abi::ReconLProbeDesc = unsafe { core::mem::zeroed() };
+    desc.base = hdr::<abi::ReconLProbeDesc>();
+    desc.spill_dir = dir.as_ref().map_or(core::ptr::null(), |c| c.as_ptr());
+    let mut info: abi::ReconLProbeInfo = unsafe { core::mem::zeroed() };
+    info.base = hdr::<abi::ReconLProbeInfo>();
+    assert_eq!(
+        unsafe { reconl::reconlProbe(&desc as *const _, &mut info) },
+        abi::result::OK,
+        "probe: {}",
+        global_error()
+    );
+    let index = (0..info.entry_count as usize)
+        .find(|&i| info.entries[i].backend == abi::backend::SOFT_CPU)
+        .expect("the probe does not report the reference backend");
+    (info.entries[index].caps, info.entries[index].best_tier)
+}
+
+/// The disk budget is the arena's hard cap, and this is where that has to hold: a
+/// `disk_cap_bytes` declared through the ABI, a frame the RAM cap cannot hold, and
+/// the bytes on disk inside the number the host declared.
+///
+/// Before the budget reached the arena at all - `config_from_desc` built the
+/// reference backend's config without `arena_bytes`, so the arena opened with no
+/// cap - the same shape of run wrote 26 MiB against a 2 MiB declaration. What this
+/// asserts is exactly the thing that was missing: the cap is the cap, and the
+/// device says which cap it was given.
+#[test]
+fn a_streamed_frame_never_writes_past_the_disk_cap_the_host_declared() {
+    let scene = occluder_scene(1);
+    let dir = SpillDir::new("disk-cap");
+    // Room for the frame's bands and one record header each, and not much else.
+    let cap = frame_target_bytes(CAP_W, CAP_H) + (16 << 10);
+    let frames = run(
+        Run {
+            width: CAP_W,
+            height: CAP_H,
+            frames: 2,
+            ram_cap: CAP_RAM,
+            disk_cap: cap,
+            spill: Some(dir.name()),
+            ..Run::one(abi::backend::SOFT_CPU, 4)
+        },
+        &scene,
+    );
+    let last = &frames[frames.len() - 1].1;
+    eprintln!(
+        "disk cap {cap}: presented {} failed {} live {} of {} declared, arena file {} bytes",
+        last.frames_presented,
+        last.failures,
+        last.memory.spill_disk_bytes,
+        last.memory.spill_disk_cap_bytes,
+        arena_file_bytes(dir.name())
+    );
+
+    assert_eq!(
+        last.frames_presented as usize,
+        frames.len(),
+        "a frame the RAM cap cannot hold must still present, by streaming"
+    );
+    assert_eq!(last.failures, 0, "a streamed frame is not a failure");
+    assert_eq!(
+        last.memory.spill_disk_cap_bytes, cap,
+        "the host's disk cap did not reach the device's budget"
+    );
+    assert!(
+        last.memory.spill_disk_bytes > 0,
+        "nothing was written to the arena, so this frame did not stream: {} live bytes, {} on \
+         disk",
+        last.memory.spill_disk_bytes,
+        arena_file_bytes(dir.name())
+    );
+    assert!(
+        last.memory.spill_disk_bytes <= cap && arena_file_bytes(dir.name()) <= cap,
+        "the arena is over its cap: {} live bytes and {} on disk, declared {cap}",
+        last.memory.spill_disk_bytes,
+        arena_file_bytes(dir.name())
+    );
+}
+
+/// The other half of the same guarantee: a cap the frame does not fit is a refusal
+/// that names what it needed, and nothing is written past the cap on the way to it.
+///
+/// Measured on the shipped bench at this size, a streamed frame needs 1,310,792
+/// bytes on disk; the cap here is half the frame's own targets, so no band of it fits
+/// either.
+#[test]
+fn a_frame_the_disk_cap_cannot_hold_is_refused_naming_what_it_needed() {
+    let scene = occluder_scene(1);
+    let dir = SpillDir::new("disk-cap-refused");
+    let cap = frame_target_bytes(CAP_W, CAP_H) / 2;
+    let frames = run(
+        Run {
+            width: CAP_W,
+            height: CAP_H,
+            frames: 1,
+            expect: Expect::RefusesAtBegin,
+            ram_cap: CAP_RAM,
+            disk_cap: cap,
+            spill: Some(dir.name()),
+            ..Run::one(abi::backend::SOFT_CPU, 4)
+        },
+        &scene,
+    );
+    let text = String::from_utf8_lossy(&frames[0].0).into_owned();
+    eprintln!("refused under a {cap} byte cap: {text}");
+
+    assert!(
+        text.contains(&cap.to_string()),
+        "the refusal does not name the cap it was given ({cap}): {text}"
+    );
+    // What it needed, as a number larger than what it may use: a refusal a host can
+    // act on says how far over it is.
+    let needed: u64 = text
+        .split("needs ")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or_else(|| panic!("the refusal names no requirement: {text}"));
+    assert!(
+        needed > cap,
+        "the refusal says it needed {needed}, which is not more than the {cap} byte cap"
+    );
+    assert!(
+        arena_file_bytes(dir.name()) <= cap,
+        "a refused frame wrote {} bytes against a {cap} byte cap - that is the defect, not the \
+         refusal",
+        arena_file_bytes(dir.name())
+    );
+}
+
+/// The probe is how a host finds out about the disk tier before it creates
+/// anything, and its answer has to match the machine: the reference backend's
+/// `disk-spill`/`out-of-core` caps and its best tier follow whether a spill
+/// directory can actually be used.
+///
+/// Answered from a hard-coded zero, every probe reported those capabilities absent
+/// - even with a writable directory named - while a device created with a disk
+/// budget reported both, so the same binary disagreed with itself about a
+/// capability it has.
+#[test]
+fn the_probe_reports_the_disk_tier_only_where_an_arena_can_live() {
+    let dir = SpillDir::new("probe-spill");
+    let writable = spill_path(dir.name());
+    std::fs::create_dir_all(&writable).expect("spill dir");
+    let file = spill_path("probe-file");
+    std::fs::write(&file, b"not a directory").expect("probe file");
+
+    let (dir_caps, dir_tier) = probe_soft_cpu(Some(&writable));
+    let (file_caps, file_tier) = probe_soft_cpu(Some(&file));
+    eprintln!(
+        "probe: directory caps {dir_caps:#010x} best tier {dir_tier}, file caps {file_caps:#010x} \
+         best tier {file_tier}"
+    );
+
+    let disk = abi::caps::DISK_SPILL | abi::caps::OUT_OF_CORE;
+    assert_eq!(
+        dir_caps & disk,
+        disk,
+        "a writable spill directory has to report the disk tier's capabilities: {dir_caps:#010x}"
+    );
+    assert_eq!(
+        dir_tier, 4,
+        "and T4 as the best tier the reference backend can reach"
+    );
+    assert_eq!(
+        file_caps & disk,
+        0,
+        "a path that is a file cannot hold an arena, so those caps are not real: {file_caps:#010x}"
+    );
+    assert_eq!(
+        file_tier, 2,
+        "and without a usable directory the reference backend is a T2 machine"
+    );
+
+    // The probe answered a question rather than taking the directory: nothing it
+    // needed is left in there.
+    let left: Vec<String> = std::fs::read_dir(&writable)
+        .expect("spill dir")
+        .map(|e| e.expect("dir entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the probe left {left:?} in the spill directory"
+    );
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn the_static_declaration_is_what_the_cascade_cache_is_keyed_on() {
+    let scene = occluder_scene(1);
+    let dir = SpillDir::new("static-cascade");
+    let leg = |static_geometry: bool| Run {
+        frames: 2,
+        static_geometry,
+        cached: true,
+        spill: Some(dir.name()),
+        ..Run::one(abi::backend::SOFT_CPU, 4)
+    };
+    let cold = run(leg(true), &scene);
+    let warm = run(leg(true), &scene);
+    let moving = run(leg(false), &scene);
+
+    // The shadow counters are the device's own, cumulative over the frames it
+    // has presented, so a leg is read at its last frame: what a leg did is what
+    // its last snapshot has.
+    let last = |frames: &[(Vec<u8>, abi::ReconLStats)]| frames[frames.len() - 1].1.clone();
+
+    eprintln!(
+        "static cache: cold hits {} misses {} frozen {}, warm hits {} misses {} frozen {} (disk {} \
+         bytes, map {}x{}, tier {}), moving hits {} misses {}",
+        last(&cold).shadows.cache_hits,
+        last(&cold).shadows.cache_misses,
+        last(&cold).shadows.frozen_cascades,
+        last(&warm).shadows.cache_hits,
+        last(&warm).shadows.cache_misses,
+        last(&warm).shadows.frozen_cascades,
+        last(&warm).memory.spill_cache_bytes,
+        last(&warm).shadows.map_width,
+        last(&warm).shadows.map_height,
+        last(&warm).tier,
+        last(&moving).shadows.cache_hits,
+        last(&moving).shadows.cache_misses,
+    );
+
+    // The T4 static cascade is a disk cache, and a device with an empty arena has
+    // to fill it before anything can hit it. The frames after the first are what
+    // the plan freezes instead - the other half of the same plan, counted rather
+    // than assumed.
+    assert_eq!(
+        last(&cold).shadows.cache_hits,
+        0,
+        "a cold device reported a cascade cache hit: there is nothing in the arena yet"
+    );
+    assert!(
+        last(&cold).shadows.cache_misses >= 1 && last(&cold).memory.spill_cache_bytes > 0,
+        "a cold device rendered the static cascade and did not put it in the arena: \
+         misses {}, frozen {}, disk cache {} bytes (caps {:#x})",
+        last(&cold).shadows.cache_misses,
+        last(&cold).shadows.frozen_cascades,
+        last(&cold).memory.spill_cache_bytes,
+        last(&cold).caps
+    );
+    assert!(
+        last(&cold).shadows.frozen_cascades >= 1,
+        "the T4 plan froze no cascade between refreshes: {} frozen over {} frames",
+        last(&cold).shadows.frozen_cascades,
+        cold.len()
+    );
+
+    // The second device, against the same arena and the same plan, finds it.
+    assert!(
+        last(&warm).shadows.cache_hits >= 1,
+        "a warm arena served no cascade: this device's static geometry was not cacheable, so \
+         the declaration did not reach the backend (hits {}, misses {}, disk cache {} bytes)",
+        last(&warm).shadows.cache_hits,
+        last(&warm).shadows.cache_misses,
+        last(&warm).memory.spill_cache_bytes
+    );
+    assert_eq!(
+        last(&warm).shadows.cache_misses,
+        0,
+        "the warm device re-rendered a cascade the arena was holding"
+    );
+    assert!(
+        last(&warm).shadows.cache_bytes_hit > 0,
+        "the cascade cache reported a hit and no bytes: {} bytes read, {} bytes hit",
+        last(&warm).shadows.cache_bytes_read,
+        last(&warm).shadows.cache_bytes_hit
+    );
+
+    // The control: the same scene, the same frames, the same plan, the same
+    // budget - and no cache, because its buffers say the geometry moves.
+    assert_eq!(
+        (
+            last(&moving).shadows.cache_hits,
+            last(&moving).shadows.cache_misses,
+            last(&moving).memory.spill_cache_bytes
+        ),
+        (0, 0, 0),
+        "a device whose geometry is declared dynamic used the static cascade cache anyway: \
+         the cache is not keyed on the declaration"
+    );
+
+    // What the cache serves, and what the declaration decides, is the same image:
+    // a cascade off the disk and a cascade rendered from scratch have to shade the
+    // same pixels, or the cache is serving a stale or partial map.
+    for (index, ((cold_frame, _), (warm_frame, _))) in cold.iter().zip(warm.iter()).enumerate() {
+        let (worst, differing, pixels) = delta_report(cold_frame, warm_frame);
+        assert!(
+            cold_frame == warm_frame,
+            "frame {index} presented from the cache differs from the frame it was cached from: \
+             {differing} of {pixels} pixels, worst channel delta {worst}"
+        );
+    }
+    for (index, ((cold_frame, _), (moving_frame, _))) in cold.iter().zip(moving.iter()).enumerate() {
+        let (worst, differing, pixels) = delta_report(cold_frame, moving_frame);
+        assert!(
+            cold_frame == moving_frame,
+            "frame {index} differs between static and moving geometry: {differing} of {pixels} \
+             pixels, worst channel delta {worst} - the declaration changed the image, not just \
+             what is cached"
         );
     }
 }

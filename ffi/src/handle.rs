@@ -170,6 +170,21 @@ pub struct BufferHandle {
 }
 impl_handle!(BufferHandle, Kind::Buffer);
 
+impl BufferHandle {
+    /// Whether this buffer's contents are declared not to move: `RECONL_BUFFER_STATIC`
+    /// set, and the explicit `RECONL_BUFFER_DYNAMIC` not set to outrank it.
+    ///
+    /// This is the ABI's one statement about geometry motion, and the reference
+    /// tier's cascade cache is keyed on it: a shadow-casting draw whose vertex and
+    /// index data are static is what can be held in RAM - or in the disk arena -
+    /// across frames, and one that is dynamic has to be re-rendered. Neither bit
+    /// set is dynamic, which is what every caller meant before the bit was read.
+    pub(crate) fn is_static_geometry(&self) -> bool {
+        self.usage & crate::abi::buffer_usage::STATIC != 0
+            && self.usage & crate::abi::buffer_usage::DYNAMIC == 0
+    }
+}
+
 #[repr(C)]
 pub struct TextureHandle {
     pub(crate) header: HandleHeader,

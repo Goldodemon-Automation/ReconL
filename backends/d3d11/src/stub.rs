@@ -5,17 +5,8 @@ use reconl_core::budget::Budget;
 use reconl_core::error::{Code, Error, Result};
 use reconl_core::stats::{Counters, FrameNumbers, ShadowCounters};
 use reconl_core::tier::{Backend, Tier, TierReason};
+use crate::{AdapterInfo, AdapterSelection};
 use std::sync::Arc;
-
-/// The probe types the non-windows build still has to name, so the ABI layer
-/// compiles and reports the backend as unavailable rather than not existing.
-#[derive(Clone, Debug)]
-pub struct AdapterInfo {
-    pub description: String,
-    pub dedicated_video_memory: u64,
-    pub vendor_id: u32,
-    pub feature_level_11: bool,
-}
 
 /// No D3D11 on this target, so no adapter can be created.
 pub fn hardware_available() -> bool {
@@ -35,7 +26,7 @@ pub fn probe_adapters() -> Result<Vec<AdapterInfo>> {
 #[derive(Clone, Debug)]
 pub struct D3d11Config {
     pub tier: Tier,
-    pub adapter_index: usize,
+    pub adapter_selection: AdapterSelection,
     pub resolution_scale: f32,
     pub target_frame_ms: u32,
     pub shadow: ShadowRequest,
@@ -45,7 +36,7 @@ impl Default for D3d11Config {
     fn default() -> Self {
         Self {
             tier: Tier::GpuShared,
-            adapter_index: 0,
+            adapter_selection: AdapterSelection::Auto,
             resolution_scale: 1.0,
             target_frame_ms: 16,
             shadow: ShadowRequest::default(),
