@@ -145,7 +145,8 @@ typedef enum ReconLStructType {
     RECONL_STRUCT_FRAME_GEN = 22,   /* ReconLFrameGenDesc */
     RECONL_STRUCT_SOFTCPU_DESC = 64,
     RECONL_STRUCT_NULL_DESC = 65,
-    RECONL_STRUCT_D3D11_DESC = 66
+    RECONL_STRUCT_D3D11_DESC = 66,
+    RECONL_STRUCT_ADAPTER_INFO = 67
 } ReconLStructType;
 
 typedef struct ReconLBase {
@@ -168,6 +169,20 @@ typedef enum ReconLBackendId {
     RECONL_BACKEND_WEBGPU = 8,
     RECONL_BACKEND_WASM_WEBGL2 = 9
 } ReconLBackendId;
+
+typedef enum ReconLAdapterType {
+    RECONL_ADAPTER_TYPE_UNKNOWN = 0,
+    RECONL_ADAPTER_TYPE_INTEGRATED = 1,
+    RECONL_ADAPTER_TYPE_DISCRETE = 2
+} ReconLAdapterType;
+
+typedef enum ReconLAdapterPreference {
+    RECONL_ADAPTER_PREFERENCE_AUTO = 0,       /* prefer discrete, then any usable adapter */
+    RECONL_ADAPTER_PREFERENCE_INTEGRATED = 1, /* prefer integrated, then any usable adapter */
+    RECONL_ADAPTER_PREFERENCE_DISCRETE = 2,   /* prefer discrete, then any usable adapter */
+    RECONL_ADAPTER_PREFERENCE_INDEX = 3,      /* use adapter_index directly */
+    RECONL_ADAPTER_PREFERENCE_LUID = 4        /* select the exact adapter_luid */
+} ReconLAdapterPreference;
 
 typedef enum ReconLTier {
     RECONL_TIER_T0_GPU_DISCRETE = 0, /* full VRAM                          */
@@ -377,6 +392,25 @@ typedef struct ReconLProbeInfo {
     uint32_t           recommended_backend; /* ReconLBackendId of the best entry   */
 } ReconLProbeInfo;
 
+/* One physical D3D11 adapter, in DXGI enumeration order. `adapter_luid` packs
+ * the DXGI LUID as high 32 bits then low 32 bits; use it to select an exact
+ * adapter rather than relying on an index that may change between runs. The
+ * adapter type is UNKNOWN if DXCore classification is unavailable. `name` is
+ * UTF-8, NUL-terminated, and may be truncated. */
+typedef struct ReconLAdapterInfo {
+    ReconLBase         base;
+    ReconLBackendId    backend;
+    ReconLAdapterType  adapter_type;
+    uint32_t           usable; /* 1 if D3D11 feature level 11.0 can be created */
+    uint32_t           vendor_id;
+    uint32_t           device_id;
+    uint32_t           reserved;
+    uint64_t           adapter_luid;
+    uint64_t           dedicated_video_memory;
+    uint64_t           shared_system_memory;
+    char               name[RECONL_MAX_NAME];
+} ReconLAdapterInfo;
+
 /* ------------------------------------------------------- limits and budget  */
 
 /* One gate, one ceiling, before any memory is touched.
@@ -442,8 +476,9 @@ typedef struct ReconLDeviceDesc {
     uint32_t            flags;
     ReconLMemoryBudget* budget;          /* optional, may be NULL                     */
     ReconLAllocator     allocator;       /* required; zeroed allocator = refuse start */
-    const void*         backend_desc;    /* ReconL*Desc from reconl_backends.h;       */
-                                         /* reserved: accepted and never read in v0.1 */
+    const void*         backend_desc;    /* backend-specific descriptor from             */
+                                         /* reconl_backends.h; D3D11 reads its adapter  */
+                                         /* selection; SoftCPU and Null descriptors remain reserved */
 } ReconLDeviceDesc;
 
 typedef struct ReconLSwapchainDesc {
@@ -914,6 +949,17 @@ RECONL_API void RECONL_CALL reconlSetLogSink(
 /* Probe. Enumerates backends and one file-system check. Creates no device,
  * allocates nothing the host must free, and is safe to call at any time. */
 RECONL_API ReconLResult RECONL_CALL reconlProbe(const ReconLProbeDesc* desc, ReconLProbeInfo* out);
+
+/* Enumerate physical adapters for a backend. For D3D11, call with
+ * `adapters=NULL`, `capacity=0` to get `out_count`, allocate that many entries,
+ * and call again. On success the library writes min(capacity, adapter_count)
+ * entries and always reports the total in `out_count`; a short buffer is not an
+ * error. Each output entry's base is filled by ReconL (the host need not
+ * initialize it). Other/unbuilt backends return RECONL_ERR_NOT_SUPPORTED; a
+ * non-Windows build reports zero D3D11 adapters. `usable` means D3D11 feature
+ * level 11.0 can be created on that adapter. */
+RECONL_API ReconLResult RECONL_CALL reconlEnumerateAdapters(
+    ReconLBackendId backend, ReconLAdapterInfo* adapters, uint32_t capacity, uint32_t* out_count);
 
 RECONL_API ReconLResult RECONL_CALL reconlCreateDevice(const ReconLDeviceDesc* desc, ReconLDevice** out);
 RECONL_API ReconLResult RECONL_CALL reconlGetDeviceLimits(ReconLDevice* device, ReconLDeviceLimits* out);

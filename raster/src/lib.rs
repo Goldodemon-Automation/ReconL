@@ -286,10 +286,17 @@ pub fn to_u8(v: f32) -> u8 {
     (c * 255.0 + 0.5) as u8
 }
 
-/// FNV-1a over a byte slice. The frame checksum the null backend and the
-/// determinism tests compare.
-pub fn checksum_bytes(data: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+/// The seed of every FNV-1a hash here, so a caller that hashes a frame in
+/// pieces can start where the whole-frame hash would.
+pub const CHECKSUM_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a over a byte slice, continued from `seed`.
+///
+/// A frame that is hashed in pieces - one per band of a frame too large for the
+/// RAM cap - checksums to the same number as the whole slice would, because
+/// FNV-1a is a fold over the bytes in order.
+pub fn checksum_bytes_with(seed: u64, data: &[u8]) -> u64 {
+    let mut hash = seed;
     for b in data {
         hash ^= *b as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -297,9 +304,19 @@ pub fn checksum_bytes(data: &[u8]) -> u64 {
     hash
 }
 
+/// FNV-1a over a byte slice. The frame checksum the null backend and the
+/// determinism tests compare.
+pub fn checksum_bytes(data: &[u8]) -> u64 {
+    checksum_bytes_with(CHECKSUM_SEED, data)
+}
+
 /// FNV-1a over the raw bits of an `f32` slice.
+///
+/// Byte for byte the same hash as [`checksum_bytes`] over those bits in
+/// little-endian order, which is what lets a colour buffer be hashed as it is
+/// written out instead of as it sits in memory.
 pub fn checksum_f32(data: &[f32]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut hash = CHECKSUM_SEED;
     for v in data {
         for b in v.to_bits().to_le_bytes() {
             hash ^= b as u64;
@@ -445,5 +462,16 @@ mod tests {
         b[1] += 1.0e-6;
         assert_ne!(checksum_f32(&a), checksum_f32(&b));
         assert_eq!(checksum_bytes(b"reconl"), checksum_bytes(b"reconl"));
+        // A frame hashed in pieces is the frame hashed whole: this is what lets
+        // a streamed frame be fingerprinted band by band and compared to a
+        // resident frame's checksum.
+        let whole = checksum_f32(&a);
+        let mut piecewise = CHECKSUM_SEED;
+        for v in a {
+            piecewise = checksum_bytes_with(piecewise, &v.to_bits().to_le_bytes());
+        }
+        assert_eq!(piecewise, whole);
+        let split = checksum_bytes_with(checksum_bytes_with(CHECKSUM_SEED, b"re"), b"conl");
+        assert_eq!(split, checksum_bytes(b"reconl"));
     }
 }

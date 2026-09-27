@@ -54,6 +54,16 @@ fn temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// Writes `img` with the pixel at (x, y) flipped on red, using the tool's codec.
+fn flip(img: &reconl_png::Image, x: u32, y: u32, name: &str) -> PathBuf {
+    let mut px = img.pixels.clone();
+    let i = (y as usize * img.width as usize + x as usize) * 4;
+    px[i] ^= 0xFF;
+    let path = temp_path(name);
+    std::fs::write(&path, reconl_png::write_rgba8(img.width, img.height, &px).unwrap()).unwrap();
+    path
+}
+
 #[test]
 fn ci_path_rerender_is_identical_to_golden() {
     // Determinism claim, end to end: the ABI re-render must be byte-identical
@@ -128,6 +138,57 @@ fn the_golden_contains_a_shadow() {
          part of the frame",
         colours.len()
     );
+}
+
+/// The compare tool is not a 64x64 tool: the project benchmarks at 256x256 and
+/// 512x512, and before this test existed the only way to look at those frames
+/// was a throwaway script, because `compare` refused any size but the golden's.
+///
+/// Every path of the contract is exercised at 512x512 here — the size is taken
+/// from the golden, the re-render happens at that size, the budget scales with
+/// it (1% of 262144 is 2621, not 40), and a find is reported per channel.
+#[test]
+fn compare_works_at_the_size_the_benchmarks_render() {
+    for name in ["reconl_test_s512.png", "reconl_test_s512_twin.png"] {
+        let (code, msg) = run(&["render", temp_path(name).to_str().unwrap(), "--size=512"]);
+        assert_eq!(code, 0, "render --size=512 failed: {msg}");
+    }
+    let a = std::fs::read(temp_path("reconl_test_s512.png")).unwrap();
+    let img = reconl_png::read_rgba8(&a).unwrap();
+    assert_eq!((img.width, img.height), (512, 512), "render --size=512 wrote another size");
+
+    // The CI path at another resolution: no candidate, so the reference is
+    // re-rendered at the golden's own size and must land on it exactly.
+    let a = temp_path("reconl_test_s512.png");
+    let b = temp_path("reconl_test_s512_twin.png");
+    let (code, msg) = run(&["compare", a.to_str().unwrap()]);
+    assert_eq!(code, 0, "512x512 re-render must be identical: {msg}");
+    assert!(msg.contains("identical (512x512"), "{msg}");
+
+    // A single flipped pixel is a finding at this size too, and the report says
+    // which channel moved, how far, and where.
+    let bad = flip(&img, 40, 32, "reconl_test_s512_flip.png");
+    let (code, msg) = run(&["compare", a.to_str().unwrap(), bad.to_str().unwrap()]);
+    assert_eq!(code, 1, "one flipped 512x512 pixel must be a finding: {msg}");
+    assert!(msg.contains("DIFFER"), "{msg}");
+    assert!(msg.contains("1 of 262144 px differ"), "{msg}");
+    assert!(
+        msg.contains("worst channel delta ") && !msg.contains("worst channel delta 0 ("),
+        "the per-channel worst delta has to be reported and nonzero: {msg}"
+    );
+    assert!(msg.contains("differing per channel (R 1, G 0, B 0, A 0)"), "{msg}");
+    assert!(msg.contains("box x 40..40 y 32..32"), "the find's location is missing: {msg}");
+
+    // The same flip is absorbed once the tolerance admits it, and the budget is
+    // 1% of the frame's pixels rather than of the golden's.
+    let (code, msg) = run(&["compare", a.to_str().unwrap(), bad.to_str().unwrap(), "--tolerance=255"]);
+    assert_eq!(code, 0, "1 px within a 2621 px budget must pass: {msg}");
+    assert!(msg.contains("within the 1% budget"), "{msg}");
+
+    // Two sizes are not compared by cropping one to the other.
+    let (code, msg) = run(&["compare", GOLDEN, b.to_str().unwrap()]);
+    assert_eq!(code, 2, "a size mismatch is a tool error: {msg}");
+    assert!(msg.contains("size mismatch"), "{msg}");
 }
 
 #[test]

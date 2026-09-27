@@ -116,7 +116,6 @@ enum Command {
         pipeline: *mut PipelineHandle,
     },
     SetVertexBuffer {
-        stream: u32,
         buffer: *mut BufferHandle,
         offset: u64,
     },
@@ -610,23 +609,31 @@ pub unsafe extern "C" fn reconlProbe(desc: *const ReconLProbeDesc, out: *mut Rec
         }
 
         let ram = detect_ram_bytes();
-        let disk = spill_dir
-            .as_deref()
-            .map(free_disk_bytes)
-            .unwrap_or_else(|| free_disk_bytes_default());
+        // The disk tier's only requirement is somewhere to put an arena: the
+        // directory the host named if it named one, and the directory the arena
+        // would fall back to otherwise. How *much* is free is not the question -
+        // v0.1 writes the arena and lets the OS refuse, and a fabricated size is a
+        // number the resolver would believe. The answer comes from the arena's own
+        // open path, so this cannot claim a directory the device would refuse.
+        let disk_ok = match spill_dir.as_deref() {
+            Some(dir) => reconl_resource::spill::dir_usable(dir),
+            None => reconl_resource::spill::dir_usable(reconl_resource::spill::default_spill_dir()),
+        };
 
         let (caps_soft, plan) = reconl_backend_softcpu::probe(Tier::CpuRam);
         let (_caps_t4, plan_t4) = reconl_backend_softcpu::probe(Tier::OutOfCore);
-        let disk_ok = disk > (64u64 << 20);
         let soft_note = if disk_ok {
             "T2 by default; T3 freezes cascades, T4 spills the static cascade to the arena"
         } else {
-            "T2 only: no writable spill directory with free space was found"
+            "T2 only: no writable spill directory - name one with --spill-dir=PATH to reach T3/T4"
         };
         // The hardware path is probed for real: a device has to be creatable at
         // feature level 11.0, not merely declared in the ABI.
         let adapters = reconl_backend_d3d11::probe_adapters().unwrap_or_default();
-        let gpu = adapters.first();
+        let gpu = adapters
+            .iter()
+            .find(|adapter| adapter.feature_level_11 && adapter.adapter_type == reconl_backend_d3d11::AdapterType::Discrete)
+            .or_else(|| adapters.iter().find(|adapter| adapter.feature_level_11));
         let gpu_usable = gpu.map(|a| a.feature_level_11).unwrap_or(false);
         let gpu_caps = reconl_backend_d3d11::caps_for(Tier::GpuShared);
         let gpu_plan = shadow_plan(
@@ -720,33 +727,144 @@ fn detect_ram_bytes() -> u64 {
     host_stats().peak_bytes.max(1 << 30)
 }
 
-fn free_disk_bytes_default() -> u64 {
-    let dir = reconl_resource::spill::default_spill_dir();
-    free_disk_bytes(dir.to_string_lossy().as_ref())
-}
-
-fn free_disk_bytes(_path: &str) -> u64 {
-    // v0.1 writes the arena and lets the OS refuse; reporting a guess here would
-    // be a lie the tier resolver would believe. The arena reports a full disk as
-    // a counted downgrade instead.
-    0
-}
-
 // ------------------------------------------------------------------- device
 
-fn d3d11_config_from_desc(desc: &ReconLDeviceDesc, tier: Tier) -> D3d11Config {
-    D3d11Config {
+fn d3d11_config_from_desc(desc: &ReconLDeviceDesc, tier: Tier) -> Result<D3d11Config> {
+    let adapter_selection = if desc.backend_desc.is_null() {
+        reconl_backend_d3d11::AdapterSelection::Auto
+    } else {
+        // Validate the prefix without constructing a reference to the *full*
+        // descriptor: callers using the legacy prefix need not allocate the
+        // appended preference/LUID fields at all.
+        let header = unsafe { &*(desc.backend_desc as *const reconl_core::StructHeader) };
+        if header.struct_size < core::mem::size_of::<reconl_core::StructHeader>() as u32 {
+            return err!(Code::StructSize, "ReconLD3D11Desc does not contain a complete struct header");
+        }
+        if header.struct_size < ReconLD3D11Desc::PREFIX_SIZE {
+            return err!(
+                Code::StructSize,
+                "ReconLD3D11Desc struct_size is {} but this library reads {}",
+                header.struct_size,
+                ReconLD3D11Desc::PREFIX_SIZE
+            );
+        }
+        if header.struct_type != struct_type::D3D11_DESC && header.struct_type != 0 {
+            return err!(
+                Code::WrongStructType,
+                "ReconLD3D11Desc type is {} but {} was expected",
+                header.struct_type,
+                struct_type::D3D11_DESC
+            );
+        }
+        let bytes = desc.backend_desc as *const u8;
+        let read_u32 = |offset: usize| unsafe { core::ptr::read_unaligned(bytes.add(offset).cast::<u32>()) };
+        let read_i32 = |offset: usize| unsafe { core::ptr::read_unaligned(bytes.add(offset).cast::<i32>()) };
+        let read_u64 = |offset: usize| unsafe { core::ptr::read_unaligned(bytes.add(offset).cast::<u64>()) };
+        let preference = if header.struct_size >= ReconLD3D11Desc::PREFERENCE_SIZE {
+            read_u32(core::mem::offset_of!(ReconLD3D11Desc, adapter_preference))
+        } else {
+            adapter_preference::AUTO
+        };
+        match preference {
+            adapter_preference::AUTO => reconl_backend_d3d11::AdapterSelection::Auto,
+            adapter_preference::INTEGRATED => reconl_backend_d3d11::AdapterSelection::Integrated,
+            adapter_preference::DISCRETE => reconl_backend_d3d11::AdapterSelection::Discrete,
+            adapter_preference::INDEX => {
+                let index = read_i32(core::mem::offset_of!(ReconLD3D11Desc, adapter_index));
+                if index < 0 {
+                    return err!(Code::InvalidArgument, "INDEX adapter preference requires a non-negative adapter_index");
+                }
+                reconl_backend_d3d11::AdapterSelection::Index(index as usize)
+            }
+            adapter_preference::LUID => {
+                if header.struct_size < ReconLD3D11Desc::LUID_SIZE {
+                    return err!(
+                        Code::StructSize,
+                        "ReconLD3D11Desc struct_size is {} but selecting by LUID reads {}",
+                        header.struct_size,
+                        ReconLD3D11Desc::LUID_SIZE
+                    );
+                }
+                reconl_backend_d3d11::AdapterSelection::Luid(read_u64(core::mem::offset_of!(ReconLD3D11Desc, adapter_luid)))
+            }
+            other => return err!(Code::InvalidArgument, "unknown D3D11 adapter preference {}", other),
+        }
+    };
+
+    Ok(D3d11Config {
         tier,
-        adapter_index: 0,
+        adapter_selection,
         resolution_scale: 1.0,
         target_frame_ms: desc.target_frame_ms,
         // The shadow request is per frame (`ReconLShadowConfig` on the frame
         // descriptor), exactly as it is for the reference backend.
         shadow: ShadowRequest::default(),
         ..D3d11Config::default()
-    }
+    })
 }
 
+/// Enumerates D3D11 adapters into the host-provided bounded output slice.
+///
+/// # Safety
+/// `out_count` must be writable, and `adapters` must be writable for
+/// `capacity` entries when it is non-null.
+#[no_mangle]
+pub unsafe extern "C" fn reconlEnumerateAdapters(
+    backend_id: u32,
+    adapters: *mut ReconLAdapterInfo,
+    capacity: u32,
+    out_count: *mut u32,
+) -> i32 {
+    guarded_entry(core::ptr::null_mut(), move || {
+        if out_count.is_null() {
+            return err!(Code::InvalidArgument, "null adapter count output");
+        }
+        unsafe { out_count.write(0) };
+        if backend_id != backend::D3D11 {
+            return err!(Code::NotSupported, "adapter enumeration is not supported for backend {}", backend_id);
+        }
+        if adapters.is_null() && capacity != 0 {
+            return err!(Code::InvalidArgument, "null adapter output with nonzero capacity");
+        }
+        let entries = reconl_backend_d3d11::probe_adapters()?;
+        let count = u32::try_from(entries.len()).map_err(|_| Error::new(Code::OutOfMemory, "adapter count exceeds the ABI limit"))?;
+        let write_count = (capacity as usize).min(entries.len());
+        for (index, adapter) in entries.iter().take(write_count).enumerate() {
+            let mut info = ReconLAdapterInfo {
+                base: reconl_core::StructHeader::new(
+                    core::mem::size_of::<ReconLAdapterInfo>() as u32,
+                    struct_type::ADAPTER_INFO,
+                ),
+                backend: backend::D3D11,
+                adapter_type: match adapter.adapter_type {
+                    reconl_backend_d3d11::AdapterType::Unknown => adapter_type::UNKNOWN,
+                    reconl_backend_d3d11::AdapterType::Integrated => adapter_type::INTEGRATED,
+                    reconl_backend_d3d11::AdapterType::Discrete => adapter_type::DISCRETE,
+                },
+                usable: u32::from(adapter.feature_level_11),
+                vendor_id: adapter.vendor_id,
+                device_id: adapter.device_id,
+                reserved: 0,
+                adapter_luid: adapter.adapter_luid,
+                dedicated_video_memory: adapter.dedicated_video_memory,
+                shared_system_memory: adapter.shared_system_memory,
+                name: [0; abi::RECONL_MAX_NAME],
+            };
+            set_str(&mut info.name, &adapter.description);
+            // SAFETY: the caller promised a writable array of `capacity` entries.
+            unsafe { adapters.add(index).write(info) };
+        }
+        // SAFETY: checked non-null above.
+        unsafe { out_count.write(count) };
+        Ok(())
+    })
+}
+
+/// The reference tier's config, built from the host's descriptor.
+///
+/// The disk budget is deliberately not in here: `disk_cap_bytes` is a field of
+/// the budget the device is created with, and the backend opens its arena against
+/// that. One number, one owner.
 fn config_from_desc(desc: &ReconLDeviceDesc, spill_dir: Option<PathBuf>, tier: Tier) -> SoftCpuConfig {
     SoftCpuConfig {
         tier,
@@ -830,10 +948,24 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     // hardware tiers, and a machine with no usable GPU API starts at the T2
     // reference tier - which is the CI case the design requires to work.
     let gpu_available = reconl_backend_d3d11::hardware_available();
+    let requested_adapter = desc.backend_hint == backend::D3D11
+        && !desc.backend_desc.is_null()
+        && {
+            let header = unsafe { &*(desc.backend_desc as *const reconl_core::StructHeader) };
+            header.struct_size >= ReconLD3D11Desc::PREFERENCE_SIZE
+                && unsafe {
+                    core::ptr::read_unaligned(
+                        (desc.backend_desc as *const u8)
+                            .add(core::mem::offset_of!(ReconLD3D11Desc, adapter_preference))
+                            .cast::<u32>(),
+                    ) != adapter_preference::AUTO
+                }
+        };
     let (mut tier, mut tier_reason) = if desc.tier_hint != 0 {
         (Tier::from_u32(desc.tier_hint), TierReason::HostRequest)
     } else {
         match desc.backend_hint {
+            backend::D3D11 if requested_adapter => (Tier::GpuDiscrete, TierReason::HostRequest),
             backend::D3D11 => (Tier::GpuShared, TierReason::HostRequest),
             backend::SOFT_CPU | backend::NULL => (Tier::CpuRam, TierReason::HostRequest),
             _ if gpu_available => (Tier::GpuShared, TierReason::StartupProbe),
@@ -873,7 +1005,11 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     // (docs/offload.md) changes backend at any later frame, and by then this
     // descriptor is the host's memory, not ours.
     let cpu_config = config_from_desc(desc, spill_dir.clone(), tier);
-    let gpu_config = d3d11_config_from_desc(desc, tier);
+    let gpu_config = if requested_backend == backend::D3D11 {
+        d3d11_config_from_desc(desc, tier)?
+    } else {
+        D3d11Config { tier, target_frame_ms: desc.target_frame_ms, ..D3d11Config::default() }
+    };
 
     // A tier the backend is asked to start at is a tier change like any other,
     // and it is recorded in the device's log like any other. Collected here
@@ -926,20 +1062,20 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
         BackendKind::D3d11(d) => d.caps(),
         BackendKind::Null(d) => d.caps(),
     };
-    let device_name = match &backend {
+    let device_name = Text::<{ abi::RECONL_MAX_NAME }>::from_str(match &backend {
         BackendKind::SoftCpu(d) => d.device_name(),
         BackendKind::D3d11(d) => d.device_name(),
         BackendKind::Null(d) => d.device_name(),
-    };
-    let driver = match &backend {
+    });
+    let driver = Text::<{ abi::RECONL_MAX_NAME }>::from_str(match &backend {
         BackendKind::SoftCpu(d) => d.driver(),
         BackendKind::D3d11(d) => d.driver(),
         BackendKind::Null(d) => d.driver(),
-    };
+    });
 
     let mut stats = Stats::new(backend_id, tier, tier_reason);
     stats.caps = device_caps;
-    stats.device_name.set(device_name);
+    stats.device_name.set(device_name.as_str());
     stats.tier_reason_text.set(tier_reason.text());
 
     let mut handle = DeviceHandle {
@@ -979,8 +1115,8 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     for entry in starting_downgrades {
         handle.downgrades.record(entry);
     }
-    handle.device_name.set(device_name);
-    handle.driver.set(driver);
+    handle.device_name.set(device_name.as_str());
+    handle.driver.set(driver.as_str());
     handle.shadow = shadow_request_from(None);
 
     let ptr = unsafe { handle_new(alloc, handle) };
@@ -1673,7 +1809,9 @@ pub unsafe extern "C" fn reconlCmdSetVertexBuffer(list: *mut CommandListHandle, 
             return err!(Code::NotSupported, "this release has one vertex stream");
         }
         let list = unsafe { &mut *list };
-        push_command(list, Command::SetVertexBuffer { stream, buffer, offset })?;
+        // The entry gate above has already refused any other stream, so the
+        // command carries only what a submit reads.
+        push_command(list, Command::SetVertexBuffer { buffer, offset })?;
         Ok(())
     })
 }
@@ -1982,9 +2120,13 @@ pub unsafe extern "C" fn reconlBeginFrame(device: *mut DeviceHandle, desc: *mut 
         // out mid-frame - and it happens before the frame is marked open, so a
         // commit that cannot be carried out leaves the device where the host can
         // begin again instead of in `Open` with a frame it can never record.
+        // The frame's own shadow request: the pass that reserves the cascade set
+        // and the pass that renders it have to agree on its size, and this frame's
+        // request is the one `Submit` will plan with.
+        let shadow = device.frame.shadow;
         let (width, height) = (device.frame.width, device.frame.height);
         if let Some(soft) = device.softcpu_mut() {
-            soft.prepare_frame(width, height)?;
+            soft.prepare_frame(width, height, &shadow)?;
         }
         device.frame_state = FrameState::Open;
         Ok(())
@@ -2123,7 +2265,7 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     state.pipeline = Some(pipeline_state(pipeline));
                     state.pipeline_rec = Some(pipeline as *const PipelineHandle as *mut PipelineHandle);
                 }
-                Command::SetVertexBuffer { stream: _, buffer, offset } => {
+                Command::SetVertexBuffer { buffer, offset } => {
                     if buffer.is_null() {
                         return err!(Code::InvalidArgument, "null vertex buffer");
                     }
@@ -2208,7 +2350,11 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                             shadows: None,
                             flip_normal: false,
                         }),
-                        dynamic: true,
+                        // The host's declaration of whether this geometry moves,
+                        // read from the buffer it was created with
+                        // (`RECONL_BUFFER_STATIC`). It is what the reference
+                        // tier's cascade cache keys on.
+                        dynamic: !buffer_ref.is_static_geometry(),
                         casts_shadow: rec.map(|p| p.casts_shadow).unwrap_or(false),
                     })?;
                     device.frame.triangles += (vertex_count / 3) as u64;
@@ -2273,7 +2419,9 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                             shadows: None,
                             flip_normal: false,
                         }),
-                        dynamic: true,
+                        // A draw reads both buffers, so it is static only when
+                        // both say so: half a moving draw is a moving draw.
+                        dynamic: !(buffer_ref.is_static_geometry() && index_ref.is_static_geometry()),
                         casts_shadow: rec.map(|p| p.casts_shadow).unwrap_or(false),
                     })?;
                     device.frame.triangles += (index_count / 3) as u64;

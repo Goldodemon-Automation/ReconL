@@ -172,10 +172,18 @@ impl Renderer {
             let mut buffers = Vec::with_capacity(scene.chunks.len());
             for chunk in &scene.chunks {
                 let verts = chunk.verts.as_slice();
+                // The reference scene's geometry is declared static
+                // (`RECONL_BUFFER_STATIC`), which is the truth about it: the
+                // vertices are uploaded once and never rewritten, and what moves
+                // between frames is the camera and the light. That declaration is
+                // what the T3/T4 static cascade cache is keyed on - a tier that
+                // could not tell static geometry from moving geometry would have
+                // nothing it was safe to reuse, which is what every draw looked
+                // like while this flag was left off.
                 let vbd = abi::ReconLBufferDesc {
                     base: hdr::<abi::ReconLBufferDesc>(),
                     size_bytes: core::mem::size_of_val(verts) as u64,
-                    usage: 1,
+                    usage: abi::buffer_usage::VERTEX | abi::buffer_usage::STATIC,
                     reserved: 0,
                     data: verts.as_ptr() as *const core::ffi::c_void,
                     data_size: core::mem::size_of_val(verts) as u64,
@@ -191,7 +199,7 @@ impl Renderer {
                 let ibd = abi::ReconLBufferDesc {
                     base: hdr::<abi::ReconLBufferDesc>(),
                     size_bytes: core::mem::size_of_val(indices) as u64,
-                    usage: 2,
+                    usage: abi::buffer_usage::INDEX | abi::buffer_usage::STATIC,
                     reserved: 0,
                     data: indices.as_ptr() as *const core::ffi::c_void,
                     data_size: core::mem::size_of_val(indices) as u64,

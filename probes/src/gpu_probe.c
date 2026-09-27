@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "reconl/reconl.h"
+#include "reconl/reconl_backends.h"
 
 #define SETBASE(p, T)                                        \
     do {                                                     \
@@ -66,7 +67,7 @@ static int fail(const char* what, ReconLResult r) {
     return 1;
 }
 
-static int rig_init(Rig* rig) {
+static int rig_init(Rig* rig, uint64_t adapter_luid) {
     ReconLDeviceDesc dd;
     memset(&dd, 0, sizeof dd);
     SETBASE(&dd, RECONL_STRUCT_DEVICE_DESC);
@@ -81,6 +82,13 @@ static int rig_init(Rig* rig) {
     dd.allocator.realloc = h_realloc;
     dd.allocator.free = h_free;
     dd.allocator.user = NULL;
+
+    ReconLD3D11Desc gpu_desc;
+    memset(&gpu_desc, 0, sizeof gpu_desc);
+    SETBASE(&gpu_desc, RECONL_STRUCT_D3D11_DESC);
+    gpu_desc.adapter_preference = RECONL_ADAPTER_PREFERENCE_LUID;
+    gpu_desc.adapter_luid = adapter_luid;
+    dd.backend_desc = &gpu_desc;
 
     ReconLResult r = reconlCreateDevice(&dd, &rig->device);
     if (r != RECONL_OK) {
@@ -298,10 +306,35 @@ int main(void) {
         return 1;
     }
 
-    /* 2. a frame through the ABI. */
+    /* 2. the public two-call adapter enumeration contract. */
+    uint32_t adapter_count = 0;
+    r = reconlEnumerateAdapters(RECONL_BACKEND_D3D11, NULL, 0, &adapter_count);
+    if (r != RECONL_OK || adapter_count == 0) return fail("enumerate adapter count", r);
+    ReconLAdapterInfo* adapters = (ReconLAdapterInfo*)calloc(adapter_count, sizeof *adapters);
+    if (!adapters) return fail("allocate adapter output", RECONL_ERR_OUT_OF_MEMORY);
+    uint32_t total = 0;
+    r = reconlEnumerateAdapters(RECONL_BACKEND_D3D11, adapters, adapter_count, &total);
+    if (r != RECONL_OK || total != adapter_count) { free(adapters); return fail("enumerate adapter details", r); }
+    uint32_t usable_adapters = 0;
+    for (uint32_t i = 0; i < adapter_count; ++i) {
+        if (adapters[i].base.type != RECONL_STRUCT_ADAPTER_INFO || adapters[i].backend != RECONL_BACKEND_D3D11) {
+            free(adapters);
+            return fail("adapter metadata", RECONL_ERR_PANIC);
+        }
+        usable_adapters += adapters[i].usable != 0;
+    }
+    if (usable_adapters == 0) { free(adapters); return fail("adapter usability", RECONL_ERR_BACKEND_UNAVAILABLE); }
+    ReconLAdapterInfo chosen = adapters[0];
+    for (uint32_t i = 0; i < adapter_count; ++i) {
+        if (adapters[i].usable) { chosen = adapters[i]; break; }
+    }
+    free(adapters);
+    printf("adapters: %u enumerated, %u usable, exact LUID %016llx\n", adapter_count, usable_adapters, (unsigned long long)chosen.adapter_luid);
+
+    /* 3. a frame through the ABI, pinned to the enumerated adapter. */
     Rig rig;
     memset(&rig, 0, sizeof rig);
-    if (rig_init(&rig)) { rig_free(&rig); return 1; }
+    if (rig_init(&rig, chosen.adapter_luid)) { rig_free(&rig); return 1; }
     if (draw_frame(&rig, 0)) { rig_free(&rig); return 1; }
 
     unsigned blue = 0, white = 0;
@@ -324,13 +357,14 @@ int main(void) {
            st.backend, st.tier, st.frames_presented, st.frame.triangles_in,
            (unsigned long long)st.frame.shadow_ns);
     if (st.backend != RECONL_BACKEND_D3D11) { rig_free(&rig); return fail("backend id", RECONL_ERR_PANIC); }
+    if (strcmp(st.device_name, chosen.name) != 0) { rig_free(&rig); return fail("selected adapter", RECONL_ERR_PANIC); }
     if (st.frame.triangles_in == 0) {
         fprintf(stderr, "FAIL: a triangle was drawn but none was counted\n");
         rig_free(&rig);
         return 1;
     }
 
-    /* 3. the same frame twice is the same image. */
+    /* 4. the same frame twice is the same image. */
     unsigned char first[W * H * 4];
     memcpy(first, rig.pixels, sizeof first);
     if (draw_frame(&rig, 0)) { rig_free(&rig); return 1; }
@@ -341,7 +375,7 @@ int main(void) {
     }
     printf("determinism: two identical frames, identical bytes\n");
 
-    /* 4. the camera field, and the struct_size that predates it. */
+    /* 5. the camera field, and the struct_size that predates it. */
     if (draw_frame(&rig, 1)) { rig_free(&rig); return 1; }
     if (memcmp(first, rig.pixels, sizeof first) != 0) {
         fprintf(stderr, "FAIL: declaring the camera changed the image\n");

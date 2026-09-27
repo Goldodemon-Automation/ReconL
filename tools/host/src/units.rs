@@ -96,6 +96,20 @@ pub fn parse_u32(text: &str, what: &str) -> Result<u32, String> {
     text.parse::<u32>().map_err(|_| format!("`{text}` is not a valid {what}"))
 }
 
+/// The same, for a count or a dimension that has to be at least one.
+///
+/// Zero is not a smaller frame or a shorter run: `--width=0` used to become a
+/// one-pixel frame and `--frames=0` a one-frame measurement, and both reported a
+/// successful run of something the host never asked for. A refusal that names the
+/// flag is the honest answer.
+pub fn parse_positive(text: &str, what: &str) -> Result<u32, String> {
+    let value = parse_u32(text, what)?;
+    if value == 0 {
+        return Err(format!("{what} must be at least 1, not 0 (see --help)"));
+    }
+    Ok(value)
+}
+
 /// `name=value` lookup over an argument list: `--frames=60` -> `Some("60")`.
 pub fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let prefix = format!("{flag}=");

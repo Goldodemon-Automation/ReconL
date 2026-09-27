@@ -376,7 +376,7 @@ pub fn cache_key(input: &CacheKeyInput) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reconl_raster::math::{look_at, perspective_rh_reversed_z};
+    use reconl_raster::math::look_at;
 
     fn camera(x: f32, y: f32, z: f32) -> Mat4 {
         look_at([x, y, z], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0])
