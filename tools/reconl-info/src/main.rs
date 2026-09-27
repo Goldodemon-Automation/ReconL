@@ -37,10 +37,13 @@ OPTIONS:
                         metal | webgpu | wasm-webgl2
   --tier=N|NAME         auto | t0..t4 | gpu-discrete | gpu-shared | cpu-ram |
                         cpu-thrifty | out-of-core
+  --adapter=SELECTOR    auto | integrated | discrete | INDEX | luid:HEX
+                        D3D11 GPU choice; auto prefers discrete, then any usable GPU
   --threads=N           worker threads; 0 lets the backend choose
   --ram-cap=SIZE        device RAM cap, e.g. 64MB
   --vram-cap=SIZE       device video memory cap
-  --disk-cap=SIZE       spill arena size cap
+  --disk-cap=SIZE       spill arena size cap (default 1 GiB when --spill=1;
+                        the ABI reads a cap of 0 as 'no disk use at all')
   --spill=0|1           allow the disk spill arena
   --spill-dir=PATH      directory the arena may use
   --help                this text
@@ -59,11 +62,12 @@ fn main() -> ExitCode {
     }
 }
 
-const FLAGS: [&str; 12] = [
+const FLAGS: [&str; 13] = [
     "--probe-only",
     "--all-devices",
     "--backend",
     "--tier",
+    "--adapter",
     "--threads",
     "--ram-cap",
     "--vram-cap",
@@ -92,6 +96,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let probed = device::probe(spill_dir.as_deref())?;
     let after_probe = reconl_host::alloc::counters();
     print_probe(&probed);
+    print_adapters()?;
     println!(
         "  host allocations during the probe: {} ({} bytes requested, {} outstanding)",
         after_probe.alloc_calls, after_probe.alloc_bytes, after_probe.live_blocks()
@@ -119,6 +124,12 @@ fn run(args: &[String]) -> Result<(), String> {
         if let Some(backend) = wanted_backend {
             one.backend = backend;
         }
+        if one.backend != abi::backend::NONE && one.backend != abi::backend::D3D11 {
+            if !one.adapter.is_auto() {
+                return Err("--adapter can only be used with the D3D11 or auto backend, not --all-devices".into());
+            }
+            one.adapter = device::AdapterSelection::Auto;
+        }
         let requested = if one.backend == abi::backend::NONE {
             "auto".to_string()
         } else {
@@ -126,7 +137,7 @@ fn run(args: &[String]) -> Result<(), String> {
         };
         match Device::create(&one) {
             Ok(device) => {
-                report_device(&device, &requested)?;
+                report_device(&device, &requested, one.adapter)?;
                 drop(device);
                 // Read *after* the release, which is the only way "gave every
                 // block back" is a measurement rather than an intention.
@@ -171,6 +182,13 @@ fn config_from(args: &[String]) -> Result<Config, String> {
         config.tier = Config::tier_from_name(name)
             .ok_or_else(|| format!("`{name}` is not a tier (see --help)"))?;
     }
+    if let Some(name) = units::value_of(args, "--adapter") {
+        config.adapter = Config::adapter_from_name(name)
+            .ok_or_else(|| format!("`{name}` is not an adapter selector (see --help)"))?;
+        if config.backend != abi::backend::NONE && config.backend != abi::backend::D3D11 {
+            return Err("--adapter can only be used with --backend=d3d11 or auto".into());
+        }
+    }
     if let Some(v) = units::value_of(args, "--threads") {
         config.threads = units::parse_u32(v, "thread count")?;
     }
@@ -189,7 +207,38 @@ fn config_from(args: &[String]) -> Result<Config, String> {
     if let Some(dir) = units::value_of(args, "--spill-dir") {
         config.spill_dir = Some(dir.to_string());
     }
+    config.resolve_disk_budget();
     Ok(config)
+}
+
+fn print_adapters() -> Result<(), String> {
+    let adapters = device::enumerate_adapters(abi::backend::D3D11)?;
+    println!("\nD3D11 adapters ({})", adapters.len());
+    if adapters.is_empty() {
+        println!("  no D3D11 adapters on this platform");
+        return Ok(());
+    }
+    println!("  {:>5} {:<11} {:<7} {:>10} {:>10} {:>8} {:>8} {:>18}  {}", "index", "type", "usable", "dedicated", "shared", "vendor", "device", "LUID", "name");
+    for (index, adapter) in adapters.iter().enumerate() {
+        let kind = match adapter.adapter_type {
+            abi::adapter_type::INTEGRATED => "integrated",
+            abi::adapter_type::DISCRETE => "discrete",
+            _ => "unknown",
+        };
+        println!(
+            "  {:>5} {:<11} {:<7} {:>10} {:>10} {:08x} {:08x} {:018x}  {}",
+            index,
+            kind,
+            if adapter.usable != 0 { "yes" } else { "no" },
+            bytes(adapter.dedicated_video_memory),
+            bytes(adapter.shared_system_memory),
+            adapter.vendor_id,
+            adapter.device_id,
+            adapter.adapter_luid,
+            names::field(&adapter.name)
+        );
+    }
+    Ok(())
 }
 
 fn print_probe(probed: &device::Probed) {
@@ -224,7 +273,7 @@ fn print_probe(probed: &device::Probed) {
     );
 }
 
-fn report_device(device: &Device, requested: &str) -> Result<(), String> {
+fn report_device(device: &Device, requested: &str, selection: device::AdapterSelection) -> Result<(), String> {
     let limits = device.limits()?;
     let memory = device.memory()?;
     let stats = device.stats()?;

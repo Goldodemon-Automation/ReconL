@@ -80,7 +80,10 @@ pub struct ArenaStats {
 pub struct SpillConfig {
     pub dir: PathBuf,
     pub file_name: String,
-    /// Hard cap on arena bytes. 0 = no cap (the caller's budget still applies).
+    /// Hard cap on the arena's live bytes, and on the file it appends to: a
+    /// write that would not fit refuses with `BudgetExceeded` and names what it
+    /// needed. 0 = no cap (the caller's budget still applies) - the ABI resolves
+    /// its own `disk_cap_bytes` of 0 to "no arena at all" before it gets here.
     pub max_bytes: u64,
     /// Seed for every checksum in this arena.
     pub seed: u64,
@@ -93,6 +96,62 @@ impl SpillConfig {
 
     pub fn path(&self) -> PathBuf {
         self.dir.join(&self.file_name)
+    }
+}
+
+/// Creates the arena's directory and opens its file, creating the file when it
+/// is not there.
+///
+/// Both [`SpillArena::open`] and [`dir_usable`] come through here, so "can an
+/// arena live at this path?" is answered by the steps an arena actually needs - a
+/// second opinion about the filesystem is a belief that can drift.
+fn open_arena_file(config: &SpillConfig) -> Result<File> {
+    std::fs::create_dir_all(&config.dir).map_err(|e| {
+        Error::new(Code::Io, "could not create the spill directory").with_context(&e.to_string())
+    })?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(config.path())
+        .map_err(|e| Error::new(Code::Io, "could not open the spill arena").with_context(&e.to_string()))
+}
+
+/// Whether an arena can live in `dir`, for a caller deciding what to tell the host
+/// before it creates a device.
+///
+/// The answer comes from [`open_arena_file`] - the same steps the device will take
+/// - and whatever this call created it takes back, so asking the question leaves no
+/// cache behind. An arena that was already there is opened and left alone.
+pub fn dir_usable(dir: impl AsRef<Path>) -> bool {
+    let config = SpillConfig::new(dir.as_ref());
+    let path = config.path();
+    let file_existed = path.exists();
+    // Measured before the open, because the open is what creates the directories:
+    // the deepest one already there is the boundary, and everything below it is
+    // this call's to give back. A host's own directory, empty or not, is not.
+    let mut boundary = config.dir.as_path();
+    while !boundary.exists() {
+        match boundary.parent() {
+            Some(parent) => boundary = parent,
+            None => break,
+        }
+    }
+    match open_arena_file(&config) {
+        Ok(_) => {
+            if !file_existed {
+                let _ = std::fs::remove_file(&path);
+                let mut created = config.dir.as_path();
+                while created != boundary && std::fs::remove_dir(created).is_ok() {
+                    match created.parent() {
+                        Some(parent) => created = parent,
+                        None => break,
+                    }
+                }
+            }
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -119,16 +178,7 @@ pub struct SpillArena {
 impl SpillArena {
     /// Opens (or creates) the arena and recovers whatever is intact.
     pub fn open(config: SpillConfig) -> Result<Self> {
-        std::fs::create_dir_all(&config.dir).map_err(|e| {
-            Error::new(Code::Io, "could not create the spill directory").with_context(&e.to_string())
-        })?;
-        let path = config.path();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .map_err(|e| Error::new(Code::Io, "could not open the spill arena").with_context(&e.to_string()))?;
+        let mut file = open_arena_file(&config)?;
 
         let len = file
             .metadata()
@@ -291,8 +341,9 @@ impl SpillArena {
         let needed = RECORD_HEADER_BYTES + payload.len() as u64;
 
         // Make room before writing, so a full arena cannot produce a torn record
-        // as part of normal operation.
-        self.evict_for(needed);
+        // as part of normal operation - and so a record the cap cannot hold is
+        // refused with its own numbers instead of written past the cap.
+        self.make_room(needed)?;
 
         let mut header = [0u8; RECORD_HEADER_BYTES as usize];
         header[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
@@ -367,14 +418,19 @@ impl SpillArena {
     }
 
     /// Drops least-recently-used entries until `needed` bytes fit under the cap.
-    pub fn evict_for(&mut self, needed: u64) {
+    ///
+    /// Returns whether the arena can now hold `needed` - always true when there
+    /// is no cap. A caller that is about to write has to read it: an entry larger
+    /// than the cap cannot be made to fit by evicting anything, and a caller that
+    /// ignored that answer is how a cap gets exceeded.
+    pub fn evict_for(&mut self, needed: u64) -> bool {
         let cap = self.config.max_bytes;
         if cap == 0 {
-            return;
+            return true;
         }
         let mut current = self.recompute_bytes();
         if current + needed <= cap {
-            return;
+            return true;
         }
         let mut order: Vec<(u64, u64)> = self.index.iter().map(|(k, v)| (*k, v.last_used)).collect();
         order.sort_by_key(|(_, used)| *used);
@@ -391,6 +447,53 @@ impl SpillArena {
             }
         }
         self.stats.bytes = self.recompute_bytes();
+        self.stats.bytes + needed <= cap
+    }
+
+    /// Makes room for `needed` bytes under the cap before a write, or refuses.
+    ///
+    /// Evicts least-recently-used entries, compacts the file when the *append*
+    /// would otherwise push it past the cap, and refuses - naming what it needed
+    /// against what it is allowed - when the arena cannot hold the record at all.
+    ///
+    /// A caller with a whole frame to write calls this **once, before it writes
+    /// any of it**: the frame's own rows are then the most recently used entries,
+    /// so the eviction its own writes can still trigger takes other frames', and
+    /// no part of the frame it is writing is thrown away to make room for the
+    /// rest of it.
+    pub fn make_room(&mut self, needed: u64) -> Result<()> {
+        let cap = self.config.max_bytes;
+        if cap == 0 {
+            return Ok(());
+        }
+        // The cap bounds the *file*, and the file is its own header plus the
+        // records in it - so eviction has to make room for the header too. Asking
+        // for `needed` alone leaves the header's bytes unaccounted for and a write
+        // is refused that one more eviction would have fitted.
+        if !self.evict_for(needed.saturating_add(HEADER_BYTES)) {
+            return Err(self.cannot_hold(needed, cap));
+        }
+        if self.write_offset + needed > cap {
+            // Dead bytes are what push an append past the cap. A compaction
+            // rewrites the live entries only, which brings the file back under
+            // it; if even an empty file could not hold the record, refuse.
+            self.compact()?;
+            if self.write_offset + needed > cap {
+                return Err(self.cannot_hold(needed, cap));
+            }
+        }
+        Ok(())
+    }
+
+    /// The refusal for a record the cap cannot hold, with the numbers a host
+    /// needs: what was asked for, what the arena holds, and what it is allowed.
+    fn cannot_hold(&self, needed: u64, cap: u64) -> Error {
+        Error::new(Code::BudgetExceeded, "the spill arena cannot hold this record within its disk cap")
+            .with_context(&format!(
+                "needs {needed} bytes with {} live in {} entries, against a {cap} byte cap",
+                self.recompute_bytes(),
+                self.index.len()
+            ))
     }
 
     /// Rewrites the file with only the live entries, in one pass.
@@ -638,15 +741,20 @@ mod tests {
     fn eviction_honours_the_cap_and_counts_what_it_dropped() {
         let dir = temp_dir("evict");
         let mut config = SpillConfig::new(&dir);
-        config.max_bytes = 200;
+        // A cap the appends do not fit in but individual records do: the file
+        // header counts against the cap, so it has to be room for it too.
+        config.max_bytes = 400;
         let mut arena = SpillArena::open(config).unwrap();
+        // `put` is what enforces the cap: no help from the caller, because a
+        // writer that has to remember to evict is a writer that can forget.
         for key in 0..20u64 {
             arena.put(key, &vec![key as u8; 24]).unwrap();
-            arena.evict_for(0);
         }
         let stats = arena.stats();
-        assert!(stats.bytes <= 200, "arena grew past its cap: {} bytes", stats.bytes);
-        assert!(stats.evictions > 0, "nothing was evicted at a 200 byte cap");
+        assert!(stats.bytes <= 400, "arena grew past its cap: {} bytes", stats.bytes);
+        assert!(stats.evictions > 0, "nothing was evicted at a 400 byte cap");
+        let written = std::fs::metadata(arena.path()).unwrap().len();
+        assert!(written <= 400, "the file grew past the cap: {written} bytes");
         // Whatever survived must still read back correctly.
         let mut out = Vec::new();
         let live: Vec<u64> = arena.index.keys().copied().collect();
@@ -654,6 +762,80 @@ mod tests {
             assert_eq!(arena.get(key, &mut out), Hit::Fresh);
             assert_eq!(out.len(), 24);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_record_the_cap_cannot_hold_is_refused_rather_than_written_past_it() {
+        // The cap is the host's disk budget, so a record that does not fit is a
+        // refusal with its own numbers - not a record written anyway. Writing it
+        // anyway is how an arena held under a 2 MiB disk budget ends up 26 MiB.
+        let dir = temp_dir("overcap");
+        let mut config = SpillConfig::new(&dir);
+        config.max_bytes = 200;
+        let mut arena = SpillArena::open(config).unwrap();
+
+        let err = arena
+            .put(1, &vec![0xABu8; 512])
+            .expect_err("a 536 byte record cannot fit a 200 byte cap");
+        assert_eq!(err.code, Code::BudgetExceeded, "{err}");
+        let text = err.to_string();
+        let record = RECORD_HEADER_BYTES + 512;
+        assert!(
+            text.contains(&record.to_string()) && text.contains("200"),
+            "a refusal has to name what it needed against what it may use: {text}"
+        );
+        assert_eq!(arena.len(), 0, "the refused record must not be indexed as live");
+        assert_eq!(arena.stats().bytes, 0);
+        let written = std::fs::metadata(arena.path()).unwrap().len();
+        assert!(written <= 200, "the arena wrote {written} bytes against a 200 byte cap");
+
+        // The refusal is not a poisoned arena: a record that does fit goes in and
+        // comes back, which is a caller that keeps going needs - and the file is
+        // still inside the cap afterwards.
+        arena.put(2, b"small").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(arena.get(2, &mut out), Hit::Fresh);
+        assert_eq!(out, b"small");
+        let written = std::fs::metadata(arena.path()).unwrap().len();
+        assert!(written <= 200, "the arena wrote {written} bytes against a 200 byte cap");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_through_a_tight_cap_compact_instead_of_growing_the_file() {
+        // Live bytes under the cap is the easy half; the file has to stay under it
+        // too, or a long run writes its way past the budget through dead records
+        // alone. This writes 40 records - 29 KiB of appends - through a 4 KiB cap
+        // and checks the file after every one of them.
+        let dir = temp_dir("bounded");
+        let mut config = SpillConfig::new(&dir);
+        config.max_bytes = 4096;
+        let mut arena = SpillArena::open(config).unwrap();
+        let record = RECORD_HEADER_BYTES + 700; // 724 bytes with its header
+        let payload = vec![9u8; 700];
+        // How many of them a 4096 byte cap holds, file header included: the file
+        // is what the cap bounds, and the header is part of the file.
+        let live = (4096 - HEADER_BYTES) / record;
+        for key in 0..40u64 {
+            arena.put(key, &payload).unwrap();
+            let written = std::fs::metadata(arena.path()).unwrap().len();
+            assert!(
+                written <= 4096,
+                "append {key} grew the file to {written} bytes against a 4096 byte cap"
+            );
+        }
+        let stats = arena.stats();
+        assert_eq!(stats.entries as u64, live, "a 4096 byte cap holds {live} of these records");
+        assert!(stats.bytes + HEADER_BYTES <= 4096, "{} live bytes plus the header exceed the cap", stats.bytes);
+        assert_eq!(
+            stats.evictions,
+            40 - stats.entries as u64,
+            "every append past the cap has to take the oldest record with it"
+        );
+        let mut out = Vec::new();
+        assert_eq!(arena.get(39, &mut out), Hit::Fresh, "the newest record must survive");
+        assert_eq!(arena.get(0, &mut out), Hit::Miss, "the oldest must have been evicted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -711,6 +893,44 @@ mod tests {
         let arena = SpillArena::open(SpillConfig::new(&dir)).unwrap();
         assert!(arena.is_empty());
         assert_eq!(arena.stats().corrupt, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe's question is the device's question, so it is asked of the device's
+    /// own open path - and asking it must not cost the host anything.
+    #[test]
+    fn dir_usable_answers_the_question_the_device_will_ask() {
+        let dir = temp_dir("usable");
+        std::fs::create_dir_all(dir.join("good")).unwrap();
+        assert!(dir_usable(dir.join("good")));
+        assert!(dir.join("good").is_dir(), "a directory the caller had is not this call's to remove");
+        assert!(!dir.join("good").join("arena.rcls").exists(), "the probe leaves no arena behind");
+
+        // An arena that is already there is opened, not replaced.
+        {
+            let mut arena = SpillArena::open(SpillConfig::new(dir.join("good"))).unwrap();
+            arena.put(7, b"a cached payload the probe must not disturb").unwrap();
+            arena.flush().unwrap();
+        }
+        assert!(dir_usable(dir.join("good")));
+        assert!(
+            std::fs::metadata(dir.join("good").join("arena.rcls")).unwrap().len() > HEADER_BYTES,
+            "a probe does not truncate an arena that is already there"
+        );
+
+        // A path that is a file is not a place an arena can land, and neither is
+        // anything below it: the create the device would run cannot make a
+        // directory inside a file. The second is the case a "can I write here?"
+        // walk up the path gets wrong.
+        std::fs::write(dir.join("blocker"), b"a file").unwrap();
+        assert!(!dir_usable(dir.join("blocker")));
+        assert!(!dir_usable(dir.join("blocker").join("sub")));
+
+        // A directory that is not there yet is usable, and probing it gives back
+        // every directory the create made.
+        assert!(dir_usable(dir.join("deep").join("new")));
+        assert!(!dir.join("deep").exists(), "the probe gives back the directories it made");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

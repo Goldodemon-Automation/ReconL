@@ -27,7 +27,7 @@ pub extern "C" fn reconlVersion(major: *mut u32, minor: *mut u32, patch: *mut u3
     }
 }
 
-const VERSION_STRING: &[u8] = b"0.1.0\0";
+const VERSION_STRING: &[u8] = b"0.1.1\0";
 
 #[no_mangle]
 pub extern "C" fn reconlVersionString() -> *const i8 {

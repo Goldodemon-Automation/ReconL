@@ -727,13 +727,11 @@ fn device_header_points_at_the_live_device() {
     }
 }
 
-/// `reconl_backends.h` declares the three `ReconL*Desc` structs and this
-/// revision says plainly that `ReconLDeviceDesc::backend_desc` is reserved:
-/// accepted and never read. That is a negative contract, so it needs a pin -
-/// a descriptor at address 8 faults if anything dereferences it, and the device
-/// that comes back must be the one a host with no descriptor gets.
+/// SoftCPU and Null descriptors remain reserved even though D3D11 adapter
+/// selection is now active. A wildcard pointer to the reserved Null descriptor
+/// must still be accepted without being read.
 #[test]
-fn a_reserved_backend_descriptor_is_accepted_and_never_read() {
+fn reserved_non_d3d11_backend_descriptors_are_never_read() {
     fn limits(device: *mut reconl::DeviceHandle) -> abi::ReconLDeviceLimits {
         let mut l: abi::ReconLDeviceLimits = unsafe { core::mem::zeroed() };
         l.base = hdr::<abi::ReconLDeviceLimits>();
@@ -742,24 +740,161 @@ fn a_reserved_backend_descriptor_is_accepted_and_never_read() {
     }
 
     let mut without: *mut reconl::DeviceHandle = core::ptr::null_mut();
-    let desc = device_desc(test_allocator());
+    let desc = device_desc_for(test_allocator(), abi::backend::NULL, 2);
     assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut without) }, abi::result::OK);
 
     let mut with_wild: *mut reconl::DeviceHandle = core::ptr::null_mut();
-    let mut desc = device_desc(test_allocator());
+    let mut desc = device_desc_for(test_allocator(), abi::backend::NULL, 2);
     desc.backend_desc = 8usize as *const core::ffi::c_void;
     assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut with_wild) }, abi::result::OK);
 
     let a = limits(without);
     let b = limits(with_wild);
-    assert_eq!(a.backend, b.backend, "the descriptor must not choose a backend");
-    assert_eq!(a.caps, b.caps, "the descriptor must not change the caps");
+    assert_eq!(a.backend, abi::backend::NULL);
+    assert_eq!(b.backend, abi::backend::NULL);
+    assert_eq!(a.caps, b.caps, "the reserved descriptor must not change Null caps");
     assert_eq!(a.worker_threads_max, b.worker_threads_max);
     assert_eq!(a.tile_size_min, b.tile_size_min);
     assert_eq!(a.max_allocation_bytes, b.max_allocation_bytes);
     unsafe {
         reconl::reconlRelease(without as *mut core::ffi::c_void);
         reconl::reconlRelease(with_wild as *mut core::ffi::c_void);
+    }
+}
+
+#[test]
+fn d3d11_backend_descriptor_validates_and_reads_adapter_selection() {
+    fn make(selection: abi::ReconLD3D11Desc) -> (i32, *mut reconl::DeviceHandle) {
+        let mut desc = device_desc_for(test_allocator(), abi::backend::D3D11, 1);
+        desc.backend_desc = &selection as *const _ as *const core::ffi::c_void;
+        let mut device = core::ptr::null_mut();
+        let result = unsafe { reconl::reconlCreateDevice(&desc, &mut device) };
+        (result, device)
+    }
+
+    let mut selection = abi::ReconLD3D11Desc {
+        base: hdr::<abi::ReconLD3D11Desc>(),
+        adapter_index: 0,
+        feature_level_min: 0,
+        debug_layer: 0,
+        allow_warp: 0,
+        prefer_flip_model: 0,
+        reserved: 0,
+        requested_vram_cap: 0,
+        adapter_preference: abi::adapter_preference::AUTO,
+        reserved2: 0,
+        adapter_luid: 0,
+    };
+    let hardware_available = d3d11_usable();
+
+    // ABI 100 hosts may still pass only the original descriptor prefix. Its
+    // absent preference field means AUTO, even if the storage after the prefix
+    // happens to contain a different value.
+    selection.base.struct_size = abi::ReconLD3D11Desc::PREFIX_SIZE;
+    selection.adapter_preference = 99;
+    let (result, device) = make(selection);
+    if hardware_available {
+        assert_eq!(result, abi::result::OK, "the legacy D3D11 prefix defaults to AUTO");
+        unsafe { reconl::reconlRelease(device as *mut core::ffi::c_void) };
+    } else {
+        // A valid legacy prefix is parsed before the platform reports that
+        // D3D11 itself is unavailable.
+        assert_eq!(result, abi::result::BACKEND_UNAVAILABLE);
+        assert!(device.is_null());
+        return;
+    }
+
+    selection.base = hdr::<abi::ReconLD3D11Desc>();
+    selection.adapter_preference = abi::adapter_preference::AUTO;
+    let mut count = 0u32;
+    assert_eq!(unsafe { reconl::reconlEnumerateAdapters(abi::backend::D3D11, core::ptr::null_mut(), 0, &mut count) }, abi::result::OK);
+    assert!(count > 0);
+    let mut adapters = vec![abi::ReconLAdapterInfo::default(); count as usize];
+    assert_eq!(unsafe { reconl::reconlEnumerateAdapters(abi::backend::D3D11, adapters.as_mut_ptr(), count, &mut count) }, abi::result::OK);
+    let chosen = adapters.iter().find(|a| a.usable != 0).expect("a usable adapter");
+
+    selection.adapter_preference = abi::adapter_preference::LUID;
+    selection.adapter_luid = chosen.adapter_luid;
+    let (result, device) = make(selection);
+    assert_eq!(result, abi::result::OK, "a live enumerated LUID should create");
+    let mut limits: abi::ReconLDeviceLimits = unsafe { core::mem::zeroed() };
+    limits.base = hdr::<abi::ReconLDeviceLimits>();
+    assert_eq!(unsafe { reconl::reconlGetDeviceLimits(device, &mut limits) }, abi::result::OK);
+    let device_name = limits.device_name.iter().copied().take_while(|b| *b != 0).collect::<Vec<_>>();
+    let adapter_name = chosen.name.iter().copied().take_while(|b| *b != 0).collect::<Vec<_>>();
+    assert_eq!(device_name, adapter_name, "the LUID-selected GPU name matches the enumerated entry");
+    unsafe { reconl::reconlRelease(device as *mut core::ffi::c_void) };
+
+    let mut missing_luid = 0u64;
+    while adapters.iter().any(|adapter| adapter.adapter_luid == missing_luid) {
+        missing_luid += 1;
+    }
+    selection.adapter_luid = missing_luid;
+    let (result, device) = make(selection);
+    assert_eq!(result, abi::result::BACKEND_UNAVAILABLE);
+    assert!(device.is_null());
+}
+
+#[test]
+fn d3d11_backend_descriptor_rejects_bad_type_and_unknown_preference() {
+    let mut selection = abi::ReconLD3D11Desc {
+        base: hdr::<abi::ReconLD3D11Desc>(),
+        adapter_index: 0,
+        feature_level_min: 0,
+        debug_layer: 0,
+        allow_warp: 0,
+        prefer_flip_model: 0,
+        reserved: 0,
+        requested_vram_cap: 0,
+        adapter_preference: abi::adapter_preference::AUTO,
+        reserved2: 0,
+        adapter_luid: 0,
+    };
+    let mut desc = device_desc_for(test_allocator(), abi::backend::D3D11, 1);
+    desc.backend_desc = &selection as *const _ as *const core::ffi::c_void;
+    let mut device = core::ptr::null_mut();
+
+    selection.base.struct_type = abi::struct_type::NULL_DESC;
+    assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut device) }, abi::result::WRONG_STRUCT_TYPE);
+    assert!(device.is_null());
+
+    selection.base = hdr::<abi::ReconLD3D11Desc>();
+    selection.base.struct_size = abi::ReconLD3D11Desc::PREFIX_SIZE - 1;
+    assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut device) }, abi::result::STRUCT_SIZE);
+    assert!(device.is_null());
+
+    selection.base = hdr::<abi::ReconLD3D11Desc>();
+    selection.adapter_preference = abi::adapter_preference::INDEX;
+    selection.adapter_index = -1;
+    assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut device) }, abi::result::INVALID_ARGUMENT);
+    assert!(device.is_null());
+
+    selection.adapter_preference = 99;
+    assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut device) }, abi::result::INVALID_ARGUMENT);
+    assert!(device.is_null());
+
+    selection.adapter_preference = abi::adapter_preference::LUID;
+    selection.base.struct_size = abi::ReconLD3D11Desc::PREFERENCE_SIZE;
+    assert_eq!(unsafe { reconl::reconlCreateDevice(&desc, &mut device) }, abi::result::STRUCT_SIZE);
+    assert!(device.is_null());
+}
+
+#[test]
+fn adapter_enumeration_checks_arguments_and_reports_non_windows_empty_lists() {
+    let mut count = 7u32;
+    assert_eq!(unsafe { reconl::reconlEnumerateAdapters(abi::backend::D3D11, core::ptr::null_mut(), 1, &mut count) }, abi::result::INVALID_ARGUMENT);
+    assert_eq!(count, 0, "failure clears the reported count");
+    assert_eq!(unsafe { reconl::reconlEnumerateAdapters(abi::backend::SOFT_CPU, core::ptr::null_mut(), 0, &mut count) }, abi::result::NOT_SUPPORTED);
+    let mut first = abi::ReconLAdapterInfo::default();
+    assert_eq!(unsafe { reconl::reconlEnumerateAdapters(abi::backend::D3D11, &mut first, 1, &mut count) }, abi::result::OK);
+    if count > 0 {
+        assert_eq!(first.base.struct_type, abi::struct_type::ADAPTER_INFO);
+        assert_eq!(first.backend, abi::backend::D3D11);
+    }
+    #[cfg(not(windows))]
+    {
+        assert_eq!(unsafe { reconl::reconlEnumerateAdapters(abi::backend::D3D11, core::ptr::null_mut(), 0, &mut count) }, abi::result::OK);
+        assert_eq!(count, 0);
     }
 }
 

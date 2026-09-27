@@ -67,7 +67,13 @@ steady state.
 *Measured by:* `reconl-bench`'s `allocations` line, which counts the host's own
 allocator ledger: 60 measured frames of the 64x64 reference scene report **0
 allocator calls per frame** at T2 and 0 on `d3d11` on this machine (8 and 2
-before the lists above had owners).
+before the lists above had owners), and 0 at 256x256 and 512x512.
+The one path that is not at zero is measured too: a frame the RAM cap cannot hold,
+streamed through the disk arena at T4, reports 3 allocations of 6144 bytes over 4
+measured frames at 512x512 under a 2 MiB cap (0.75 per frame), where the same
+frame with a cap that holds it reports 0. The rule above is not met by the
+streaming path - it is the one place a host pays an allocation inside a frame - and
+that is recorded here rather than averaged away.
 *Pinned by:* `tools/reconl-bench/tests/cli.rs::a_steady_state_frame_allocates_nothing`,
 and for the rasteriser's own tables `raster/tests/render.rs`.
 
@@ -125,6 +131,7 @@ Three layers, cheapest first:
 | Unit tests | one rule, in isolation (fixed-point, math, bias table) | `cargo test` |
 | Golden images | the whole reference scene, byte for byte, from two independent producers | `reconl-diff compare`, `reconl-bench --png` |
 | Cross-tier comparison | a hardware backend agrees with the reference within a *measured* tolerance, with the divergence confined to the shadow's edge | `ffi/tests/tiers.rs`, `reconl-diff compare --tolerance=48` |
+| Streamed vs resident | a frame cut into bands through the arena reproduces a resident frame everywhere except where the band cut's rounding moves a 1/256-px vertex snap: 2 of 262144 pixels at 512x512, worst channel delta 46, at a shadow edge | `reconl-diff compare`, `backends/soft-cpu/tests/render.rs` |
 
 The tolerance is not chosen. For the shadowed reference scene, `soft-cpu` and
 `d3d11` differ on 14 of 4096 pixels with a worst channel delta of 46, all within
@@ -132,3 +139,13 @@ The tolerance is not chosen. For the shadowed reference scene, `soft-cpu` and
 documented setting for the cross-tier comparison is therefore `--tolerance=48`
 inside the 1% budget. Widening the tolerance to absorb a divergence is not a fix,
 it is a deletion of the evidence.
+
+The band cut's own difference is the same class and smaller. At 512x512, same tier
+and same shadow mode, a streamed frame and a resident one differ on 2 of 262144
+pixels with the same worst channel delta of 46, and with `--shadows=off` the same
+pair is byte-identical - so what a band changes is a shadow-edge pixel, not the
+frame. It is not forced to zero because a band renders through a re-projected clip
+space rather than an integer row crop, so its vertices reach the rasteriser's
+snap through different arithmetic (`backends/soft-cpu/src/lib.rs::band_projection`
+states the measurement and what an exact crop would need); `--tolerance=48`
+absorbs it.

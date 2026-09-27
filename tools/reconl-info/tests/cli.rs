@@ -32,6 +32,7 @@ fn the_probe_reports_the_machine_and_allocates_nothing() {
         stdout.contains("host allocations during the probe: 0"),
         "the probe must not allocate:\n{stdout}"
     );
+    assert!(stdout.contains("D3D11 adapters ("), "the adapter table should be listed:\n{stdout}");
 }
 
 /// A device report names the tier it resolved, the limits it will honour, and
@@ -64,6 +65,21 @@ fn a_refused_device_is_reported_with_its_code() {
 }
 
 /// Options are checked, so a typo cannot quietly measure something else.
+#[test]
+fn adapter_preferences_and_luids_are_reported_and_validated() {
+    let (stdout, stderr, code) = info(&["--probe-only", "--adapter=integrated"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("D3D11 adapters ("), "{stdout}");
+
+    let (_, stderr, code) = info(&["--probe-only", "--adapter=igpux"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("not an adapter selector"), "{stderr}");
+
+    let (_, stderr, code) = info(&["--backend=soft-cpu", "--adapter=integrated"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("only be used with"), "{stderr}");
+}
+
 #[test]
 fn a_mistyped_option_is_refused() {
     let (_, stderr, code) = info(&["--backend=softcpu7"]);

@@ -31,14 +31,24 @@
 
 pub mod policy;
 
+/// Where a frame's own targets live, and what T4 does when they do not fit RAM.
+///
+/// A separate module because it is a separate concern from rendering: the frame's
+/// targets are either one resident `Target` or bands in the disk arena, and that
+/// choice has its own row geometry, arena keys, readback and refusal. Everything
+/// in it is `pub(super)` for the device above: the renderer asks
+/// `ensure_frame_targets` which of the two it is in and never learns more.
+mod stream;
+
 pub use policy::{Emptiness, FrameClassifier, FramePolicy};
+use stream::{read_bands_depth, read_bands_into, FrameStream};
 
 use reconl_contract::{FrameInput, ShadowRequest};
 use reconl_core::alloc::{HostAlloc, HostVec};
 use reconl_core::budget::{Budget, Reservation};
 use reconl_core::error::{Code, Error, Result};
 use reconl_core::stats::{Counters, FrameNumbers, ShadowCounters};
-use reconl_core::tier::{caps, rules, shadow_plan, Backend, ShadowFilter, ShadowPlan, Tier, TierReason};
+use reconl_core::tier::{caps, filter_caps, rules, shadow_plan, Backend, ShadowFilter, ShadowPlan, Tier, TierReason};
 use reconl_raster::math;
 use reconl_raster::shade::{LightSet, ShadowLookup, ShadowMapRef, SurfaceShader};
 use reconl_raster::tile::RasterConfig;
@@ -66,8 +76,6 @@ pub struct SoftCpuConfig {
     pub frame_policy: FramePolicy,
     /// Cascade split lambda: 0 = uniform, 1 = logarithmic.
     pub split_lambda: f32,
-    /// Cap on the arena. `0` = the budget's disk cap only.
-    pub arena_bytes: u64,
     pub shadow: ShadowRequest,
 }
 
@@ -84,7 +92,6 @@ impl Default for SoftCpuConfig {
             spill_dir: None,
             frame_policy: FramePolicy::default(),
             split_lambda: 0.75,
-            arena_bytes: 0,
             shadow: ShadowRequest::default(),
         }
     }
@@ -136,6 +143,13 @@ pub struct SoftCpuDevice {
     /// backend's lighting state stamped into it, cleared by the next frame's
     /// fill, so nothing here outlives the frame whose data it copies.
     colors: HostVec<DrawItem<'static>>,
+    /// The frame's own targets, when they do not fit the RAM cap: cut into bands
+    /// in the disk arena, one band resident. `None` is the ordinary case - the
+    /// frame lives in `color`, as it does on every other tier.
+    stream: Option<FrameStream>,
+    /// The number of the last frame that streamed: part of every band key, so a
+    /// band can never be read back as another frame's rows.
+    stream_serial: u64,
     plan: Option<ShadowPlan>,
     arena: Option<SpillArena>,
     arena_reservation: Option<Reservation>,
@@ -183,6 +197,8 @@ impl SoftCpuDevice {
             maps: HostVec::new(alloc),
             cascade: HostVec::new(alloc),
             colors: HostVec::new(alloc),
+            stream: None,
+            stream_serial: 0,
             map_size: 0,
             map_count: 0,
             maps_valid: [false; shadow::MAX_CASCADES],
@@ -274,9 +290,15 @@ impl SoftCpuDevice {
     }
 
     /// Resident bytes this device is accountable for.
+    ///
+    /// A streamed frame's band is resident and the rest of it is on disk: the
+    /// band's reservation is what the frame costs RAM, and the arena it is cut
+    /// into is counted as disk by the budget that opened it. A device holding
+    /// both would be reporting a frame it never managed to make fit.
     pub fn resident_bytes(&self) -> u64 {
         self.color_reservation.as_ref().map(|r| r.bytes()).unwrap_or(0)
             + self.map_reservation.as_ref().map(|r| r.bytes()).unwrap_or(0)
+            + self.stream.as_ref().map(|s| s.resident_bytes()).unwrap_or(0)
     }
 
     /// Applies a tier the *device* decided on: the same backend at a lower
@@ -296,24 +318,6 @@ impl SoftCpuDevice {
         for slot in self.maps_valid.iter_mut() {
             *slot = false;
         }
-    }
-
-    fn ensure_targets(&mut self, width: u32, height: u32) -> Result<()> {
-        if width == 0 || height == 0 {
-            return Err(Error::new(Code::InvalidArgument, "zero-sized frame"));
-        }
-        if self.color.width == width && self.color.height == height && self.color.depth.is_some() {
-            return Ok(());
-        }
-        let bytes = (width as u64) * (height as u64) * 4 * 2;
-        let reservation = self.budget.reserve_ram(bytes).map_err(|e| {
-            self.counters.safe_path_events += 1;
-            e
-        })?;
-        let target = Target::new_color(self.alloc, width, height)?.with_depth()?;
-        self.color = target;
-        self.color_reservation = Some(reservation);
-        Ok(())
     }
 
     /// Allocates the cascade set the plan decided on, reserving what the plan
@@ -415,26 +419,47 @@ impl SoftCpuDevice {
 
     fn ensure_arena(&mut self) -> Option<&mut SpillArena> {
         if self.arena.is_none() {
-            if !self.budget.caps().allow_disk_spill {
+            // One owner for the arena's cap: the host's `disk_cap_bytes` is a
+            // field of the budget, and the budget is what the arena is opened
+            // against. A second copy in the config could disagree with it, and the
+            // copy is the one that would be wrong.
+            let declared = self.budget.caps();
+            if !declared.allow_disk_spill {
+                return None;
+            }
+            // `disk_cap_bytes` of 0 is the header's "no disk use at all": opting
+            // in to a spill without budgeting disk buys no arena, rather than an
+            // unbounded one - which is what makes the budget a budget. The refusal
+            // names the field a host has to set.
+            if declared.disk == 0 {
+                self.arena_error = Some(
+                    Error::new(
+                        Code::BudgetExceeded,
+                        "this device has no disk budget, so the spill arena is not opened",
+                    )
+                    .with_context(
+                        "set ReconLMemoryBudget.disk_cap_bytes above 0 (with allow_disk_spill = 1) to use the disk tier",
+                    ),
+                );
                 return None;
             }
             let dir = self.config.spill_dir.clone().unwrap_or_else(reconl_resource::spill::default_spill_dir);
             let mut config = SpillConfig::new(dir);
-            config.max_bytes = self.config.arena_bytes;
+            config.max_bytes = declared.disk;
             config.seed = 0x5243_4C53_0000_0001 ^ (u64::from(self.config.seed) << 1);
             match SpillArena::open(config) {
                 Ok(arena) => {
-                    // Account for the arena up front; a refused reservation means
-                    // the host capped disk use below the arena, so the RAM-only
-                    // path is used and the refusal is counted by the budget.
-                    if self.config.arena_bytes > 0 {
-                        match self.budget.reserve_disk(self.config.arena_bytes) {
-                            Ok(r) => self.arena_reservation = Some(r),
-                            Err(e) => {
-                                self.arena_error = Some(e);
-                                self.counters.safe_path_events += 1;
-                                return None;
-                            }
+                    // Account for the arena up front: it is the same number the
+                    // host declared, so this reservation is the arena's own cap
+                    // charged once. A refusal means the budget is tighter than
+                    // the config it was built from, and the RAM-only path is used
+                    // with the refusal counted.
+                    match self.budget.reserve_disk(declared.disk) {
+                        Ok(r) => self.arena_reservation = Some(r),
+                        Err(e) => {
+                            self.arena_error = Some(e);
+                            self.counters.safe_path_events += 1;
+                            return None;
                         }
                     }
                     self.arena = Some(arena);
@@ -488,7 +513,8 @@ impl SoftCpuDevice {
             ..Default::default()
         };
 
-        self.ensure_targets(input.width, input.height)?;
+        self.ensure_frame_targets(input.width, input.height)?;
+        let streamed = self.stream.is_some();
 
         let request = input.shadow;
         let shadow_wanted = request.enabled && self.plan_capable();
@@ -718,6 +744,8 @@ impl SoftCpuDevice {
         let emptiness = self.classifier.classify(input.draws.len(), count_triangles(input.draws));
         let clears_anything = input.clear_color_enabled || input.clear_depth_enabled;
         let mut color_stats = RasterStats::default();
+        let mut stream_io = 0u64;
+        let mut stream_checksum = 0u64;
 
         if !self.classifier.may_skip_pass(emptiness, clears_anything) {
             // The fits are recomputed here from the same inputs as the shadow
@@ -787,20 +815,37 @@ impl SoftCpuDevice {
                 &mut frame,
             )?;
 
-            let rasterize_start = Instant::now();
-            // The host's viewport is in frame pixels; this tier may be rendering
-            // a scaled target, so resolve it against that target. `(0, 0)` - the
-            // documented default - resolves to the whole target.
-            let render = rendered_viewport(
-                input.viewport,
-                (input.width, input.height),
-                (self.color.width, self.color.height),
-            );
-            let stats = self.raster.rasterize(&mut self.color, self.colors.as_slice(), render)?;
-            accumulate_raster(&mut color_stats, &stats);
-            let _ = rasterize_start;
-
             self.shadows.shadowed_lights = count_shadowed_lights(&input.lights);
+
+            let rasterize_start = Instant::now();
+            if streamed {
+                // The frame is not in RAM to draw into: its bands are, one at a
+                // time, and the colour list is warped into each band's own
+                // projection as the band is drawn (`stream_bands`).
+                let (io, hash) = self.stream_bands(input, true, &mut color_stats)?;
+                stream_io += io;
+                stream_checksum = hash;
+            } else {
+                // The host's viewport is in frame pixels; this tier may be
+                // rendering a scaled target, so resolve it against that target.
+                // `(0, 0)` - the documented default - resolves to the whole
+                // target.
+                let render = rendered_viewport(
+                    input.viewport,
+                    (input.width, input.height),
+                    (self.color.width, self.color.height),
+                );
+                let stats = self.raster.rasterize(&mut self.color, self.colors.as_slice(), render)?;
+                accumulate_raster(&mut color_stats, &stats);
+            }
+            let _ = rasterize_start;
+        } else if streamed {
+            // A frame the classifier skipped still has to be *something* in the
+            // arena: its bands are written cleared, which is what a resident
+            // target would have been left holding.
+            let (io, hash) = self.stream_bands(input, false, &mut color_stats)?;
+            stream_io += io;
+            stream_checksum = hash;
         }
 
         let raster_ns = raster_start.elapsed().as_nanos() as u64;
@@ -819,12 +864,24 @@ impl SoftCpuDevice {
 
         // The frame fingerprint the audit compares, computed only when it is
         // asked for: it is a full pass over the colour target and nothing else
-        // reads it.
+        // reads it. A streamed frame was fingerprinted as its bands were written,
+        // and the number is the same one: FNV-1a over the same bytes, in the same
+        // row order.
         self.color_checksum = if input.checksum {
-            checksum_f32(self.color.color_slice().unwrap_or(&[]))
+            if streamed {
+                stream_checksum
+            } else {
+                checksum_f32(self.color.color_slice().unwrap_or(&[]))
+            }
         } else {
             0
         };
+
+        // What the frame moved through the arena. Counted here rather than in the
+        // band loop, so a band's bytes are counted once and on the frame they
+        // belong to.
+        self.spill_io_bytes += stream_io;
+        frame.spill_io_bytes += stream_io;
 
         // Classification and the frame-time ladder. Both are telemetry: neither
         // changes a pixel, they only decide what gets counted and what steps
@@ -846,17 +903,23 @@ impl SoftCpuDevice {
     /// targets, the rasteriser's tile storage and the cascade maps are all taken
     /// here, so `Submit` reuses them instead of growing. A refused reservation
     /// is reported (and counted) rather than taken out mid-frame.
-    pub fn prepare_frame(&mut self, width: u32, height: u32) -> Result<()> {
-        self.ensure_targets(width, height)?;
+    ///
+    /// The shadow request is the *frame's*, not the device's: a plan reserved from
+    /// one request and rendered from another re-allocates the cascade set on the
+    /// frame that renders with it, and that allocation is what the frozen and
+    /// cached cascade paths are supposed to make unnecessary - the maps they were
+    /// holding are dropped by the re-allocation before either path can reuse them.
+    pub fn prepare_frame(&mut self, width: u32, height: u32, shadow: &ShadowRequest) -> Result<()> {
+        self.ensure_frame_targets(width, height)?;
         let vertices = 1usize << 16;
         let indices = 1usize << 16;
         self.raster.prepare(width, height, vertices, indices)?;
-        if self.config.shadow.enabled {
+        if shadow.enabled {
             let plan = shadow_plan(
                 self.tier,
-                self.config.shadow.cascades,
-                self.config.shadow.texel_budget_bytes,
-                self.config.shadow.filter,
+                shadow.cascades,
+                shadow.texel_budget_bytes,
+                shadow.filter,
                 self.caps(),
             );
             self.ensure_maps(&plan)?;
@@ -884,8 +947,21 @@ impl SoftCpuDevice {
     /// `width * height` values, for frame generation.
     ///
     /// The reference tier's depth is a slice it already owns, so this costs a
-    /// copy and no driver round trip - the same buffer the rasteriser wrote.
+    /// copy and no driver round trip - the same buffer the rasteriser wrote. A
+    /// streamed frame's depth is in the arena, one entry per band, and is read
+    /// back in the same row order.
     pub fn depth_into(&mut self, out: &mut [f32]) -> Result<()> {
+        if self.stream.is_some() {
+            match (self.stream.as_mut(), self.arena.as_mut()) {
+                (Some(stream), Some(arena)) => return read_bands_depth(stream, arena, out),
+                _ => {
+                    return Err(Error::new(
+                        Code::NotReady,
+                        "the frame's depth is in an arena that is not open",
+                    ))
+                }
+            }
+        }
         let depth = self.color.depth_slice().ok_or_else(|| {
             Error::new(Code::NotSupported, "the frame target has no depth buffer to reproject")
         })?;
@@ -902,8 +978,21 @@ impl SoftCpuDevice {
     ///
     /// The conversion happens straight into those rows. There is no tightly
     /// packed intermediate: a frame crossed the target->host boundary once, and
-    /// the buffer the host handed over is the only one involved.
+    /// the buffer the host handed over is the only one involved. A streamed frame
+    /// crosses that boundary from the arena instead, band by band and in the same
+    /// row order, through the same conversion.
     pub fn read_frame_into(&mut self, out: &mut [u8], pitch: u32, flip: u32) -> Result<()> {
+        if self.stream.is_some() {
+            match (self.stream.as_mut(), self.arena.as_mut()) {
+                (Some(stream), Some(arena)) => return read_bands_into(stream, arena, out, pitch, flip != 0),
+                _ => {
+                    return Err(Error::new(
+                        Code::NotReady,
+                        "the frame's colour is in an arena that is not open",
+                    ))
+                }
+            }
+        }
         let row_bytes = self.color.width as usize * 4;
         let pitch = if pitch == 0 { row_bytes } else { pitch as usize };
         self.color.to_rgba8_rows(out, pitch, flip != 0)
@@ -913,9 +1002,6 @@ impl SoftCpuDevice {
         self.color_checksum
     }
 
-    pub fn frame_size(&self) -> (u32, u32) {
-        (self.color.width, self.color.height)
-    }
 
     pub fn counters(&self) -> Counters {
         self.counters
@@ -933,6 +1019,7 @@ impl SoftCpuDevice {
         Ok(())
     }
 }
+
 
 fn count_triangles(draws: &[DrawItem<'_>]) -> u64 {
     let mut total = 0u64;
@@ -1004,16 +1091,20 @@ fn write_depth_bytes(map: Option<&mut Target>, bytes: &[u8]) {
 
 /// Capabilities of a software tier. There is no GPU, so nothing here claims to
 /// be hardware: what it claims is that the reference path can do the work.
+///
+/// The filter bits are read off the tier's own clamp rather than claimed here:
+/// [`filter_caps`] reports exactly the filters the tier policy lets through,
+/// so a tier the policy holds to `pcf3x3` no longer advertises `pcf5x5` or
+/// `pcss-lite` a host could ask for and never get.
 pub fn caps_for(tier: Tier) -> u32 {
     let mut caps = caps::TEXTURES
         | caps::MIPMAPS
         | caps::SHADOWS
-        | caps::PCF_5X5
-        | caps::PCSS_LITE
         | caps::MULTITHREAD
         | caps::CACHED_CASCADE
         | caps::COMPUTE
-        | caps::PRESENT_TO_MEMORY;
+        | caps::PRESENT_TO_MEMORY
+        | filter_caps(tier);
     if tier >= Tier::CpuThrifty {
         caps |= caps::DISK_SPILL;
     }
