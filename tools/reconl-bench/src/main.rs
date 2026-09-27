@@ -29,7 +29,7 @@
 //! which is how `--shadows=off` and `--spill=1` runs are checked against a
 //! golden rather than taken on trust.
 //!
-//! Exit codes: 0 completed, 2 error.
+//! Exit codes: 0 completed, 2 error, 3 the `--fps-gate` budget was exceeded.
 
 use reconl::abi;
 use reconl_host::device::{Config, Device};
@@ -70,6 +70,11 @@ OPTIONS:
                         reports the presented rate it actually achieved
   --target-ms=N         frame-time target for the tier ladder; 0 disables it
   --audit=N             re-verify tier and budget every N frames (expensive)
+  --fps-gate            sweep 1280x720, 1920x1080, 2560x1440 and 3840x2160 and
+                        judge each resolution's mean frame time against the
+                        frame budget; exit 3 when any resolution is over it
+  --fps-target=N        the gate's budget in frames per second (default 60,
+                        which is 16.666 ms per frame at the mean)
   --trace=PATH          write the per-frame trace and per-second summary
   --png=PATH            write the last frame as an RGBA PNG
   --help                this text
@@ -80,7 +85,7 @@ Sizes accept B, K, M, G and T, all binary: 64MB is 64 MiB.
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match run(&args) {
-        Ok(()) => ExitCode::from(0),
+        Ok(code) => code,
         Err(e) => {
             eprintln!("{e}");
             ExitCode::from(2)
@@ -88,7 +93,7 @@ fn main() -> ExitCode {
     }
 }
 
-const FLAGS: [&str; 22] = [
+const FLAGS: [&str; 24] = [
     "--backend",
     "--tier",
     "--adapter",
@@ -108,6 +113,8 @@ const FLAGS: [&str; 22] = [
     "--framegen",
     "--target-ms",
     "--audit",
+    "--fps-gate",
+    "--fps-target",
     "--trace",
     "--png",
     "--help",
@@ -128,6 +135,10 @@ struct Options {
     /// Images per rendered frame, as a reduced fraction, or `None` when the
     /// run renders and presents one image per frame as it always did.
     framegen: Option<(u32, u32)>,
+    /// Sweep the gate's four resolutions and judge each mean against the budget.
+    fps_gate: bool,
+    /// The budget in frames per second (60 = 16.666 ms per frame at the mean).
+    fps_target: u32,
 }
 
 fn options_from(args: &[String]) -> Result<Options, String> {
@@ -144,6 +155,8 @@ fn options_from(args: &[String]) -> Result<Options, String> {
         trace: None,
         png: None,
         framegen: None,
+        fps_gate: false,
+        fps_target: 60,
     };
     if let Some(name) = units::value_of(args, "--backend") {
         config.backend = Config::backend_from_name(name)
@@ -213,6 +226,26 @@ fn options_from(args: &[String]) -> Result<Options, String> {
     if let Some(v) = units::value_of(args, "--framegen") {
         options.framegen = Some(parse_ratio(v)?);
     }
+    options.fps_gate = units::has_flag(args, "--fps-gate");
+    if let Some(v) = units::value_of(args, "--fps-target") {
+        options.fps_target = units::parse_u32(v, "fps target")?;
+        if options.fps_target == 0 {
+            return Err("`--fps-target` must be at least 1 frame per second".into());
+        }
+    }
+    if options.fps_gate {
+        // The gate sweeps its own four resolutions. An option that would
+        // quietly pick a different frame, a different schedule or a different
+        // artifact is a measurement mislabelled, so it is refused rather than
+        // silently ignored.
+        for flag in ["--width", "--height", "--resolution", "--framegen", "--trace", "--png"] {
+            if units::value_of(args, flag).is_some() {
+                return Err(format!(
+                    "`{flag}` does not apply to --fps-gate: the gate sweeps 1280x720, 1920x1080, 2560x1440 and 3840x2160 itself - drop `{flag}`"
+                ));
+            }
+        }
+    }
     options.trace = units::value_of(args, "--trace").map(str::to_string);
     options.png = units::value_of(args, "--png").map(str::to_string);
     config.resolve_disk_budget();
@@ -262,10 +295,10 @@ fn images_in_interval(index: u32, num: u32, den: u32) -> u32 {
     total_through(index + 1).saturating_sub(total_through(index))
 }
 
-fn run(args: &[String]) -> Result<(), String> {
+fn run(args: &[String]) -> Result<ExitCode, String> {
     if units::has_flag(args, "--help") || args.iter().any(|a| a == "-h") {
         print!("{USAGE}");
-        return Ok(());
+        return Ok(ExitCode::from(0));
     }
     units::reject_unknown(args, &FLAGS)?;
     let options = options_from(args)?;
@@ -297,7 +330,11 @@ fn run(args: &[String]) -> Result<(), String> {
         scene.triangle_count(),
         options.repeat
     );
-    println!("  frame           {} x {}", options.width, options.height);
+    if options.fps_gate {
+        println!("  frame           sweep 1280x720, 1920x1080, 2560x1440, 3840x2160");
+    } else {
+        println!("  frame           {} x {}", options.width, options.height);
+    }
     println!(
         "  shadows         {} — {} cascades requested, {} texel budget, filter {}",
         options.shadows.name(),
@@ -351,6 +388,13 @@ fn run(args: &[String]) -> Result<(), String> {
         println!("  driver          {}", device.driver());
     }
     println!("  caps            {}", names::caps(limits.caps));
+
+    if options.fps_gate {
+        if let Some(n) = options.audit_every {
+            device.audit(n)?;
+        }
+        return fps_gate(&device, &scene, &options);
+    }
 
     let renderer = Renderer::new(
         &device,
@@ -437,7 +481,7 @@ fn run(args: &[String]) -> Result<(), String> {
     if stats.audit_divergences > 0 {
         println!("\nAUDIT: {} divergences reported", stats.audit_divergences);
     }
-    Ok(())
+    Ok(ExitCode::from(0))
 }
 
 fn adapter_selection_name(selection: reconl_host::device::AdapterSelection) -> String {
@@ -455,6 +499,156 @@ fn cap(value: u64) -> String {
         "none".to_string()
     } else {
         bytes(value)
+    }
+}
+
+/// The four resolutions the gate judges, named the way a host names them and
+/// numbered so every table row is a claim about a real frame size.
+const GATE_SWEEP: [(&str, u32, u32); 4] = [
+    ("720p", 1280, 720),
+    ("1080p", 1920, 1080),
+    ("1440p", 2560, 1440),
+    ("4K", 3840, 2160),
+];
+
+/// The budget as whole nanoseconds per frame: 60 fps is 16,666,666 ns, so the
+/// verdict is an integer comparison and a target always means the same number.
+fn budget_ns(target_fps: u32) -> u64 {
+    1_000_000_000 / u64::from(target_fps.max(1))
+}
+
+/// The gate's one question: does this resolution's *mean* frame time fit?
+///
+/// The mean decides because the claim under test is a sustained rate. Min and
+/// max are printed beside it - a number without its spread is a peak wearing a
+/// costume - and warmup is excluded for the same reason the single run
+/// excludes it: the first frames pay costs a steady state does not.
+fn within_budget(mean_ns: u64, budget: u64) -> bool {
+    mean_ns <= budget
+}
+
+/// One resolution's measured frames, through the same warmup-then-measure
+/// discipline the single run uses: warmup unmeasured, then `frames` samples
+/// timed across the host's own begin/submit/present boundaries. The renderer
+/// is dropped at the end of this function, so the next resolution starts from
+/// a released swapchain and the sweep cannot leak one target into the next.
+fn gate_measure(
+    device: &Device,
+    scene: &Scene,
+    options: &Options,
+    width: u32,
+    height: u32,
+) -> Result<Run, String> {
+    let renderer = Renderer::new(
+        device,
+        scene,
+        RenderOptions {
+            width,
+            height,
+            present_to_memory: true,
+            repeat: options.repeat,
+            max_draws: 0,
+            framegen: false,
+        },
+    )
+    .map_err(|e| describe(e, device, width, height))?;
+    let mut pixels = vec![0u8; renderer.frame_bytes()];
+    let render = |seed: u32, pixels: &mut [u8]| {
+        renderer
+            .frame(scene, seed, pixels)
+            .map_err(|e| describe(e, device, width, height))
+    };
+    for i in 0..options.warmup {
+        render(1 + i, &mut pixels)?;
+    }
+    device.reset_stats()?;
+    reconl_host::alloc::reset();
+    let mut run = Run::default();
+    for i in 0..options.frames {
+        let cost = render(1 + options.warmup + i, &mut pixels)?;
+        run.record(cost, &device.stats()?);
+    }
+    Ok(run)
+}
+
+/// A frame failure, named with the resolution it happened at and the device's
+/// own last error - the result code says *that* a call failed, and the
+/// last-error text is the only place the driver's detail survives.
+fn describe(error: String, device: &Device, width: u32, height: u32) -> String {
+    match device.last_error() {
+        Some(detail) => format!("{width}x{height}: {error} — device reported: {detail}"),
+        None => format!("{width}x{height}: {error}"),
+    }
+}
+
+/// `--fps-gate`: four resolutions, one verdict each, one loud verdict overall.
+///
+/// The sweep is the 60 FPS question asked the only way it can be answered
+/// honestly: one device, one scene, the warmup/measure discipline of a normal
+/// run at every resolution a host means by 720p through 4K, and a table whose
+/// mean column is judged against the budget in integer nanoseconds. Any
+/// resolution over budget makes the summary line say FAIL and the process exit
+/// 3, so a gate that cannot hold the budget fails a pipeline rather than
+/// printing a number nobody checks.
+fn fps_gate(device: &Device, scene: &Scene, options: &Options) -> Result<ExitCode, String> {
+    let budget = budget_ns(options.fps_target);
+    println!(
+        "\nfps gate — budget {} fps ({}) per frame at the mean of {} + {} frames",
+        options.fps_target,
+        ns(budget),
+        options.warmup,
+        options.frames
+    );
+    println!(
+        "  {:<18} {:>10}  {:>10}  {:>10}  {:>7}  {}",
+        "resolution", "min", "avg", "max", "fps", "verdict"
+    );
+    let mut over: Vec<String> = Vec::new();
+    for (name, width, height) in GATE_SWEEP {
+        let run = gate_measure(device, scene, options, width, height)?;
+        let (min, avg, max) = run.bounds();
+        let pass = within_budget(avg, budget);
+        if !pass {
+            over.push(format!(
+                "{name} {width}x{height}: mean {}, {} fps — over the {} fps budget by {}",
+                ns(avg),
+                fps(avg),
+                options.fps_target,
+                ns(avg - budget)
+            ));
+        }
+        println!(
+            "  {:<18} {:>10}  {:>10}  {:>10}  {:>7}  {}",
+            format!("{name} {width}x{height}"),
+            ns(min),
+            ns(avg),
+            ns(max),
+            fps(avg),
+            if pass { "PASS" } else { "FAIL" }
+        );
+    }
+    let stats = device.stats()?;
+    if stats.audit_divergences > 0 {
+        println!("\nAUDIT: {} divergences reported", stats.audit_divergences);
+    }
+    if over.is_empty() {
+        println!(
+            "\ngate: PASS — all {} resolutions within {} fps",
+            GATE_SWEEP.len(),
+            options.fps_target
+        );
+        Ok(ExitCode::from(0))
+    } else {
+        println!(
+            "\ngate: FAIL — {} of {} resolutions over {} fps:",
+            over.len(),
+            GATE_SWEEP.len(),
+            options.fps_target
+        );
+        for line in &over {
+            println!("  {line}");
+        }
+        Ok(ExitCode::from(3))
     }
 }
 
@@ -804,5 +998,31 @@ impl Run {
             ));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The budget is one integer nanosecond count per target, and the mean -
+    /// not a lucky frame - is what the verdict reads: exactly on the budget
+    /// passes, one nanosecond over does not.
+    #[test]
+    fn the_gate_budget_is_whole_nanoseconds_and_the_mean_decides() {
+        assert_eq!(budget_ns(60), 16_666_666);
+        assert_eq!(budget_ns(1), 1_000_000_000);
+        assert!(within_budget(budget_ns(60), budget_ns(60)));
+        assert!(!within_budget(budget_ns(60) + 1, budget_ns(60)));
+    }
+
+    /// The sweep is 720p through 4K at the sizes those names mean - a row that
+    /// silently judged another frame size would gate nothing a host cares about.
+    #[test]
+    fn the_sweep_is_720p_through_4k() {
+        assert_eq!(
+            GATE_SWEEP.map(|(_, w, h)| (w, h)),
+            [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)]
+        );
     }
 }

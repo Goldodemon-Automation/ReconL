@@ -273,6 +273,59 @@ fn a_steady_state_frame_allocates_nothing() {
     }
 }
 
+/// The gate's contract, pinned on the null tier so the verdict is about the
+/// harness rather than this machine's speed: every resolution in the sweep is
+/// judged, a budget that fits exits 0, and a budget no frame can meet exits 3
+/// with a loud FAIL - the two exit paths a CI step would branch on.
+#[test]
+fn the_fps_gate_judges_every_resolution_and_fails_loudly() {
+    let (stdout, stderr, code) = bench(&[
+        "--fps-gate",
+        "--fps-target=1",
+        "--backend=null",
+        "--frames=2",
+        "--warmup=1",
+    ]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    for expected in [
+        "sweep 1280x720, 1920x1080, 2560x1440, 3840x2160",
+        "720p 1280x720",
+        "1080p 1920x1080",
+        "1440p 2560x1440",
+        "4K 3840x2160",
+        "gate: PASS",
+    ] {
+        assert!(stdout.contains(expected), "missing `{expected}` in:\n{stdout}");
+    }
+
+    // A one-nanosecond budget: nothing that renders a frame fits it, and the
+    // gate must say so loudly rather than report the number and exit 0.
+    let (stdout, stderr, code) = bench(&[
+        "--fps-gate",
+        "--fps-target=1000000000",
+        "--backend=null",
+        "--frames=1",
+        "--warmup=0",
+    ]);
+    assert_eq!(code, 3, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("gate: FAIL"), "{stdout}");
+    assert!(stdout.contains("FAIL"), "{stdout}");
+    assert!(
+        stdout.contains("over the 1000000000 fps budget"),
+        "the summary must name the budget it missed:\n{stdout}"
+    );
+
+    // The gate owns its sweep: an option that would quietly change it is
+    // refused with a code rather than silently ignored.
+    let (_, stderr, code) = bench(&["--fps-gate", "--resolution=64x64", "--backend=null"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("does not apply to --fps-gate"), "{stderr}");
+
+    let (_, stderr, code) = bench(&["--fps-gate", "--fps-target=0"]);
+    assert_eq!(code, 2);
+    assert!(stderr.contains("at least 1 frame per second"), "{stderr}");
+}
+
 /// A zero is refused by name rather than quietly standing in for one. `--width=0`
 /// used to become a one-pixel frame and `--frames=0` a one-frame measurement, and
 /// both reported a successful run of something the host never asked for.

@@ -543,6 +543,77 @@ serves; `clang` is absent). `cargo check --workspace --all-targets` is the fast 
   on a non-zero `target_frame_ms` (the benchmark's default is 0), and the
   frontend's script shaping (no GSUB/GPOS, no kerning pairs).
 
+## The 60 FPS gate
+
+`reconl-bench --fps-gate` is the benchmarking hook that turns "does this machine
+hold 60 FPS?" into a number, a table and an exit code. It sweeps the four
+resolutions a host means by 720p, 1080p, 1440p and 4K - 1280x720, 1920x1080,
+2560x1440, 3840x2160 - on one device, through the same warmup-then-measure
+discipline every bench run uses (5 unmeasured frames, then 60 measured), and
+judges each resolution's *mean* frame time against the budget.
+
+* **The budget is an integer.** `--fps-target=N` (default 60) becomes
+  `1_000_000_000 / N` nanoseconds - 16,666,666 ns at 60 - so the verdict is an
+  integer comparison and the same target always means the same number. The mean
+  decides because the claim is a sustained rate; min and max are printed beside
+  it because a number without its spread is a peak wearing a costume.
+* **Failure is loud.** Any resolution over budget prints a FAIL row, the summary
+  names every offender with its mean, its fps and the amount it was over by, and
+  the process exits 3 (0 pass, 2 error, 3 budget exceeded) - a CI step cannot
+  read a passing exit code off a failing machine.
+* **The sweep is owned.** `--width`, `--height`, `--resolution`, `--framegen`,
+  `--trace` and `--png` are refused alongside `--fps-gate` rather than silently
+  ignored: an option that would quietly measure something else is a measurement
+  mislabelled.
+* **Headless by construction.** `--backend=soft-cpu` runs the whole gate with no
+  GPU at all (the same reference path the offload ladder falls back to), so the
+  gate exists on a machine with no display as well as on one with a GPU.
+
+How to run it:
+
+```bash
+cargo build --release -p reconl-bench
+target/release/reconl-bench --fps-gate --backend=soft-cpu   # headless: no GPU needed
+target/release/reconl-bench --fps-gate --backend=d3d11      # the hardware tier
+cargo test -p reconl-bench                                   # the gate's contract, on the null tier
+```
+
+Measured on this machine (Windows, Intel UHD Graphics, 4 worker threads, single
+runs of the reference scene with shadows on, release build), 5 + 60 frames per
+resolution:
+
+| resolution | soft-cpu (T2) min / avg / max | fps | verdict | d3d11 (T1) min / avg / max | fps | verdict |
+|---|---|---|---|---|---|---|
+| 720p 1280x720 | 97.918 / 123.725 / 265.161 ms | 8.1 | FAIL | 4.695 / 9.912 / 20.628 ms | 100.9 | PASS |
+| 1080p 1920x1080 | 223.987 / 255.781 / 317.991 ms | 3.9 | FAIL | 10.121 / 17.136 / 23.259 ms | 58.4 | FAIL (+469.6 us) |
+| 1440p 2560x1440 | 400.376 / 452.623 / 780.300 ms | 2.2 | FAIL | 17.151 / 25.842 / 32.227 ms | 38.7 | FAIL (+9.176 ms) |
+| 4K 3840x2160 | 870.654 / 975.962 / 1576 ms | 1.0 | FAIL | 38.803 / 45.565 / 54.899 ms | 21.9 | FAIL (+28.899 ms) |
+
+Both runs exited 3. The honest reading:
+
+* **60 FPS on this machine is a hardware-tier claim at 720p only.** The d3d11
+  tier holds it at 1280x720 with half the budget to spare and misses 1080p by
+  469.6 us - a margin small enough to flip between runs, reported as measured
+  rather than rounded into a pass. 1440p and 4K are over by whole milliseconds.
+  The reference tier cannot hold the budget at any of the four, which is what
+  the design says: T2 defines correctness, not frame rate.
+* **What the number is:** host wall time across the ABI's three boundaries
+  (begin, submit, present) - the cost of *producing* a frame into memory. It
+  does not include display scanout or vsync; this gate is headless, so there is
+  no swap chain to wait on.
+* **What cannot be measured here:** the hardware path has no GPU timestamp
+  queries, so the gate cannot say *which stage* put a resolution over budget,
+  only that the frame the host waited for was. And these are single runs on one
+  machine: the min/avg/max spread in the table is the honest uncertainty, not a
+  variance across runs.
+
+Pinned by two unit tests in `tools/reconl-bench/src/main.rs` (the budget's
+integer derivation, and the sweep being exactly 720p through 4K at the sizes
+those names mean) and `tests/cli.rs::the_fps_gate_judges_every_resolution_and_fails_loudly`,
+which drives both exit paths end to end on the null tier - a budget that fits
+must exit 0, a one-nanosecond budget must exit 3 - so the gate's contract is
+tested without making the suite's green depend on how fast this machine is.
+
 ## Checks
 
 ```bash
@@ -555,6 +626,8 @@ target/release/reconl-bench --backend=soft-cpu --resolution=512x512 --framegen=2
 target/release/reconl-bench --backend=soft-cpu --tier=t4 --width=512 --height=512 \
     --frames=4 --warmup=1 --ram-cap=2MB --disk-cap=64MB --spill=1 \
     --spill-dir=spill --shadows=cached --png=streamed.png
+target/release/reconl-bench --fps-gate --backend=soft-cpu   # the 60 FPS gate, headless
+target/release/reconl-bench --fps-gate --backend=d3d11      # the same gate on the hardware tier
 ```
 
 Last run on this machine (the debug and fix pass, `reconl/debug-fix-phase`):
