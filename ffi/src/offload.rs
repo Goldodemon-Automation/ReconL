@@ -197,22 +197,30 @@ impl DeviceHandle {
     fn adopt_backend(&mut self, backend: BackendKind, reason: TierReason, frame_index: u64, detail: &str) {
         let from = self.tier;
         let (to, caps, name, driver, id) = match &backend {
-            BackendKind::SoftCpu(d) => (d.tier(), d.caps(), d.device_name(), d.driver(), backend::SOFT_CPU),
-            BackendKind::D3d11(d) => (d.tier(), d.caps(), d.device_name(), d.driver(), backend::D3D11),
-            BackendKind::Null(d) => (d.tier(), d.caps(), d.device_name(), d.driver(), backend::NULL),
+            BackendKind::SoftCpu(d) => {
+                (d.tier(), d.caps(), d.device_name(), d.driver(), backend::SOFT_CPU)
+            }
+            BackendKind::D3d11(d) => {
+                (d.tier(), d.caps(), d.device_name(), d.driver(), backend::D3D11)
+            }
+            BackendKind::Null(d) => {
+                (d.tier(), d.caps(), d.device_name(), d.driver(), backend::NULL)
+            }
         };
+        let name = reconl_core::Text::<64>::from_str(name);
+        let driver = reconl_core::Text::<64>::from_str(driver);
         self.backend = backend;
         self.tier = to;
         self.tier_reason = reason;
         self.caps = caps;
-        self.device_name.set(name);
-        self.driver.set(driver);
+        self.device_name.set(name.as_str());
+        self.driver.set(driver.as_str());
         self.stats.backend = id;
         self.stats.caps = caps;
         self.stats.tier = to;
         self.stats.tier_reason = reason;
         self.stats.tier_reason_text.set(reason.text());
-        self.stats.device_name.set(name);
+        self.stats.device_name.set(name.as_str());
         self.stats.counters.safe_path_events += 1;
         self.stats.counters.frames_since_tier_change = 0;
         // A return trip buys a settle window: the frames inside the target that
@@ -432,7 +440,7 @@ impl DeviceHandle {
             let soft = self.softcpu_mut().ok_or_else(|| {
                 Error::new(Code::BackendUnavailable, "the reference backend is not available")
             })?;
-            soft.prepare_frame(frame.width, frame.height)?;
+            soft.prepare_frame(frame.width, frame.height, &input.shadow)?;
             soft.render(&input)?;
             soft.snapshot().shadows
         };

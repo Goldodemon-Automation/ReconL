@@ -391,6 +391,28 @@ pub fn rules(tier: Tier) -> TierRules {
     }
 }
 
+/// The shadow-filter caps bits a tier is allowed to advertise.
+///
+/// The clamp has one owner - [`rules`]' `shadow_filter_cap`, enforced by
+/// [`shadow_plan`] - and this is its only other reader: a tier whose cap sits
+/// below `Pcf5x5` reports no `PCF_5X5`, and a tier below `PcssLite` reports no
+/// `PCSS_LITE`, so a host reading a device's caps can only ask for a filter
+/// the tier will actually run. Backends OR this into their own caps; they
+/// never re-derive the per-tier table. The mapping uses the same numeric
+/// ordering the clamp compares with, so "advertised" and "survives the clamp"
+/// agree by construction rather than by a second table kept in step.
+pub fn filter_caps(tier: Tier) -> u32 {
+    let cap = rules(tier).shadow_filter_cap as u32;
+    let mut out = 0;
+    if cap >= ShadowFilter::Pcf5x5 as u32 {
+        out |= caps::PCF_5X5;
+    }
+    if cap >= ShadowFilter::PcssLite as u32 {
+        out |= caps::PCSS_LITE;
+    }
+    out
+}
+
 /// Everything the resolver is allowed to know.
 #[derive(Clone, Copy, Debug)]
 pub struct TierInputs {
@@ -817,5 +839,47 @@ mod tests {
     fn tier_step_down_saturates() {
         assert_eq!(Tier::GpuDiscrete.step_down(), Tier::GpuShared);
         assert_eq!(Tier::OutOfCore.step_down(), Tier::OutOfCore);
+    }
+
+    #[test]
+    fn reported_filter_caps_are_the_tier_clamp_read_back() {
+        // The advertised bits name exactly the filters the clamp lets
+        // through, tier by tier, so a host reading a device's caps can only
+        // ask for a filter the tier will actually run.
+        for tier in [Tier::GpuDiscrete, Tier::GpuShared, Tier::CpuRam, Tier::CpuThrifty, Tier::OutOfCore] {
+            let cap = rules(tier).shadow_filter_cap;
+            let bits = filter_caps(tier);
+            assert_eq!(
+                bits & caps::PCF_5X5 != 0,
+                (cap as u32) >= (ShadowFilter::Pcf5x5 as u32),
+                "{tier:?} advertises pcf5x5 exactly when its clamp allows it"
+            );
+            assert_eq!(
+                bits & caps::PCSS_LITE != 0,
+                (cap as u32) >= (ShadowFilter::PcssLite as u32),
+                "{tier:?} advertises pcss-lite exactly when its clamp allows it"
+            );
+            // End to end: a plan built with the advertised caps runs every
+            // filter at or below the cap unchanged, and clamps everything
+            // above it with the downgrade reported rather than silent. One
+            // cascade is requested so the filter is the only clamp in play.
+            for req in [ShadowFilter::Hard, ShadowFilter::Pcf3x3, ShadowFilter::Pcf5x5, ShadowFilter::PcssLite] {
+                let plan = shadow_plan(tier, 1, 32 << 20, req, bits | caps::SHADOWS);
+                if (req as u32) <= (cap as u32) {
+                    assert_eq!(plan.filter, req, "{tier:?} must run {req:?}: it advertises it");
+                } else {
+                    assert!(
+                        (plan.filter as u32) <= (cap as u32),
+                        "{tier:?} clamped {req:?} to {:?}, above its own cap",
+                        plan.filter
+                    );
+                    assert_eq!(
+                        plan.clamp_event,
+                        Some(ShadowEvent::FilterDowngraded),
+                        "{tier:?} reports the downgrade of {req:?}"
+                    );
+                }
+            }
+        }
     }
 }

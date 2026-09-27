@@ -29,16 +29,24 @@ cc="${CC:-cc}"
 filter="$*"
 
 # ----------------------------------------------------------------- the plan
-# One row per probe invocation: probe|arguments|expected checks|required lines.
+# One row per probe invocation: probe|arguments|minimum checks|required lines|
+# alternate short path|D3D11 required.
 #
-# `expected checks` is the count the probe's own verdict prints (`-` for the few
-# probes that print a verdict but no count). Pinning it means a probe that stops
-# running its checks cannot pass by printing nothing: a row is red unless the
-# count matches *and* every required line is present.
+# `minimum checks` is the smallest count a complete run reports (`-` for probes
+# pinned by required lines instead). It is a floor: optional passing branches can
+# add checks, but missing checks below the floor need an exact alternate path in
+# the next column. For offload, the return trip adds two checks (35 vs 33). When
+# the first hardware frame is within target, it can finish at 18; that exact count
+# and the probe's no-miss explanation is the only accepted short path.
 #
 # `required lines` are literal substrings, `;`-separated, that the output must
 # contain. They are what makes a red row diagnosable - the count alone would not
 # say which property moved.
+#
+# `alternate short path` entries are `count:reason`, `;`-separated. A row below
+# its floor passes only at that exact branch count and when the probe prints its
+# reason; all other short counts remain red. `D3D11 required` rows are skipped
+# when gpu_probe reports no usable device; their row remains in the 24-row total.
 fg_state="(the documented order holds in every cell)"
 fg_state="$fg_state;refusals that wrote into the host's buffer: 0"
 fg_state="$fg_state;cells that left the device somewhere unusable: 0"
@@ -46,30 +54,30 @@ fg_state="$fg_state;cells that could not be set up: 0 of 90"
 fg_state="$fg_state;descriptors that crashed or wedged the device: 0"
 
 plan=$(cat <<PLAN
-fghostile|--backend=soft-cpu|32|
-fghostile|--backend=d3d11|32|
-framegen|--backend=soft-cpu|21|
-framegen|--backend=d3d11|21|
-framestate||43|
-gpu_probe||-|OK;usable=1
-hostile||11|
-hostile2||13|
-hostile3||11|
-hostile4||-|a full frame afterwards: 0 (recovered);present(too small) -1
-hostile5||16|
-ladder||6|
-narrowpitch|--backend=soft-cpu|11|
-narrowpitch|--backend=d3d11|11|
-narrowpitch|--backend=null|11|
-offload||33|
-onewriter||8|
-overtarget||-|presented 12;failures 0
-shadowconfig||40|
-viewport|--backend=soft-cpu --size=64 --vp=16|-|lit pixels 256 of 4096;lit pixels outside the requested 16x16 rect: 0
-viewport|--backend=d3d11 --size=64 --vp=16|-|lit pixels 256 of 4096;lit pixels outside the requested 16x16 rect: 0
-fgstate|--backend=soft-cpu|-|$fg_state
-fgstate|--backend=d3d11|-|$fg_state
-fgstate|--backend=null|-|$fg_state
+fghostile|--backend=soft-cpu|32|||no
+fghostile|--backend=d3d11|32|||yes
+framegen|--backend=soft-cpu|21|||no
+framegen|--backend=d3d11|21|||yes
+framestate||43|||yes
+gpu_probe||-|OK;usable=1||no
+hostile||11|||yes
+hostile2||13|||yes
+hostile3||11|||yes
+hostile4||-|a full frame afterwards: 0 (recovered);present(too small) -1||yes
+hostile5||16|||yes
+ladder||6|||yes
+narrowpitch|--backend=soft-cpu|11|||no
+narrowpitch|--backend=d3d11|11|||yes
+narrowpitch|--backend=null|11|||no
+offload||33||18:no miss here for the trigger to act on|yes
+onewriter||8|||yes
+overtarget||-|presented 12;failures 0||yes
+shadowconfig||40|||yes
+viewport|--backend=soft-cpu --size=64 --vp=16|-|lit pixels 256 of 4096;lit pixels outside the requested 16x16 rect: 0||no
+viewport|--backend=d3d11 --size=64 --vp=16|-|lit pixels 256 of 4096;lit pixels outside the requested 16x16 rect: 0||yes
+fgstate|--backend=soft-cpu|-|$fg_state||no
+fgstate|--backend=d3d11|-|$fg_state||yes
+fgstate|--backend=null|-|$fg_state||no
 PLAN
 )
 
@@ -124,7 +132,7 @@ trap 'rm -rf "$bin"' EXIT
 # Directly against the DLL/SO: the probes link the artifact, not a Rust crate,
 # and no import library or .def file has to be kept in step with it.
 probes=""
-while IFS='|' read -r probe _args _want _need; do
+while IFS='|' read -r probe _args _want _need _alternate _requires_gpu; do
     [ -n "$probe" ] || continue
     case " $probes " in *" $probe "*) continue ;; esac
     probes="$probes $probe"
@@ -163,9 +171,9 @@ done
 
 # --------------------------------------------------------------- run the plan
 # Whether this host has a usable D3D11 device, from the probe that reports the
-# backend table rather than from an assumption about the OS. Rows that name
-# `--backend=d3d11` are skipped when it does not, the way the in-repo tests skip
-# their d3d11 legs, instead of being reported as failures the machine cannot fix.
+# backend table rather than from an assumption about the OS. The plan marks any
+# row that depends on that device, including probes that mix hardware and CPU
+# arms, so missing hardware is a skip rather than a silent partial run.
 have_gpu=no
 if (cd "$build" && "./bin.$$/gpu_probe$exe" 2>&1 | grep -qE 'd3d11 +usable=1'); then
     have_gpu=yes
@@ -176,7 +184,7 @@ bad=0
 skip=0
 summary=""
 failures=""
-while IFS='|' read -r probe args want need; do
+while IFS='|' read -r probe args want need alternate requires_gpu; do
     [ -n "$probe" ] || continue
     if [ -n "$filter" ]; then
         case " $filter " in *" $probe "*) ;; *) continue ;; esac
@@ -187,17 +195,13 @@ while IFS='|' read -r probe args want need; do
     out="$build/$tag.out"
     : >"$out"
 
-    case "$probe $args" in
-        *d3d11* | overtarget\ *)
-            if [ "$have_gpu" = no ]; then
-                skip=$((skip + 1))
-                printf -v row '%-10s %-34s %6s %6s   %s\n' "$probe" "$args" "-" "-" \
-                    "SKIP (no usable d3d11 device on this host)"
-                summary="$summary$row"
-                continue
-            fi
-            ;;
-    esac
+    if [ "$requires_gpu" = yes ] && [ "$have_gpu" = no ]; then
+        skip=$((skip + 1))
+        printf -v row '%-10s %-34s %6s %6s   %s\n' "$probe" "$args" "-" "-" \
+            "SKIP (no usable d3d11 device on this host)"
+        summary="$summary$row"
+        continue
+    fi
 
     (cd "$build" && "./bin.$$/$probe$exe" $args) >>"$out" 2>&1
     rc=$?
@@ -212,8 +216,41 @@ while IFS='|' read -r probe args want need; do
     if [ "$rc" -ne 0 ]; then
         why="exit $rc"
     fi
-    if [ "$want" != "-" ] && [ "$got" != "$want" ]; then
-        why="${why:+$why; }checks $got, expected $want"
+    if [ "$probe" = gpu_probe ] && [ "$have_gpu" = no ]; then
+        need="no usable D3D11 device: nothing further to check"
+    fi
+    setup_issue="$(grep -m1 -iE '\(unavailable\)|device not created|device unavailable|capped rig unavailable|ring unreadable|d3d11 unavailable|could not be piloted' "$out" || true)"
+    short=""
+    if [ "$want" != "-" ]; then
+        case "$got" in
+            '' | *[!0-9]*)
+                why="${why:+$why; }no check count in the verdict (see $out)"
+                ;;
+            *)
+                if [ "$got" -lt "$want" ]; then
+                    # A legitimate branch may have a lower minimum, but only at
+                    # its declared count and with its own identifying output.
+                    while IFS= read -r path; do
+                        [ -n "$path" ] || continue
+                        path_min="${path%%:*}"
+                        path_reason="${path#*:}"
+                        case "$path_min" in '' | *[!0-9]*) continue ;; esac
+                        [ -n "$path_reason" ] || continue
+                        if [ "$got" = "$path_min" ] && grep -qF -- "$path_reason" "$out"; then
+                            short="${got} of ${want}, ${path_reason}"
+                            break
+                        fi
+                    done <<ALTERNATES
+$(echo "$alternate" | tr ';' '\n')
+ALTERNATES
+                    [ -n "$short" ] ||
+                        why="${why:+$why; }checks $got, below the minimum $want (see $out)"
+                fi
+                ;;
+        esac
+    fi
+    if [ -n "$setup_issue" ]; then
+        why="${why:+$why; }required setup unavailable: $setup_issue"
     fi
     if [ "$findings" -ne 0 ]; then
         why="${why:+$why; }$findings failure marker(s)"
@@ -238,7 +275,7 @@ NEED
         printf -v line '  %-10s %-34s %s\n' "$probe" "$args" "$why"
         failures="$failures$line"
     fi
-    printf -v row '%-10s %-34s %6s %6s   %s %s\n' "$probe" "$args" "$got" "$findings" "$verdict" "${why:+($why)}"
+    printf -v row '%-10s %-34s %6s %6s   %s %s\n' "$probe" "$args" "$got" "$findings" "$verdict" "${why:+($why)}${short:+ (short: $short)}"
     summary="$summary$row"
 done <<EOF
 $plan

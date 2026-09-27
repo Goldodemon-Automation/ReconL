@@ -48,6 +48,8 @@ USAGE:
 OPTIONS:
   --backend=NAME        auto (default) | soft-cpu | null | d3d11 | ...
   --tier=N|NAME         auto (default) | t0..t4 | gpu-shared | cpu-ram | ...
+  --adapter=SELECTOR    auto | integrated | discrete | INDEX | luid:HEX
+                        D3D11 GPU choice; auto prefers discrete, then any usable GPU
   --frames=N            measured frames (default 60)
   --warmup=N            unmeasured frames first (default 5)
   --width=N             frame width (default 64, the golden scene's width)
@@ -58,7 +60,8 @@ OPTIONS:
   --threads=N           worker threads; 0 lets the backend choose
   --ram-cap=SIZE        device RAM cap, e.g. 64MB
   --vram-cap=SIZE       device video memory cap
-  --disk-cap=SIZE       spill arena size cap
+  --disk-cap=SIZE       spill arena size cap (default 1 GiB when --spill=1;
+                        the ABI reads a cap of 0 as 'no disk use at all')
   --spill=0|1           allow the disk spill arena
   --spill-dir=PATH      directory the arena may use
   --framegen=R          present images instead of frames at R per rendered
@@ -88,9 +91,12 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
-}  const FLAGS: [&str; 23] = [
+}
+
+const FLAGS: [&str; 24] = [
     "--backend",
     "--tier",
+    "--adapter",
     "--frames",
     "--warmup",
     "--width",
@@ -160,27 +166,34 @@ fn options_from(args: &[String]) -> Result<Options, String> {
         config.tier = Config::tier_from_name(name)
             .ok_or_else(|| format!("`{name}` is not a tier (see --help)"))?;
     }
+    if let Some(name) = units::value_of(args, "--adapter") {
+        config.adapter = Config::adapter_from_name(name)
+            .ok_or_else(|| format!("`{name}` is not an adapter selector (see --help)"))?;
+        if config.backend != abi::backend::NONE && config.backend != abi::backend::D3D11 {
+            return Err("--adapter can only be used with --backend=d3d11 or auto".into());
+        }
+    }
     if let Some(v) = units::value_of(args, "--frames") {
-        options.frames = units::parse_u32(v, "frame count")?.max(1);
+        options.frames = units::parse_positive(v, "frame count")?;
     }
     if let Some(v) = units::value_of(args, "--warmup") {
         options.warmup = units::parse_u32(v, "warmup count")?;
     }
     if let Some(v) = units::value_of(args, "--width") {
-        options.width = units::parse_u32(v, "frame width")?.max(1);
+        options.width = units::parse_positive(v, "frame width")?;
     }
     if let Some(v) = units::value_of(args, "--height") {
-        options.height = units::parse_u32(v, "frame height")?.max(1);
+        options.height = units::parse_positive(v, "frame height")?;
     }
     if let Some(v) = units::value_of(args, "--resolution") {
         let (w, h) = v
             .split_once(['x', 'X'])
             .ok_or_else(|| format!("`{v}` is not a resolution: expected WxH"))?;
-        options.width = units::parse_u32(w, "frame width")?.max(1);
-        options.height = units::parse_u32(h, "frame height")?.max(1);
+        options.width = units::parse_positive(w, "frame width")?;
+        options.height = units::parse_positive(h, "frame height")?;
     }
     if let Some(v) = units::value_of(args, "--repeat") {
-        options.repeat = units::parse_u32(v, "repeat count")?.max(1);
+        options.repeat = units::parse_positive(v, "repeat count")?;
     }
     if let Some(v) = units::value_of(args, "--shadows") {
         options.shadows =
@@ -235,6 +248,7 @@ fn options_from(args: &[String]) -> Result<Options, String> {
     }
     options.trace = units::value_of(args, "--trace").map(str::to_string);
     options.png = units::value_of(args, "--png").map(str::to_string);
+    config.resolve_disk_budget();
     options.config = config;
     Ok(options)
 }
@@ -309,6 +323,7 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     };
     println!("fingerprint (resolved before the first frame)");
     println!("  requested       backend {requested_backend}, tier {requested_tier}");
+    println!("  adapter         {}", adapter_selection_name(options.config.adapter));
     println!(
         "  scene           reference: {} chunks, {} triangles, repeat {}",
         scene.chunks.len(),
@@ -352,6 +367,15 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
 
     let device = Device::create(&options.config)?;
     let limits = device.limits()?;
+    if limits.backend == abi::backend::D3D11 {
+        if let Ok(adapters) = reconl_host::device::enumerate_adapters(abi::backend::D3D11) {
+            if let Some(adapter) = reconl_host::device::selected_adapter(&adapters, options.config.adapter) {
+                if adapter.name == limits.device_name {
+                    println!("  adapter LUID    {:016x}", adapter.adapter_luid);
+                }
+            }
+        }
+    }
     println!(
         "  resolved        backend {}, tier {}",
         names::backend(limits.backend),
@@ -458,6 +482,16 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
         println!("\nAUDIT: {} divergences reported", stats.audit_divergences);
     }
     Ok(ExitCode::from(0))
+}
+
+fn adapter_selection_name(selection: reconl_host::device::AdapterSelection) -> String {
+    match selection {
+        reconl_host::device::AdapterSelection::Auto => "auto (discrete first)".into(),
+        reconl_host::device::AdapterSelection::Integrated => "integrated".into(),
+        reconl_host::device::AdapterSelection::Discrete => "discrete".into(),
+        reconl_host::device::AdapterSelection::Index(index) => format!("index {index}"),
+        reconl_host::device::AdapterSelection::Luid(luid) => format!("LUID {luid:016x}"),
+    }
 }
 
 fn cap(value: u64) -> String {

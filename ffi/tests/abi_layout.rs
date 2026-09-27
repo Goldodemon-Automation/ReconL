@@ -119,7 +119,8 @@ fn generated() -> String {
          * ffi/src/abi.rs; compiled, never run, against include/reconl/reconl.h.\n\
          * Do not edit: change the struct or the mirror and run the test. */\n\
          #include <stddef.h>\n\
-         #include <reconl/reconl.h>\n",
+         #include <reconl/reconl.h>\n\
+         #include <reconl/reconl_backends.h>\n",
     );
 
     // The base every other struct starts with. `ReconLBase::type` is
@@ -163,6 +164,34 @@ fn generated() -> String {
         f!(ReconLProbeInfo, entries, [ReconLBackendProbe; RECONL_MAX_BACKENDS], "none"),
         f!(ReconLProbeInfo, recommended_tier, u32, "int"),
         f!(ReconLProbeInfo, recommended_backend, u32, "int"),
+    ]);
+
+    struct_layout(&mut c, "ReconLAdapterInfo", size_of::<ReconLAdapterInfo>(), &[
+        f!(ReconLAdapterInfo, base, StructHeader, "none"),
+        f!(ReconLAdapterInfo, backend, u32, "int"),
+        f!(ReconLAdapterInfo, adapter_type, u32, "int"),
+        f!(ReconLAdapterInfo, usable, u32, "int"),
+        f!(ReconLAdapterInfo, vendor_id, u32, "int"),
+        f!(ReconLAdapterInfo, device_id, u32, "int"),
+        f!(ReconLAdapterInfo, reserved, u32, "int"),
+        f!(ReconLAdapterInfo, adapter_luid, u64, "int"),
+        f!(ReconLAdapterInfo, dedicated_video_memory, u64, "int"),
+        f!(ReconLAdapterInfo, shared_system_memory, u64, "int"),
+        f!(ReconLAdapterInfo, name, [u8; RECONL_MAX_NAME], "ints"),
+    ]);
+
+    struct_layout(&mut c, "ReconLD3D11Desc", size_of::<ReconLD3D11Desc>(), &[
+        f!(ReconLD3D11Desc, base, StructHeader, "none"),
+        f!(ReconLD3D11Desc, adapter_index, i32, "int"),
+        f!(ReconLD3D11Desc, feature_level_min, u32, "int"),
+        f!(ReconLD3D11Desc, debug_layer, u32, "int"),
+        f!(ReconLD3D11Desc, allow_warp, u32, "int"),
+        f!(ReconLD3D11Desc, prefer_flip_model, u32, "int"),
+        f!(ReconLD3D11Desc, reserved, u32, "int"),
+        f!(ReconLD3D11Desc, requested_vram_cap, u64, "int"),
+        f!(ReconLD3D11Desc, adapter_preference, u32, "int"),
+        f!(ReconLD3D11Desc, reserved2, u32, "int"),
+        f!(ReconLD3D11Desc, adapter_luid, u64, "int"),
     ]);
 
     struct_layout(&mut c, "ReconLDeviceLimits", size_of::<ReconLDeviceLimits>(), &[
@@ -638,6 +667,7 @@ fn constants(c: &mut String) {
         "RECONL_STRUCT_SOFTCPU_DESC" = struct_type::SOFTCPU_DESC as i64,
         "RECONL_STRUCT_NULL_DESC" = struct_type::NULL_DESC as i64,
         "RECONL_STRUCT_D3D11_DESC" = struct_type::D3D11_DESC as i64,
+        "RECONL_STRUCT_ADAPTER_INFO" = struct_type::ADAPTER_INFO as i64,
     );
 
     let _ = writeln!(c, "\n/* ---------------- backends, tiers and reasons ---------------- */");
@@ -652,6 +682,14 @@ fn constants(c: &mut String) {
         "RECONL_BACKEND_METAL" = backend::METAL as i64,
         "RECONL_BACKEND_WEBGPU" = backend::WEBGPU as i64,
         "RECONL_BACKEND_WASM_WEBGL2" = backend::WASM_WEBGL2 as i64,
+        "RECONL_ADAPTER_TYPE_UNKNOWN" = adapter_type::UNKNOWN as i64,
+        "RECONL_ADAPTER_TYPE_INTEGRATED" = adapter_type::INTEGRATED as i64,
+        "RECONL_ADAPTER_TYPE_DISCRETE" = adapter_type::DISCRETE as i64,
+        "RECONL_ADAPTER_PREFERENCE_AUTO" = adapter_preference::AUTO as i64,
+        "RECONL_ADAPTER_PREFERENCE_INTEGRATED" = adapter_preference::INTEGRATED as i64,
+        "RECONL_ADAPTER_PREFERENCE_DISCRETE" = adapter_preference::DISCRETE as i64,
+        "RECONL_ADAPTER_PREFERENCE_INDEX" = adapter_preference::INDEX as i64,
+        "RECONL_ADAPTER_PREFERENCE_LUID" = adapter_preference::LUID as i64,
         "RECONL_TIER_T0_GPU_DISCRETE" = Tier::GpuDiscrete as u32 as i64,
         "RECONL_TIER_T1_GPU_SHARED" = Tier::GpuShared as u32 as i64,
         "RECONL_TIER_T2_CPU_RAM" = Tier::CpuRam as u32 as i64,

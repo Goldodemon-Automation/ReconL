@@ -198,6 +198,33 @@ fn a_generation_run_reports_the_rate_it_achieved() {
 /// A mistyped option is an error, not a silently ignored default - and an option
 /// whose value was written as a separate argument says so.
 #[test]
+fn adapter_selection_is_part_of_the_benchmark_fingerprint() {
+    let (stdout, stderr, code) = bench(&[
+        "--backend=soft-cpu",
+        "--adapter=integrated",
+        "--frames=1",
+        "--warmup=0",
+    ]);
+    assert_eq!(code, 2, "a GPU selector cannot target the CPU backend: stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("only be used with"), "{stderr}");
+
+    let (stdout, stderr, code) = bench(&[
+        "--backend=d3d11",
+        "--adapter=integrated",
+        "--frames=1",
+        "--warmup=0",
+    ]);
+    if code == 0 {
+        assert!(stdout.contains("adapter         integrated"), "{stdout}");
+        assert!(stdout.contains("adapter LUID"), "the resolved adapter LUID should be recorded:\n{stdout}");
+    } else {
+        // A D3D11 device may not be present in a CI environment; parsing and
+        // selection behavior are also covered by the in-process FFI tests.
+        assert!(stdout.contains("adapter         integrated") || stderr.contains("reconlCreateDevice"), "{stdout}\n{stderr}");
+    }
+}
+
+#[test]
 fn a_mistyped_option_is_refused() {
     let (_, stderr, code) = bench(&["--frams=10"]);
     assert_eq!(code, 2);
@@ -297,4 +324,60 @@ fn the_fps_gate_judges_every_resolution_and_fails_loudly() {
     let (_, stderr, code) = bench(&["--fps-gate", "--fps-target=0"]);
     assert_eq!(code, 2);
     assert!(stderr.contains("at least 1 frame per second"), "{stderr}");
+}
+
+/// A zero is refused by name rather than quietly standing in for one. `--width=0`
+/// used to become a one-pixel frame and `--frames=0` a one-frame measurement, and
+/// both reported a successful run of something the host never asked for.
+#[test]
+fn zero_dimensions_and_counts_are_refused_by_name() {
+    for (arg, what) in [
+        ("--width=0", "frame width"),
+        ("--height=0", "frame height"),
+        ("--resolution=0x0", "frame width"),
+        ("--frames=0", "frame count"),
+        ("--repeat=0", "repeat count"),
+    ] {
+        let (stdout, stderr, code) = bench(&[arg, "--warmup=0"]);
+        assert_eq!(
+            code, 2,
+            "{arg} must be refused, not coerced: stdout\n{stdout}\nstderr\n{stderr}"
+        );
+        assert!(
+            stderr.contains(what) && stderr.contains("at least 1"),
+            "{arg} must be refused by name: stderr was `{}`",
+            stderr.trim()
+        );
+    }
+}
+
+/// `--spill=1` with no `--disk-cap` still spills. The ABI reads a cap of 0 as *no
+/// disk use at all*, so a tool that passed the flag through as a zero would open no
+/// arena while its fingerprint said "spill on" - and PROMPT's own acceptance run
+/// spills without naming a cap. The run has to show both the budget it inferred and
+/// the arena that budget bought.
+#[test]
+fn a_spill_with_no_named_cap_still_has_a_budget() {
+    let spill_dir = tmp("spill-default");
+    std::fs::create_dir_all(&spill_dir).expect("spill dir");
+    let spill = format!("--spill-dir={}", spill_dir.display());
+    let (stdout, stderr, code) = bench(&[
+        "--backend=soft-cpu",
+        "--tier=t4",
+        "--shadows=cached",
+        "--frames=3",
+        "--warmup=1",
+        "--ram-cap=64MB",
+        "--spill=1",
+        &spill,
+    ]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("disk 1.0 GiB, spill on"),
+        "the run must name the disk budget it inferred:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("spill 256.0 KiB of 1.0 GiB"),
+        "the inferred budget has to buy the cascade cache, not nothing:\n{stdout}"
+    );
 }

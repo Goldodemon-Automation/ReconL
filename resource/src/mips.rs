@@ -38,7 +38,7 @@ impl MipChain {
 
     /// Total bytes across every level.
     pub fn bytes(&self) -> u64 {
-        self.levels.iter().map(|l| (l.pixels.len() as u64)).sum()
+        self.levels.iter().map(|l| l.pixels.len() as u64).sum()
     }
 }
 
