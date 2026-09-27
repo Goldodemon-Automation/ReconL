@@ -1567,6 +1567,13 @@ impl D3d11Device {
             self.color_checksum = 0;
         }
 
+        // Every command of this frame is issued; hand them to the GPU now so
+        // it renders while the CPU is still finishing submit, instead of
+        // starting inside the present that waits for it. The host pays for the
+        // same work either way - the flush only decides how much of it overlaps
+        // the CPU, and it adds nothing a host that never presents would owe.
+        unsafe { self.context.Flush() };
+
         self.shadows.cascades_rendered = cascades_rendered;
         self.shadows.shadow_pass_ns = shadow_ns;
         self.shadows.fit_ns = fit_ns;
