@@ -232,6 +232,7 @@ impl Config {
             "soft-cpu" | "softcpu" | "cpu" => abi::backend::SOFT_CPU,
             "null" => abi::backend::NULL,
             "d3d11" => abi::backend::D3D11,
+            "gpu-compute" | "compute" | "cuda" | "rocm" | "hip" => abi::backend::GPU_COMPUTE,
             "d3d12" => abi::backend::D3D12,
             "vulkan" => abi::backend::VULKAN,
             "gl" => abi::backend::GL,
@@ -560,6 +561,11 @@ mod tests {
         assert_eq!(Config::backend_from_name("auto"), Some(abi::backend::NONE));
         assert_eq!(Config::backend_from_name("soft-cpu"), Some(abi::backend::SOFT_CPU));
         assert_eq!(Config::backend_from_name("d3d11"), Some(abi::backend::D3D11));
+        // A host that thinks in vendors gets there too: the compute backend is
+        // one id covering CUDA and ROCm, so naming either vendor selects it.
+        assert_eq!(Config::backend_from_name("gpu-compute"), Some(abi::backend::GPU_COMPUTE));
+        assert_eq!(Config::backend_from_name("cuda"), Some(abi::backend::GPU_COMPUTE));
+        assert_eq!(Config::backend_from_name("rocm"), Some(abi::backend::GPU_COMPUTE));
         assert_eq!(Config::backend_from_name("d3d9"), None);
         assert_eq!(Config::adapter_from_name("integrated"), Some(AdapterSelection::Integrated));
         assert_eq!(Config::adapter_from_name("2"), Some(AdapterSelection::Index(2)));

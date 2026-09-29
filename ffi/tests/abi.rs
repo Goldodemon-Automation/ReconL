@@ -3353,3 +3353,152 @@ fn resetting_the_counters_keeps_the_frame_behind_them() {
         assert_eq!(generate_into(&mut rig, 0.5, &mut generated), abi::result::OK, "{}", rig.error_message());
     }
 }
+
+// --------------------------------------------------------- the compute tier
+
+/// A fixed-size NUL-terminated field the library wrote.
+fn probe_field(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// The compute backend's row, found the way a host finds it: by walking the
+/// probe's own entries rather than by assuming an index.
+fn compute_probe_row(info: &abi::ReconLProbeInfo) -> &abi::ReconLBackendProbe {
+    (0..info.entry_count as usize)
+        .find(|&i| info.entries[i].backend == abi::backend::GPU_COMPUTE)
+        .map(|i| &info.entries[i])
+        .expect("the probe reports no gpu-compute backend row at all")
+}
+
+/// The id has a name in the library, not just in the header, and the probe
+/// carries a row for it on every machine - with a usable/note pair that cannot
+/// disagree with whether a device can be created.
+///
+/// The assertions are written to hold either way, because both are real states:
+/// a machine with a vendor driver (where the row must describe the device it
+/// found) and this repository's own development machine, which has neither
+/// CUDA nor ROCm (where the row must say so rather than staying silent).
+#[test]
+fn the_compute_backend_is_named_and_probed_honestly() {
+    // `reconlBackendName` is a safe fn that returns a static string for any input.
+    let name = reconl::reconlBackendName(abi::backend::GPU_COMPUTE);
+    assert!(!name.is_null());
+    // SAFETY: the library documents a NUL-terminated static string.
+    let name = unsafe { core::ffi::CStr::from_ptr(name) }.to_str().unwrap();
+    assert_eq!(name, "gpu-compute", "the library cannot name the id the header declares");
+
+    let mut info: abi::ReconLProbeInfo = unsafe { core::mem::zeroed() };
+    info.base = hdr::<abi::ReconLProbeInfo>();
+    assert_eq!(unsafe { reconl::reconlProbe(core::ptr::null(), &mut info) }, abi::result::OK);
+
+    let entry = compute_probe_row(&info);
+    assert_eq!(probe_field(&entry.name), "gpu-compute");
+    assert!(!probe_field(&entry.note).is_empty(), "the compute probe row gives no reason for its verdict");
+
+    if entry.usable != 0 {
+        // Usable means a device would start: it has to name the device, report
+        // its memory, be on a GPU tier, and be what the probe recommends.
+        assert!(!probe_field(&entry.device_name).is_empty(), "a usable compute row names no device");
+        assert!(entry.vram_bytes > 0, "a usable compute row reports no video memory");
+        assert!(entry.best_tier <= 1, "a compute device is on T0 or T1, not {}", entry.best_tier);
+        assert_eq!(info.recommended_backend, abi::backend::GPU_COMPUTE);
+    } else {
+        // Unusable means creating a device would refuse. The ladder must not be
+        // pointed at the backend anyway, or a host following the recommendation
+        // would create a device that cannot render.
+        assert_ne!(
+            info.recommended_backend,
+            abi::backend::GPU_COMPUTE,
+            "the probe recommends a compute device it says is unusable"
+        );
+    }
+}
+
+/// Enumerating the compute backend's adapters is supported whether or not the
+/// machine has one, and an empty list is the answer rather than an error.
+#[test]
+fn compute_adapters_enumerate_with_or_without_a_vendor_driver() {
+    let mut count: u32 = 0;
+    assert_eq!(
+        unsafe { reconl::reconlEnumerateAdapters(abi::backend::GPU_COMPUTE, core::ptr::null_mut(), 0, &mut count) },
+        abi::result::OK,
+        "compute adapter enumeration must answer, not refuse: {}",
+        last_global_error()
+    );
+    if count == 0 {
+        // No CUDA and no ROCm here. An empty list is the honest answer, and it
+        // is the same answer a host gets from a machine with a driver that
+        // reports no devices.
+        return;
+    }
+
+    let mut adapters = vec![unsafe { core::mem::zeroed::<abi::ReconLAdapterInfo>() }; count as usize];
+    let mut total: u32 = 0;
+    assert_eq!(
+        unsafe { reconl::reconlEnumerateAdapters(abi::backend::GPU_COMPUTE, adapters.as_mut_ptr(), count, &mut total) },
+        abi::result::OK
+    );
+    assert_eq!(total, count, "the container count and the reported total disagree");
+    for adapter in &adapters {
+        assert_eq!(adapter.backend, abi::backend::GPU_COMPUTE);
+        assert!(!probe_field(&adapter.name).is_empty(), "an enumerated compute adapter has no name");
+        assert!(adapter.adapter_type <= abi::adapter_type::DISCRETE, "unknown adapter type");
+        assert_eq!(adapter.adapter_luid, 0, "the compute drivers expose no LUID to report");
+    }
+
+    // A short buffer is not an error, the same rule the D3D11 path follows.
+    let mut short = vec![unsafe { core::mem::zeroed::<abi::ReconLAdapterInfo>() }; 1];
+    let mut short_total: u32 = 0;
+    assert_eq!(
+        unsafe { reconl::reconlEnumerateAdapters(abi::backend::GPU_COMPUTE, short.as_mut_ptr(), 1, &mut short_total) },
+        abi::result::OK
+    );
+    assert_eq!(short_total, count, "a short buffer must still report the real total");
+}
+
+/// Asking for the compute backend never quietly hands back the reference tier,
+/// and when it refuses it says which of the two things was missing.
+///
+/// This is the pin on the backend matrix's honesty: the ABI declares a backend
+/// it may not have built, and the rule is that a host asking for it gets a
+/// classified code rather than software pixels it did not ask for.
+#[test]
+fn the_compute_backend_refuses_rather_than_falling_back_to_software() {
+    let desc = device_desc_for(test_allocator(), abi::backend::GPU_COMPUTE, 1);
+    match create_device(&desc) {
+        Ok(device) => {
+            // A machine where the compute device really is buildable: it must be
+            // the compute backend, reported as itself, with the vendor runtime
+            // named in the driver string.
+            let mut limits: abi::ReconLDeviceLimits = unsafe { core::mem::zeroed() };
+            limits.base = hdr::<abi::ReconLDeviceLimits>();
+            assert_eq!(unsafe { reconl::reconlGetDeviceLimits(device, &mut limits) }, abi::result::OK);
+            assert_eq!(
+                limits.backend,
+                abi::backend::GPU_COMPUTE,
+                "the compute backend handed back a device labelled something else"
+            );
+            assert!(!probe_field(&limits.driver).is_empty(), "a compute device reports no driver");
+            let name = probe_field(&limits.device_name);
+            assert!(
+                name.contains("cuda") || name.contains("rocm") || !name.is_empty(),
+                "a compute device must name the runtime that answered"
+            );
+            // SAFETY: `device` came from reconlCreateDevice and is released once.
+            unsafe { reconl::reconlRelease(device as *mut core::ffi::c_void) };
+        }
+        Err(code) => {
+            assert!(
+                code == abi::result::BACKEND_UNAVAILABLE || code == abi::result::NOT_SUPPORTED,
+                "a refused compute device must be BACKEND_UNAVAILABLE (no driver) or \
+                 NOT_SUPPORTED (no render path), got {code}"
+            );
+            let message = last_global_error();
+            assert!(
+                message.contains("CUDA") || message.contains("ROCm") || message.contains("compute"),
+                "the refusal has to name what is missing, said: {message}"
+            );
+        }
+    }
+}

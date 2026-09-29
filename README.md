@@ -33,6 +33,7 @@ test result rather than a hope.
 | `resource/` | mip chains, streaming, the spill arena |
 | `backends/soft-cpu/` | the reference tier (T2), SIMD where it is exact |
 | `backends/d3d11/` | the same passes on hardware |
+| `backends/gpu-compute/` | the GPU tiers through a vendor *compute* API - CUDA on NVIDIA, ROCm/HIP on AMD - discovered at run time; the device layer is built, the raster is not (`docs/gpu-compute.md`) |
 | `backends/null/` | a deterministic no-op, for ABI and CI tests |
 | `ffi/` | handles, validation, last-error, frame state, the offload ladder - no rendering logic |
 | `frontend/` | the Zig UI core, its C ABI, and the showcase that drives them |
@@ -405,6 +406,18 @@ instead of re-projecting clip space.
 * **The backend matrix is mostly unbuilt.** `d3d12`, `vulkan`, `gl`, `metal`,
   `webgpu` and `wasm-webgl2` are enum values with no implementation behind them;
   the honest reading of the matrix today is "d3d11, plus a reference tier".
+* **`gpu-compute` is half built, and says which half.** It opens the CUDA driver
+  API or the ROCm/HIP runtime at run time (neither is a build or link
+  dependency), enumerates the machine's GPUs, measures whether a compute context
+  opens on each, resolves T0/T1 and reports its caps - and then refuses device
+  creation, with `RECONL_ERR_BACKEND_UNAVAILABLE` when there is no vendor driver
+  and `RECONL_ERR_NOT_SUPPORTED` when there is one but this release has no
+  compute raster to run on it. `reconlEnumerateAdapters` answers on every
+  machine; the automatic backend choice does not treat it as a GPU until it can
+  render. The seam is one named constant (`RENDER_PATH_BUILT`) and the evidence
+  bar the kernels have to meet is in `docs/gpu-compute.md`, next to the reason no
+  test in this repository can exercise them yet: the development machine has no
+  CUDA and no ROCm device.
 * **No GPU timestamps.** The hardware path reports the stages it can measure on
   the host side of a submit. `reconl-bench` prints the device's split as reported
   and says so when a backend reports nothing, rather than printing a plausible

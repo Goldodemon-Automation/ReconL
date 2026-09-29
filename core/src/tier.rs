@@ -26,6 +26,12 @@ pub enum Backend {
     Metal = 7,
     WebGpu = 8,
     WasmWebGl2 = 9,
+    /// The GPU tiers reached through a vendor *compute* API rather than a
+    /// graphics one: the CUDA driver API on NVIDIA, the ROCm/HIP runtime on AMD.
+    /// One id for two runtimes because the tier question is the same one
+    /// (`gpu-discrete` or `gpu-shared`) and which vendor answered is reported in
+    /// the device's name and driver strings instead.
+    GpuCompute = 10,
 }
 
 impl Backend {
@@ -40,6 +46,7 @@ impl Backend {
             7 => Backend::Metal,
             8 => Backend::WebGpu,
             9 => Backend::WasmWebGl2,
+            10 => Backend::GpuCompute,
             _ => Backend::None,
         }
     }
@@ -56,6 +63,7 @@ impl Backend {
             Backend::Metal => "metal",
             Backend::WebGpu => "webgpu",
             Backend::WasmWebGl2 => "wasm-webgl2",
+            Backend::GpuCompute => "gpu-compute",
         }
     }
 }

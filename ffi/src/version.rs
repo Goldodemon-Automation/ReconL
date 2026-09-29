@@ -27,7 +27,7 @@ pub extern "C" fn reconlVersion(major: *mut u32, minor: *mut u32, patch: *mut u3
     }
 }
 
-const VERSION_STRING: &[u8] = b"0.1.1\0";
+const VERSION_STRING: &[u8] = b"0.1.2\0";
 
 #[no_mangle]
 pub extern "C" fn reconlVersionString() -> *const i8 {
@@ -107,6 +107,7 @@ pub extern "C" fn reconlBackendName(backend: u32) -> *const i8 {
         7 => b"metal\0",
         8 => b"webgpu\0",
         9 => b"wasm-webgl2\0",
+        10 => b"gpu-compute\0",
         _ => b"none\0",
     };
     name.as_ptr() as *const i8

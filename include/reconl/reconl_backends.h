@@ -2,8 +2,8 @@
  *
  * A backend descriptor may be passed to reconlCreateDevice through
  * ReconLDeviceDesc::backend_desc. The D3D11 adapter selection fields are read
- * in ABI 101; SoftCPU and Null descriptors remain reserved and are accepted
- * without being read.
+ * in ABI 101 and the compute backend's in ABI 102; SoftCPU and Null descriptors
+ * remain reserved and are accepted without being read.
  *
  * A backend that is asked for a capability it does not have reports it in
  * ReconLBackendProbe / ReconLDeviceLimits; it never fails device creation over
@@ -88,6 +88,35 @@ typedef struct ReconLD3D11Desc {
     uint32_t    reserved2;
     uint64_t    adapter_luid;     /* exact adapter_luid for LUID preference */
 } ReconLD3D11Desc;
+
+/* ----------------------------------------------------------------- gpu-compute
+ * The GPU tiers through a vendor compute API: the CUDA driver API on NVIDIA,
+ * the ROCm/HIP runtime on AMD. Opened at run time, so neither stack is a build
+ * or link dependency; a machine with neither driver reports
+ * RECONL_ERR_BACKEND_UNAVAILABLE rather than falling back to software.
+ *
+ * Adapters come from reconlEnumerateAdapters(RECONL_BACKEND_GPU_COMPUTE, ...),
+ * which reports the device name, its total memory, whether the driver
+ * classified it as integrated or discrete, and whether a compute context can
+ * be created on it. `device_index` selects one by its position in that list;
+ * `vendor_preference` picks which runtime to open when a machine has both.
+ *
+ * A device is created only if a context opens and the backend's kernels
+ * compile; a device that is reported but cannot render is never returned.
+ */
+typedef enum ReconLComputeVendor {
+    RECONL_COMPUTE_VENDOR_AUTO = 0,    /* NVIDIA first, then AMD               */
+    RECONL_COMPUTE_VENDOR_NVIDIA = 1,  /* CUDA only                            */
+    RECONL_COMPUTE_VENDOR_AMD = 2      /* ROCm/HIP only                        */
+} ReconLComputeVendor;
+
+typedef struct ReconLComputeDesc {
+    ReconLBase           base;   /* type = RECONL_STRUCT_COMPUTE_DESC */
+    ReconLComputeVendor  vendor_preference; /* AUTO = whichever runtime is here */
+    int32_t              device_index;      /* < 0 = let ReconL choose          */
+    uint32_t             reserved;
+    uint64_t             reserved2;
+} ReconLComputeDesc;
 
 #ifdef __cplusplus
 } /* extern "C" */

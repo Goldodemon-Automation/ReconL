@@ -43,8 +43,8 @@ pub const RECONL_TIER_COUNT: usize = 5;
 
 pub const VERSION_MAJOR: u32 = 0;
 pub const VERSION_MINOR: u32 = 1;
-pub const VERSION_PATCH: u32 = 1;
-pub const ABI_VERSION: u32 = 101;
+pub const VERSION_PATCH: u32 = 2;
+pub const ABI_VERSION: u32 = 102;
 
 // --------------------------------------------------------------------- results
 
@@ -101,6 +101,9 @@ pub mod struct_type {
     /// D3D11 is read when creating a D3D11 device; SoftCPU and Null remain reserved.
     pub const D3D11_DESC: u32 = 66;
     pub const ADAPTER_INFO: u32 = 67;
+    /// The compute backend's descriptor. Additive: no existing struct changed
+    /// size, so an older caller keeps working - see `RECONL_ABI_VERSION`.
+    pub const COMPUTE_DESC: u32 = 68;
 }
 
 // ------------------------------------------------------------------ backend ids
@@ -119,6 +122,13 @@ pub mod adapter_preference {
     pub const LUID: u32 = 4;
 }
 
+/// `ReconLComputeVendor`: which runtime the compute backend opens.
+pub mod compute_vendor {
+    pub const AUTO: u32 = 0;
+    pub const NVIDIA: u32 = 1;
+    pub const AMD: u32 = 2;
+}
+
 pub mod backend {
     pub const NONE: u32 = 0;
     pub const SOFT_CPU: u32 = 1;
@@ -130,6 +140,8 @@ pub mod backend {
     pub const METAL: u32 = 7;
     pub const WEBGPU: u32 = 8;
     pub const WASM_WEBGL2: u32 = 9;
+    /// CUDA (NVIDIA) or ROCm (AMD), whichever runtime this machine has.
+    pub const GPU_COMPUTE: u32 = 10;
 }
 
 // ------------------------------------------------------------- downgrade flags
@@ -381,6 +393,25 @@ impl ReconLD3D11Desc {
         (core::mem::offset_of!(Self, adapter_preference) + core::mem::size_of::<u32>()) as u32;
     pub const LUID_SIZE: u32 =
         (core::mem::offset_of!(Self, adapter_luid) + core::mem::size_of::<u64>()) as u32;
+}
+
+/// `ReconLComputeDesc` from `reconl_backends.h`: the compute backend's adapter
+/// selection. Its whole contract is at the front of the struct, so it has no
+/// size-gated suffix and a caller's `struct_size` only has to reach the fields
+/// it uses - which is what `ABIStruct::MIN_SIZE` enforces.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReconLComputeDesc {
+    pub base: StructHeader,
+    pub vendor_preference: u32,
+    pub device_index: i32,
+    pub reserved: u32,
+    pub reserved2: u64,
+}
+
+impl ABIStruct for ReconLComputeDesc {
+    const STRUCT_TYPE: u32 = struct_type::COMPUTE_DESC;
+    const MIN_SIZE: u32 = core::mem::size_of::<Self>() as u32;
 }
 
 #[repr(C)]

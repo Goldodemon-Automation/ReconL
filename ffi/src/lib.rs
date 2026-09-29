@@ -564,6 +564,27 @@ impl DeviceHandle {
 
 // --------------------------------------------------------------------- probe
 
+/// The zeroed adapter record with its ABI header stamped, so an enumeration
+/// fills in only the fields its driver actually answered.
+fn blank_adapter_info() -> ReconLAdapterInfo {
+    ReconLAdapterInfo {
+        base: reconl_core::StructHeader::new(
+            core::mem::size_of::<ReconLAdapterInfo>() as u32,
+            struct_type::ADAPTER_INFO,
+        ),
+        backend: backend::NONE,
+        adapter_type: adapter_type::UNKNOWN,
+        usable: 0,
+        vendor_id: 0,
+        device_id: 0,
+        reserved: 0,
+        adapter_luid: 0,
+        dedicated_video_memory: 0,
+        shared_system_memory: 0,
+        name: [0; abi::RECONL_MAX_NAME],
+    }
+}
+
 fn probe_entry(backend_id: u32, name: &str, device_name: &str, usable: bool, caps: u32, best_tier: Tier, vram: u64, ram: u64, cascades: u32, budget: u64, note: &str) -> ReconLBackendProbe {
     let mut entry = ReconLBackendProbe {
         backend: backend_id,
@@ -643,16 +664,43 @@ pub unsafe extern "C" fn reconlProbe(desc: *const ReconLProbeDesc, out: *mut Rec
             ShadowFilter::Pcf3x3,
             gpu_caps,
         );
+        // The compute backend is probed for real too: the driver has to be
+        // present, and the release has to be able to render on it. The two
+        // answers are reported separately, because "this machine has no NVIDIA
+        // or AMD driver" and "this build cannot render on the one it has" are
+        // different things for a host to act on.
+        let compute_adapters = reconl_backend_gpucompute::discover();
+        let compute_support = reconl_backend_gpucompute::device_support();
+        let compute_usable = compute_support.is_ok();
+        let compute_best = reconl_backend_gpucompute::best(&compute_adapters);
+        let compute_caps = compute_best
+            .map(|adapter| reconl_backend_gpucompute::caps_for(adapter.best_tier))
+            .unwrap_or(0);
+        let compute_plan = shadow_plan(
+            compute_best.map(|a| a.best_tier).unwrap_or(Tier::GpuShared),
+            3,
+            24 << 20,
+            ShadowFilter::Pcf3x3,
+            compute_caps,
+        );
+        let compute_note = match &compute_support {
+            Ok(()) => "T0/T1 through a vendor compute API; the same passes, diffed against the soft-cpu golden".to_string(),
+            Err(e) => e.message.as_str().to_string(),
+        };
+
         // The ladder's recommendation, and the one `tier_plan` will make when a
-        // device is created without a hint.
+        // device is created without a hint. D3D11 first: it is the GPU path that
+        // has been diffed against the golden.
         let preferred = if gpu_usable {
             (Tier::GpuShared, backend::D3D11)
+        } else if compute_usable {
+            (compute_best.map(|a| a.best_tier).unwrap_or(Tier::GpuShared), backend::GPU_COMPUTE)
         } else {
             (if disk_ok { Tier::OutOfCore } else { Tier::CpuRam }, backend::SOFT_CPU)
         };
         let mut info = ReconLProbeInfo {
             base: reconl_core::StructHeader::new(core::mem::size_of::<ReconLProbeInfo>() as u32, struct_type::PROBE_INFO),
-            entry_count: 3,
+            entry_count: 4,
             entries: [ReconLBackendProbe {
                 backend: 0,
                 name: [0; abi::RECONL_MAX_NAME],
@@ -711,6 +759,26 @@ pub unsafe extern "C" fn reconlProbe(desc: *const ReconLProbeDesc, out: *mut Rec
             plan_t4.cascades,
             0,
             "counts commands and present calls without producing pixels; the CI backend",
+        );
+        // The compute row names the adapter the driver reported - which vendor
+        // answered is in `device_name` and in the `driver` a created device
+        // would report - and its note carries the *measured* reason it is not
+        // usable, so a log line is enough to tell a missing driver from a
+        // missing render path.
+        info.entries[3] = probe_entry(
+            backend::GPU_COMPUTE,
+            "gpu-compute",
+            compute_best
+                .map(|a| a.name.as_str())
+                .unwrap_or("no CUDA or ROCm device"),
+            compute_usable,
+            compute_caps,
+            compute_best.map(|a| a.best_tier).unwrap_or(Tier::GpuShared),
+            compute_best.map(|a| a.vram_bytes).unwrap_or(0),
+            ram,
+            compute_plan.cascades,
+            compute_plan.map_bytes,
+            &compute_note,
         );
 
         if !info.entries[0].name.is_empty() {
@@ -820,37 +888,72 @@ pub unsafe extern "C" fn reconlEnumerateAdapters(
             return err!(Code::InvalidArgument, "null adapter count output");
         }
         unsafe { out_count.write(0) };
-        if backend_id != backend::D3D11 {
-            return err!(Code::NotSupported, "adapter enumeration is not supported for backend {}", backend_id);
-        }
         if adapters.is_null() && capacity != 0 {
             return err!(Code::InvalidArgument, "null adapter output with nonzero capacity");
         }
-        let entries = reconl_backend_d3d11::probe_adapters()?;
+        // One list per backend, so the short-buffer rule and the write loop below
+        // are the same for both rather than a copy that can drift.
+        let entries: Vec<ReconLAdapterInfo> = match backend_id {
+            backend::D3D11 => reconl_backend_d3d11::probe_adapters()?
+                .into_iter()
+                .map(|adapter| {
+                    let mut info = blank_adapter_info();
+                    info.backend = backend::D3D11;
+                    info.adapter_type = match adapter.adapter_type {
+                        reconl_backend_d3d11::AdapterType::Unknown => adapter_type::UNKNOWN,
+                        reconl_backend_d3d11::AdapterType::Integrated => adapter_type::INTEGRATED,
+                        reconl_backend_d3d11::AdapterType::Discrete => adapter_type::DISCRETE,
+                    };
+                    info.usable = u32::from(adapter.feature_level_11);
+                    info.vendor_id = adapter.vendor_id;
+                    info.device_id = adapter.device_id;
+                    info.adapter_luid = adapter.adapter_luid;
+                    info.dedicated_video_memory = adapter.dedicated_video_memory;
+                    info.shared_system_memory = adapter.shared_system_memory;
+                    set_str(&mut info.name, &adapter.description);
+                    info
+                })
+                .collect(),
+            backend::GPU_COMPUTE => reconl_backend_gpucompute::discover()
+                .into_iter()
+                .map(|adapter| {
+                    let mut info = blank_adapter_info();
+                    info.backend = backend::GPU_COMPUTE;
+                    info.adapter_type = match adapter.integrated {
+                        Some(true) => adapter_type::INTEGRATED,
+                        Some(false) => adapter_type::DISCRETE,
+                        None => adapter_type::UNKNOWN,
+                    };
+                    // Measured, not assumed: `usable` is whether a compute
+                    // context opens on the device, and (this release) whether the
+                    // build has a raster to run on it.
+                    info.usable = u32::from(adapter.usable);
+                    // The compute drivers expose no LUID, so none is reported
+                    // rather than an index dressed up as one. A host selects one
+                    // of these through ReconLComputeDesc::device_index, which is
+                    // the position in this list - the driver's own order.
+                    info.adapter_luid = 0;
+                    info.dedicated_video_memory = if adapter.integrated == Some(true) {
+                        0
+                    } else {
+                        adapter.vram_bytes
+                    };
+                    info.shared_system_memory = adapter.shared_system_memory;
+                    set_str(&mut info.name, &adapter.name);
+                    info
+                })
+                .collect(),
+            _ => {
+                return err!(
+                    Code::NotSupported,
+                    "adapter enumeration is not supported for backend {}",
+                    backend_id
+                )
+            }
+        };
         let count = u32::try_from(entries.len()).map_err(|_| Error::new(Code::OutOfMemory, "adapter count exceeds the ABI limit"))?;
         let write_count = (capacity as usize).min(entries.len());
-        for (index, adapter) in entries.iter().take(write_count).enumerate() {
-            let mut info = ReconLAdapterInfo {
-                base: reconl_core::StructHeader::new(
-                    core::mem::size_of::<ReconLAdapterInfo>() as u32,
-                    struct_type::ADAPTER_INFO,
-                ),
-                backend: backend::D3D11,
-                adapter_type: match adapter.adapter_type {
-                    reconl_backend_d3d11::AdapterType::Unknown => adapter_type::UNKNOWN,
-                    reconl_backend_d3d11::AdapterType::Integrated => adapter_type::INTEGRATED,
-                    reconl_backend_d3d11::AdapterType::Discrete => adapter_type::DISCRETE,
-                },
-                usable: u32::from(adapter.feature_level_11),
-                vendor_id: adapter.vendor_id,
-                device_id: adapter.device_id,
-                reserved: 0,
-                adapter_luid: adapter.adapter_luid,
-                dedicated_video_memory: adapter.dedicated_video_memory,
-                shared_system_memory: adapter.shared_system_memory,
-                name: [0; abi::RECONL_MAX_NAME],
-            };
-            set_str(&mut info.name, &adapter.description);
+        for (index, info) in entries.into_iter().take(write_count).enumerate() {
             // SAFETY: the caller promised a writable array of `capacity` entries.
             unsafe { adapters.add(index).write(info) };
         }
@@ -947,7 +1050,13 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     // hint the backend follows the machine: a creatable D3D11 device means the
     // hardware tiers, and a machine with no usable GPU API starts at the T2
     // reference tier - which is the CI case the design requires to work.
+    //
+    // The compute backend is probed the same way and is *not* counted as a GPU
+    // for the automatic choice until it can actually render
+    // (`device_support`): a backend that enumerates a GPU but refuses every
+    // device must not become the default on a machine that has one.
     let gpu_available = reconl_backend_d3d11::hardware_available();
+    let compute_usable = reconl_backend_gpucompute::device_support().is_ok();
     let requested_adapter = desc.backend_hint == backend::D3D11
         && !desc.backend_desc.is_null()
         && {
@@ -968,6 +1077,16 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
             backend::D3D11 if requested_adapter => (Tier::GpuDiscrete, TierReason::HostRequest),
             backend::D3D11 => (Tier::GpuShared, TierReason::HostRequest),
             backend::SOFT_CPU | backend::NULL => (Tier::CpuRam, TierReason::HostRequest),
+            backend::GPU_COMPUTE => (
+                // The tier the probed adapter would start at, which is T0 for a
+                // device the driver calls discrete and T1 otherwise. A host that
+                // asked for the compute backend has named the hardware, so this
+                // is a host request rather than a probe guess.
+                reconl_backend_gpucompute::best(&reconl_backend_gpucompute::discover())
+                    .map(|adapter| adapter.best_tier)
+                    .unwrap_or(Tier::GpuShared),
+                TierReason::HostRequest,
+            ),
             _ if gpu_available => (Tier::GpuShared, TierReason::StartupProbe),
             _ => (Tier::CpuRam, TierReason::NoGpuApi),
         }
@@ -976,7 +1095,16 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     // With no backend named the tier picks one, so the two cannot disagree.
     let requested_backend = if desc.backend_hint == backend::NONE {
         if tier <= Tier::GpuShared {
-            backend::D3D11
+            // Whichever GPU path can actually start: D3D11 first, because it is
+            // the one that has been diffed against the golden, and the compute
+            // backend only once it can render (see `compute_usable`).
+            if gpu_available {
+                backend::D3D11
+            } else if compute_usable {
+                backend::GPU_COMPUTE
+            } else {
+                backend::SOFT_CPU
+            }
         } else {
             backend::SOFT_CPU
         }
@@ -989,6 +1117,14 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
     // stats a host reads back.
     match requested_backend {
         backend::D3D11 if tier > Tier::GpuShared => {
+            tier = Tier::GpuShared;
+            tier_reason = TierReason::HostRequest;
+        }
+        backend::GPU_COMPUTE if tier > Tier::GpuShared => {
+            // The compute backend's own ladder tops out at T1 on a shared-memory
+            // device; a host asking for T2..T4 on it is asking for a tier the
+            // backend does not have, and the honest answer is the GPU tier it
+            // does have rather than a software label on a GPU device.
             tier = Tier::GpuShared;
             tier_reason = TierReason::HostRequest;
         }
@@ -1023,6 +1159,19 @@ unsafe fn create_device(desc: *const ReconLDeviceDesc, out: *mut *mut DeviceHand
         }
         backend::D3D11 => {
             BackendKind::D3d11(Box::new(D3d11Device::new(alloc, Arc::clone(&budget), gpu_config.clone())?))
+        }
+        backend::GPU_COMPUTE => {
+            // Enumerated here, renderable or not: the compute backend refuses at
+            // creation unless a device can actually render, and it says which of
+            // the two things is missing - no driver on this machine
+            // (`BACKEND_UNAVAILABLE`) or no compute raster in this release
+            // (`NOT_SUPPORTED`). What it never does is hand back a device whose
+            // frames would fail, and it never falls back to software.
+            reconl_backend_gpucompute::device_support()?;
+            return err!(
+                Code::NotSupported,
+                "the gpu-compute backend is declared in the ABI and its device layer is built, but this release has no compute raster; use RECONL_BACKEND_D3D11 or RECONL_BACKEND_SOFT_CPU"
+            );
         }
         other => {
             if other != backend::SOFT_CPU {

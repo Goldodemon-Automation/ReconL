@@ -1,0 +1,12 @@
+[package]
+name = "reconl-backend-gpucompute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+reconl-core = { workspace = true }
+
+[lib]
+name = "reconl_backend_gpucompute"
+path = "src/lib.rs"

@@ -146,7 +146,8 @@ typedef enum ReconLStructType {
     RECONL_STRUCT_SOFTCPU_DESC = 64,
     RECONL_STRUCT_NULL_DESC = 65,
     RECONL_STRUCT_D3D11_DESC = 66,
-    RECONL_STRUCT_ADAPTER_INFO = 67
+    RECONL_STRUCT_ADAPTER_INFO = 67,
+    RECONL_STRUCT_COMPUTE_DESC = 68   /* ReconLComputeDesc */
 } ReconLStructType;
 
 typedef struct ReconLBase {
@@ -167,7 +168,14 @@ typedef enum ReconLBackendId {
     RECONL_BACKEND_GL = 6,
     RECONL_BACKEND_METAL = 7,
     RECONL_BACKEND_WEBGPU = 8,
-    RECONL_BACKEND_WASM_WEBGL2 = 9
+    RECONL_BACKEND_WASM_WEBGL2 = 9,
+    /* The GPU tiers through a vendor *compute* API instead of a graphics one:
+     * the CUDA driver API on NVIDIA, the ROCm/HIP runtime on AMD. Which vendor
+     * answered is reported in ReconLDeviceLimits::device_name / ::driver and in
+     * ReconLBackendProbe::device_name; the tier ids are the same T0/T1 the
+     * graphics backend uses. Adapters are enumerated with reconlEnumerateAdapters
+     * and selected through ReconLComputeDesc. */
+    RECONL_BACKEND_GPU_COMPUTE = 10
 } ReconLBackendId;
 
 typedef enum ReconLAdapterType {
@@ -957,7 +965,15 @@ RECONL_API ReconLResult RECONL_CALL reconlProbe(const ReconLProbeDesc* desc, Rec
  * error. Each output entry's base is filled by ReconL (the host need not
  * initialize it). Other/unbuilt backends return RECONL_ERR_NOT_SUPPORTED; a
  * non-Windows build reports zero D3D11 adapters. `usable` means D3D11 feature
- * level 11.0 can be created on that adapter. */
+ * level 11.0 can be created on that adapter.
+ *
+ * RECONL_BACKEND_GPU_COMPUTE is enumerable too, and answers even where the
+ * machine has no vendor driver: an empty list is the answer, not an error. Each
+ * entry reports the driver's own device name, its total memory, the adapter type
+ * the driver declared (UNKNOWN when it declares none), and `usable` = a compute
+ * context can be created on it. The compute drivers expose no LUID, so
+ * `adapter_luid` is 0 there and an adapter is selected by its position in this
+ * list through ReconLComputeDesc::device_index. */
 RECONL_API ReconLResult RECONL_CALL reconlEnumerateAdapters(
     ReconLBackendId backend, ReconLAdapterInfo* adapters, uint32_t capacity, uint32_t* out_count);
 

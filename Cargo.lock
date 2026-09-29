@@ -135,6 +135,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reconl-backend-gpucompute"
+version = "0.1.0"
+dependencies = [
+ "reconl-core",
+]
+
+[[package]]
 name = "reconl-backend-null"
 version = "0.1.0"
 dependencies = [
@@ -189,6 +196,7 @@ name = "reconl-ffi"
 version = "0.1.0"
 dependencies = [
  "reconl-backend-d3d11",
+ "reconl-backend-gpucompute",
  "reconl-backend-null",
  "reconl-backend-softcpu",
  "reconl-contract",

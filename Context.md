@@ -24,7 +24,10 @@ ffi/                     the only place the ABI exists
   ├── contract/          FrameInput / ShadowRequest: what a backend is handed
   └── backends/
         soft-cpu/        the reference tier — the definition of correct
-        d3d11/           the hardware tier — must match the reference
+        d3d11/           the graphics hardware tier — must match the reference
+        gpu-compute/     the GPU tiers through a vendor compute API: CUDA on
+                         NVIDIA, ROCm/HIP on AMD, both opened at run time.
+                         Device layer built, raster not — docs/gpu-compute.md
         null/            no-op, so ABI tests run without a GPU
               └── raster/  tiled fixed-point rasteriser, SIMD fills, ShaderRef
               └── shadow/  cascade fit, texel snap, bias presets, filters

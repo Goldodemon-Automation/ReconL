@@ -15,6 +15,7 @@ members = [
     "backends/null",
     "backends/soft-cpu",
     "backends/d3d11",
+    "backends/gpu-compute",
     "ffi",
 ]
 
@@ -35,6 +36,7 @@ reconl-contract = { path = "contract" }
 reconl-backend-null = { path = "backends/null" }
 reconl-backend-softcpu = { path = "backends/soft-cpu" }
 reconl-backend-d3d11 = { path = "backends/d3d11" }
+reconl-backend-gpucompute = { path = "backends/gpu-compute" }
 reconl-png = { path = "tools/png" }
 reconl-host = { path = "tools/host" }
 reconl = { package = "reconl-ffi", path = "ffi" }

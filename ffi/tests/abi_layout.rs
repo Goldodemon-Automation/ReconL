@@ -193,6 +193,13 @@ fn generated() -> String {
         f!(ReconLD3D11Desc, reserved2, u32, "int"),
         f!(ReconLD3D11Desc, adapter_luid, u64, "int"),
     ]);
+    struct_layout(&mut c, "ReconLComputeDesc", size_of::<ReconLComputeDesc>(), &[
+        f!(ReconLComputeDesc, base, StructHeader, "none"),
+        f!(ReconLComputeDesc, vendor_preference, u32, "int"),
+        f!(ReconLComputeDesc, device_index, i32, "int"),
+        f!(ReconLComputeDesc, reserved, u32, "int"),
+        f!(ReconLComputeDesc, reserved2, u64, "int"),
+    ]);
 
     struct_layout(&mut c, "ReconLDeviceLimits", size_of::<ReconLDeviceLimits>(), &[
         f!(ReconLDeviceLimits, base, StructHeader, "none"),
@@ -668,6 +675,7 @@ fn constants(c: &mut String) {
         "RECONL_STRUCT_NULL_DESC" = struct_type::NULL_DESC as i64,
         "RECONL_STRUCT_D3D11_DESC" = struct_type::D3D11_DESC as i64,
         "RECONL_STRUCT_ADAPTER_INFO" = struct_type::ADAPTER_INFO as i64,
+        "RECONL_STRUCT_COMPUTE_DESC" = struct_type::COMPUTE_DESC as i64,
     );
 
     let _ = writeln!(c, "\n/* ---------------- backends, tiers and reasons ---------------- */");
@@ -682,6 +690,10 @@ fn constants(c: &mut String) {
         "RECONL_BACKEND_METAL" = backend::METAL as i64,
         "RECONL_BACKEND_WEBGPU" = backend::WEBGPU as i64,
         "RECONL_BACKEND_WASM_WEBGL2" = backend::WASM_WEBGL2 as i64,
+        "RECONL_BACKEND_GPU_COMPUTE" = backend::GPU_COMPUTE as i64,
+        "RECONL_COMPUTE_VENDOR_AUTO" = compute_vendor::AUTO as i64,
+        "RECONL_COMPUTE_VENDOR_NVIDIA" = compute_vendor::NVIDIA as i64,
+        "RECONL_COMPUTE_VENDOR_AMD" = compute_vendor::AMD as i64,
         "RECONL_ADAPTER_TYPE_UNKNOWN" = adapter_type::UNKNOWN as i64,
         "RECONL_ADAPTER_TYPE_INTEGRATED" = adapter_type::INTEGRATED as i64,
         "RECONL_ADAPTER_TYPE_DISCRETE" = adapter_type::DISCRETE as i64,
