@@ -71,10 +71,13 @@ OPTIONS:
   --target-ms=N         frame-time target for the tier ladder; 0 disables it
   --audit=N             re-verify tier and budget every N frames (expensive)
   --fps-gate            sweep 1280x720, 1920x1080, 2560x1440 and 3840x2160 and
-                        judge each resolution's mean frame time against the
+                        judge each resolution's gated frame time against the
                         frame budget; exit 3 when any resolution is over it
   --fps-target=N        the gate's budget in frames per second (default 60,
-                        which is 16.666 ms per frame at the mean)
+                        which is 16.667 ms per frame)
+  --fps-stat=WHICH      what the gate judges: median (default), mean or best
+  --fps-trials=N        measured trials per resolution (default 3); the gate
+                        collapses them into the one number it judges
   --trace=PATH          write the per-frame trace and per-second summary
   --png=PATH            write the last frame as an RGBA PNG
   --help                this text
@@ -93,7 +96,7 @@ fn main() -> ExitCode {
     }
 }
 
-const FLAGS: [&str; 24] = [
+const FLAGS: [&str; 26] = [
     "--backend",
     "--tier",
     "--adapter",
@@ -115,6 +118,8 @@ const FLAGS: [&str; 24] = [
     "--audit",
     "--fps-gate",
     "--fps-target",
+    "--fps-stat",
+    "--fps-trials",
     "--trace",
     "--png",
     "--help",
@@ -135,10 +140,14 @@ struct Options {
     /// Images per rendered frame, as a reduced fraction, or `None` when the
     /// run renders and presents one image per frame as it always did.
     framegen: Option<(u32, u32)>,
-    /// Sweep the gate's four resolutions and judge each mean against the budget.
+    /// Sweep the gate's four resolutions and judge each against the budget.
     fps_gate: bool,
-    /// The budget in frames per second (60 = 16.666 ms per frame at the mean).
+    /// The budget in frames per second (60 = 16.667 ms per frame).
     fps_target: u32,
+    /// How repeated trials collapse into the one number the gate judges.
+    fps_stat: GateStat,
+    /// Measured trials per resolution, each its own warmup-then-measure run.
+    fps_trials: u32,
 }
 
 fn options_from(args: &[String]) -> Result<Options, String> {
@@ -157,6 +166,8 @@ fn options_from(args: &[String]) -> Result<Options, String> {
         framegen: None,
         fps_gate: false,
         fps_target: 60,
+        fps_stat: GateStat::Median,
+        fps_trials: 3,
     };
     if let Some(name) = units::value_of(args, "--backend") {
         config.backend = Config::backend_from_name(name)
@@ -233,6 +244,16 @@ fn options_from(args: &[String]) -> Result<Options, String> {
             return Err("`--fps-target` must be at least 1 frame per second".into());
         }
     }
+    if let Some(v) = units::value_of(args, "--fps-stat") {
+        options.fps_stat = GateStat::from_name(v)
+            .ok_or_else(|| format!("`{v}` is not a gate statistic: median, mean or best"))?;
+    }
+    if let Some(v) = units::value_of(args, "--fps-trials") {
+        options.fps_trials = units::parse_u32(v, "fps trial count")?;
+        if options.fps_trials == 0 {
+            return Err("`--fps-trials` must be at least 1 trial".into());
+        }
+    }
     if options.fps_gate {
         // The gate sweeps its own four resolutions. An option that would
         // quietly pick a different frame, a different schedule or a different
@@ -242,6 +263,18 @@ fn options_from(args: &[String]) -> Result<Options, String> {
             if units::value_of(args, flag).is_some() {
                 return Err(format!(
                     "`{flag}` does not apply to --fps-gate: the gate sweeps 1280x720, 1920x1080, 2560x1440 and 3840x2160 itself - drop `{flag}`"
+                ));
+            }
+        }
+    } else {
+        // The same mislabelling, the other direction. A run without --fps-gate
+        // reports a plain mean and has no gated statistic to configure, so
+        // accepting these and ignoring them would print a measurement the
+        // caller did not ask for and never said they were not getting.
+        for flag in ["--fps-target", "--fps-stat", "--fps-trials"] {
+            if units::value_of(args, flag).is_some() {
+                return Err(format!(
+                    "`{flag}` only applies to --fps-gate: a run without it reports no gated statistic - add --fps-gate or drop `{flag}`"
                 ));
             }
         }
@@ -517,14 +550,108 @@ fn budget_ns(target_fps: u32) -> u64 {
     1_000_000_000 / u64::from(target_fps.max(1))
 }
 
-/// The gate's one question: does this resolution's *mean* frame time fit?
+/// The statistic repeated trials collapse into, the one number the gate judges.
 ///
-/// The mean decides because the claim under test is a sustained rate. Min and
-/// max are printed beside it - a number without its spread is a peak wearing a
-/// costume - and warmup is excluded for the same reason the single run
-/// excludes it: the first frames pay costs a steady state does not.
-fn within_budget(mean_ns: u64, budget: u64) -> bool {
-    mean_ns <= budget
+/// The default is the median because a gate's verdict has to be *reproducible*,
+/// and a mean is hostage to the worst frame in the window. On a shared machine
+/// one 90 ms scheduling stall drags a 60-frame mean over a budget that the
+/// other 59 frames cleared, and the same binary then passes on the next run -
+/// a verdict that changes when nothing did is not a measurement, it is a coin.
+///
+/// The gate therefore reduces twice, in two separate places. Within a trial the
+/// statistic is always the median, so a stalled frame cannot move the number.
+/// Across trials, `--fps-stat` picks how the trial medians collapse, which is
+/// what absorbs a machine that drifts part-way through a sweep.
+///
+/// `Mean` is the policy this replaced, kept so the old number stays
+/// reproducible for comparison. `Best` is the honest ceiling - the fastest
+/// trial this machine could actually hold - which says what the hardware can
+/// do, not what a run delivers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GateStat {
+    Median,
+    Mean,
+    Best,
+}
+
+impl GateStat {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "median" => Some(Self::Median),
+            "mean" | "avg" => Some(Self::Mean),
+            "best" | "min" => Some(Self::Best),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Median => "median",
+            Self::Mean => "mean",
+            Self::Best => "best",
+        }
+    }
+
+    /// How the per-trial numbers collapse into the judged one.
+    fn of(self, trials: &[u64]) -> u64 {
+        if trials.is_empty() {
+            return 0;
+        }
+        match self {
+            Self::Median => median(trials),
+            Self::Mean => trials.iter().sum::<u64>() / trials.len() as u64,
+            Self::Best => trials.iter().copied().min().unwrap_or(0),
+        }
+    }
+}
+
+/// The median of a set of frame times: the middle sample once sorted, taking
+/// the lower of the two middles on an even count so the answer is always a
+/// frame that was really measured rather than an average of two.
+fn median(samples: &[u64]) -> u64 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    sorted[(sorted.len() - 1) / 2]
+}
+
+/// The trial numbers in one column, through the tool's own duration formatter,
+/// so a trial and the gated number beside it are printed by the same rule.
+fn trial_column(trials: &[u64]) -> String {
+    trials.iter().map(|t| ns(*t)).collect::<Vec<_>>().join(" ")
+}
+
+/// The gate table's header and every row print through this one layout. Two
+/// copies of a format string drift, and a table whose columns disagree with its
+/// own header is worse than one with no header at all.
+fn gate_row(cells: [&str; 7]) {
+    println!(
+        "  {:<18} {:<30}  {:>9}  {:>9}  {:>9}  {:>7}  {}",
+        cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
+    );
+}
+
+/// `1 trial` / `3 trials`. The summary names its own sample size, and a tool
+/// whose output says "1 trials" is a tool whose output deserves suspicion.
+fn plural(count: u32, word: &str) -> String {
+    if count == 1 {
+        format!("{count} {word}")
+    } else {
+        format!("{count} {word}s")
+    }
+}
+
+/// The gate's one question: does this resolution's gated frame time fit?
+///
+/// The gated time is whatever `--fps-stat` collapsed the trials into - the
+/// median of them by default - and it is the only number the verdict reads.
+/// Min and max are printed beside it because a number without its spread is a
+/// peak wearing a costume; the gap between the gated column and `max` is
+/// exactly what the old mean-based verdict used to be hostage to.
+fn within_budget(gated_ns: u64, budget: u64) -> bool {
+    gated_ns <= budget
 }
 
 /// One resolution's measured frames, through the same warmup-then-measure
@@ -586,46 +713,80 @@ fn describe(error: String, device: &Device, width: u32, height: u32) -> String {
 /// The sweep is the 60 FPS question asked the only way it can be answered
 /// honestly: one device, one scene, the warmup/measure discipline of a normal
 /// run at every resolution a host means by 720p through 4K, and a table whose
-/// mean column is judged against the budget in integer nanoseconds. Any
+/// *gated* column is judged against the budget in integer nanoseconds. Any
 /// resolution over budget makes the summary line say FAIL and the process exit
 /// 3, so a gate that cannot hold the budget fails a pipeline rather than
 /// printing a number nobody checks.
+///
+/// Each resolution is measured `--fps-trials` times (3 by default), each trial a
+/// full warmup-then-measure run on its own renderer, and each reports the median
+/// of its frames. The repeated trials are also how a cold start is discarded: a
+/// caller who passes `--warmup=0` puts the cold frames in the *first* trial only,
+/// and the median across trials drops that trial rather than letting it set the
+/// verdict. The table prints every trial's median next to the gated number, so
+/// the row shows its own evidence instead of asking to be trusted.
 fn fps_gate(device: &Device, scene: &Scene, options: &Options) -> Result<ExitCode, String> {
     let budget = budget_ns(options.fps_target);
+    let stat = options.fps_stat;
+    let trials = options.fps_trials;
     println!(
-        "\nfps gate — budget {} fps ({}) per frame at the mean of {} + {} frames",
+        "\nfps gate — budget {} fps ({}) per frame",
         options.fps_target,
-        ns(budget),
-        options.warmup,
-        options.frames
+        ns(budget)
     );
     println!(
-        "  {:<18} {:>10}  {:>10}  {:>10}  {:>7}  {}",
-        "resolution", "min", "avg", "max", "fps", "verdict"
+        "  policy: each trial is the median of {} frames after {} warmup; the verdict is the {} of {}",
+        options.frames,
+        options.warmup,
+        stat.name(),
+        plural(trials, "trial")
     );
+    gate_row([
+        "resolution",
+        "trials (median each)",
+        "gated",
+        "min",
+        "max",
+        "fps",
+        "verdict",
+    ]);
     let mut over: Vec<String> = Vec::new();
     for (name, width, height) in GATE_SWEEP {
-        let run = gate_measure(device, scene, options, width, height)?;
-        let (min, avg, max) = run.bounds();
-        let pass = within_budget(avg, budget);
+        let mut trial_medians: Vec<u64> = Vec::with_capacity(trials as usize);
+        // `--frames` is at least 1 and `--fps-trials` is at least 1, so every
+        // loop below runs at least once with at least one sample: `min` ends
+        // up a real frame and needs no "was anything seen" guard.
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        for _ in 0..trials {
+            let run = gate_measure(device, scene, options, width, height)?;
+            let (trial_min, _, trial_max) = run.bounds();
+            min = min.min(trial_min);
+            max = max.max(trial_max);
+            trial_medians.push(run.median_total());
+        }
+        let gated = stat.of(&trial_medians);
+        let pass = within_budget(gated, budget);
         if !pass {
             over.push(format!(
-                "{name} {width}x{height}: mean {}, {} fps — over the {} fps budget by {}",
-                ns(avg),
-                fps(avg),
+                "{name} {width}x{height}: gated {} ({} of {}), {} fps — over the {} fps budget by {}",
+                ns(gated),
+                stat.name(),
+                plural(trials, "trial"),
+                fps(gated),
                 options.fps_target,
-                ns(avg - budget)
+                ns(gated - budget)
             ));
         }
-        println!(
-            "  {:<18} {:>10}  {:>10}  {:>10}  {:>7}  {}",
-            format!("{name} {width}x{height}"),
-            ns(min),
-            ns(avg),
-            ns(max),
-            fps(avg),
-            if pass { "PASS" } else { "FAIL" }
-        );
+        gate_row([
+            &format!("{name} {width}x{height}"),
+            &trial_column(&trial_medians),
+            &ns(gated),
+            &ns(min),
+            &ns(max),
+            &fps(gated),
+            if pass { "PASS" } else { "FAIL" },
+        ]);
     }
     let stats = device.stats()?;
     if stats.audit_divergences > 0 {
@@ -633,17 +794,21 @@ fn fps_gate(device: &Device, scene: &Scene, options: &Options) -> Result<ExitCod
     }
     if over.is_empty() {
         println!(
-            "\ngate: PASS — all {} resolutions within {} fps",
+            "\ngate: PASS — all {} resolutions within {} fps (gated on the {} of {})",
             GATE_SWEEP.len(),
-            options.fps_target
+            options.fps_target,
+            stat.name(),
+            plural(trials, "trial")
         );
         Ok(ExitCode::from(0))
     } else {
         println!(
-            "\ngate: FAIL — {} of {} resolutions over {} fps:",
+            "\ngate: FAIL — {} of {} resolutions over {} fps (gated on the {} of {}):",
             over.len(),
             GATE_SWEEP.len(),
-            options.fps_target
+            options.fps_target,
+            stat.name(),
+            plural(trials, "trial")
         );
         for line in &over {
             println!("  {line}");
@@ -774,6 +939,14 @@ impl Run {
         let min = self.samples.iter().map(|s| s.total_ns).min().unwrap_or(0);
         let max = self.samples.iter().map(|s| s.total_ns).max().unwrap_or(0);
         (min, self.mean(|s| s.total_ns), max)
+    }
+
+    /// The median of this run's measured frames - what one trial reports.
+    ///
+    /// Deliberately not `mean`: a run's mean is the number the gate used to
+    /// judge, and it moves for one stalled frame while the median does not.
+    fn median_total(&self) -> u64 {
+        median(&self.samples.iter().map(|s| s.total_ns).collect::<Vec<u64>>())
     }
 
     /// What the frame-generation schedule actually delivered.
@@ -1005,15 +1178,78 @@ impl Run {
 mod tests {
     use super::*;
 
-    /// The budget is one integer nanosecond count per target, and the mean -
-    /// not a lucky frame - is what the verdict reads: exactly on the budget
-    /// passes, one nanosecond over does not.
+    /// The budget is one integer nanosecond count per target, and the gated
+    /// number - not a lucky frame - is what the verdict reads: exactly on the
+    /// budget passes, one nanosecond over does not.
     #[test]
-    fn the_gate_budget_is_whole_nanoseconds_and_the_mean_decides() {
+    fn the_gate_budget_is_whole_nanoseconds_and_the_gated_number_decides() {
         assert_eq!(budget_ns(60), 16_666_666);
         assert_eq!(budget_ns(1), 1_000_000_000);
         assert!(within_budget(budget_ns(60), budget_ns(60)));
         assert!(!within_budget(budget_ns(60) + 1, budget_ns(60)));
+    }
+
+    /// The median is the point of the change, so it is pinned by the behaviour
+    /// that motivated it: one catastrophic frame must not move the verdict.
+    #[test]
+    fn one_stalled_frame_cannot_move_the_median() {
+        // 59 frames at 10 ms and one at 500 ms: the mean lands at 18.167 ms,
+        // over a 16.667 ms budget, entirely because of the single stall - which
+        // is the failure this policy exists to stop repeating.
+        let mut samples = vec![10_000_000u64; 59];
+        samples.push(500_000_000);
+        let mean = samples.iter().sum::<u64>() / samples.len() as u64;
+        assert!(mean > budget_ns(60), "mean {mean} should be over budget");
+        // The median does not move, which is the whole reason the gate reads it.
+        assert!(within_budget(median(&samples), budget_ns(60)));
+    }
+
+    /// The median takes a measured sample, not an average of two, and reads the
+    /// same whatever order the frames arrived in.
+    #[test]
+    fn the_median_is_a_measured_sample_and_order_free() {
+        assert_eq!(median(&[]), 0);
+        assert_eq!(median(&[7]), 7);
+        assert_eq!(median(&[9, 1, 5]), 5);
+        // Even count: the lower of the two middles, so the answer is a frame
+        // that really happened rather than a value between two frames.
+        assert_eq!(median(&[1, 2, 3, 4]), 2);
+        assert_eq!(median(&[1, 2, 8, 9, 40, 41]), 8);
+        let shuffled = vec![41, 2, 9, 40, 1, 8];
+        assert_eq!(median(&shuffled), 8);
+    }
+
+    /// Collapsing trials: the default median ignores one bad trial, `best`
+    /// reports the ceiling, and `mean` is the old policy kept reachable.
+    #[test]
+    fn trials_collapse_by_the_named_statistic() {
+        let trials = [12_000_000u64, 12_400_000, 30_000_000];
+        assert_eq!(GateStat::Median.of(&trials), 12_400_000);
+        assert_eq!(GateStat::Best.of(&trials), 12_000_000);
+        assert_eq!(GateStat::Mean.of(&trials), 18_133_333);
+        for stat in [GateStat::Median, GateStat::Mean, GateStat::Best] {
+            assert_eq!(stat.of(&[]), 0);
+        }
+        assert_eq!(GateStat::from_name("median"), Some(GateStat::Median));
+        assert_eq!(GateStat::from_name("mean"), Some(GateStat::Mean));
+        assert_eq!(GateStat::from_name("best"), Some(GateStat::Best));
+        assert_eq!(GateStat::from_name("p95"), None);
+    }
+
+    /// The trial column states every trial the gate weighed, through the same
+    /// duration formatter the gated column uses.
+    #[test]
+    fn the_trial_column_shows_every_trial() {
+        assert_eq!(trial_column(&[8_616_000, 8_402_000]), "8.616 ms 8.402 ms");
+        assert_eq!(trial_column(&[16_666_666]), "16.667 ms");
+    }
+
+    /// The summary names its own sample size, and gets the grammar right.
+    #[test]
+    fn the_summary_names_its_sample_size() {
+        assert_eq!(plural(1, "trial"), "1 trial");
+        assert_eq!(plural(3, "trial"), "3 trials");
+        assert_eq!(plural(0, "trial"), "0 trials");
     }
 
     /// The sweep is 720p through 4K at the sizes those names mean - a row that

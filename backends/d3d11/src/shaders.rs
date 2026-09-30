@@ -159,8 +159,10 @@ float slope_term(float3 n, float3 l) {
 // One comparison tap: lit when the (epsilon-shifted) reference depth is at
 // least the stored occluder. Reversed-Z: GREATER_EQUAL, near = 1.
 float tap(float2 uv, float slice, float reference) {
-    return shadow_map.SampleCmp(shadow_cmp,
-        float3(clamp(uv, 0.0, 1.0), slice), reference + 1.0e-7);
+    // No software clamp: the comparison sampler's address mode is CLAMP, so
+    // the hardware resolves an out-of-range uv to the same edge texel the
+    // clamp used to pick by hand - the same result for fewer instructions.
+    return shadow_map.SampleCmp(shadow_cmp, float3(uv, slice), reference + 1.0e-7);
 }
 
 float pcf(float2 uv, float slice, float reference, int radius) {

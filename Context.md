@@ -557,9 +557,12 @@ judges each resolution's *mean* frame time against the budget.
 
 * **The budget is an integer.** `--fps-target=N` (default 60) becomes
   `1_000_000_000 / N` nanoseconds - 16,666,666 ns at 60 - so the verdict is an
-  integer comparison and the same target always means the same number. The mean
-  decides because the claim is a sustained rate; min and max are printed beside
-  it because a number without its spread is a peak wearing a costume.
+  integer comparison and the same target always means the same number. The
+  *gated* statistic decides - the median of three repeated trials, each the
+  median of its frames (`--fps-stat` / `--fps-trials`, see "The gate's
+  measurement policy" in the 4K defect section below for why a mean could not).
+  The trials and min/max are printed beside it because a number without its
+  spread is a peak wearing a costume.
 * **Failure is loud.** Any resolution over budget prints a FAIL row, the summary
   names every offender with its mean, its fps and the amount it was over by, and
   the process exits 3 (0 pass, 2 error, 3 budget exceeded) - a CI step cannot
@@ -578,6 +581,7 @@ How to run it:
 cargo build --release -p reconl-bench
 target/release/reconl-bench --fps-gate --backend=soft-cpu   # headless: no GPU needed
 target/release/reconl-bench --fps-gate --backend=d3d11      # the hardware tier
+target/release/reconl-bench --fps-gate --fps-stat=best      # the ceiling, not the verdict
 cargo test -p reconl-bench                                   # the gate's contract, on the null tier
 ```
 
@@ -701,6 +705,247 @@ rows, 24 pass, 0 fail, 0 skip; `reconl-diff compare tests/golden/soft-cpu-shadow
 identical (4096 px); no new compiler warnings - the five on this base are the
 ones PR #2 removes, and none are in `d3d11`. The profiling instrumentation was
 temporary and is gone from `backends/d3d11/src/imp.rs`.
+
+## The 4K defect - what the frame is actually made of
+
+The pass above left 4K over budget and said so. This one took the next defect off
+the same list - put 4K inside the budget - and went looking for the stage that
+put it there. What was found, and why it stops where it does, are both below.
+
+* **A caution on cross-run numbers, which are the first thing to get wrong
+  here.** This machine's run-to-run spread is roughly 15% at 4K *before* any
+  change, and partway through the session the whole box degraded by 30-50% on an
+  identical binary - 1440p went from 13.2 ms to 17-20 ms with no code change at
+  all. So a number from this afternoon and a number from this morning are not
+  comparable. Only *interleaved* A/B inside one run is evidence here, and the
+  table below is the one that is labelled accordingly. Anything resting on a
+  before/after comparison across hours on this machine is a comparison of
+  machines, not of code.
+
+**The stage split, from GPU timestamps.** `D3D11_QUERY_TIMESTAMP` around the
+frame's four boundaries, read after the present's `Map` returned (so the stream
+had drained), behind an env var, removed again before this was written. At 4K,
+profiling build, healthy machine, with the LEVEL3 change below in the tree:
+
+| stage | 4K |
+|---|---|
+| shadow pass | 0.045 ms |
+| colour pass | 13.6 ms |
+| - of which: clears | 0.096 ms |
+| - of which: draw 0 | 12.9 ms |
+| - of which: draw 1 | 0.55 ms |
+| copy (driver DMA of the staging texture) | 4.6 ms |
+| **GPU total** | **18.3 ms** |
+
+The host side agreed: across the three ABI boundaries, `begin` ~3 us, `submit`
+~0.9 ms, `present` ~26.9 ms - present is ~96% of the frame. Inside the present,
+the `Map` wait covers the render tail plus the DMA (~13 + ~5.5 ms) and the host's
+own copy out of the mapping runs a further 4-5.5 ms for 33.2 MB.
+
+**The colour pass is the wall, and it is per-pixel.** Interleaved variants of the
+shader, medians, 4K, draw 0:
+
+| variant | draw 0 |
+|---|---|
+| as shipped | 12.9 ms |
+| no shadow taps (PCF off) | 9.4 ms |
+| loop body kept, loop work skipped | 8.0 ms |
+| no lights at all | 2.5 ms |
+| unlit (no light loop, no PCF) | 2.0 ms |
+
+So of 12.9 ms: ~3.5 ms is the 9-tap PCF across two cascades, ~5.5-7.5 ms is the
+*control flow* of the light loop - a dynamic `for (i = 0; i < 16; ++i) { if (i >=
+count) break; }` that a compiler cannot unroll - and ~2 ms is everything else.
+The loop's cost scales with pixels, not with lights: the reference scene has
+**one** directional light (printed from the lights constant buffer to be sure),
+and the loop still costs ~5.5 ms at 4K and ~3.3 ms at 1080p. The shader is
+already at `ps_5_0`, and the scene is 3 triangles - this is pure fill rate on a
+shared-memory Intel iGPU, 8.3 Mpixels of a full-screen-lit pixel shader.
+
+### Two exact changes, kept
+
+Both are semantics-preserving by construction - neither can change a pixel:
+
+1. **Compile the shaders at optimisation level 3** (`backends/d3d11/src/imp.rs`,
+   `compile()`). The default level left real time on the table: measured
+   interleaved at 4K, the colour pass went 15.3 -> 13.6 ms. Optimisation cannot
+   change what a program computes, and the frame stays byte-identical.
+2. **Stop clamping the shadow uv in software** (`backends/d3d11/src/shaders.rs`,
+   `tap()`). The comparison sampler's address mode is `D3D11_TEXTURE_ADDRESS_CLAMP`
+   on U/V/W, so the hardware already resolves an out-of-range uv to the same edge
+   texel the `clamp(uv, 0.0, 1.0)` was picking by hand. Same result, fewer
+   instructions per tap - and there are 9 of them per lit pixel.
+
+Both were then checked rather than argued. The d3d11 tier renders bit-
+deterministically (same binary, two runs, byte-identical PNGs), so the honest
+test is a differential one: render seven configurations - 64x64, 512x512 and
+1280x720 with shadows on, plus 256x256 shadows=cached, shadows=off, framegen=2
+and repeat=3 - against the committed binary and against this one, and compare.
+All seven are byte-identical, and `reconl-diff` reports `PASS ... identical
+(64x64, 4096 px)`.
+
+The more interesting half is whether that comparison *could* have caught
+anything. `lookup_at` already returns 1.0 the moment the cascade's uv leaves
+[0, 1], so the software clamp could only ever fire on the *offset* taps in
+`pcf`/`pcss` - a one-texel band at the cascade border - which is exactly the
+kind of path a test quietly never reaches. Poisoning the clamp to
+`clamp(uv, 0.0, 0.9)` and re-rendering is the falsification: it moves 173 of
+4096 pixels at 64x64, worst channel delta 43, confined to the box
+x 7..51 y 46..55. The clamp governs real pixels, so the A/B above is a real
+test, and the hardware really is doing what the software was doing.
+
+### What was tried and rejected, with the numbers
+
+* **Banded staging** (the colour staging split into four horizontal bands, so one
+   band's `Map` could return while the host copied another): the driver's first
+   `Map` serialises on the *whole* immediate context. Band 0's map-wait was the
+   entire GPU pipeline (16-20 ms) and bands 1-3 then mapped in ~100 us. No
+   overlap to be had on this driver; reverted.
+* **Manually unrolling the light loop** (16x `shade_light` + `pcf1`/`pcf2`):
+   477 KB of bytecode, device init 60-150 s, and no frame-time gain at all
+   (4K 27.2 ms). The driver is worse at a 477 KB shader, not better. Reverted.
+* **Removing the `[loop]` attribute** so LEVEL3 could unroll it by itself - the
+   natural version of the same idea, and the one thing not yet tried: it made
+   things *worse*. 4K min 24.2 -> 28.9 ms, and the whole gate run took 88 s
+   against ~20 s. Reverted.
+* **MSAA**: `sample_desc()` is already `{Count: 1, Quality: 0}`. Not a knob.
+* **A depth prepass**: the depth function is strict `GREATER` (reversed-Z), and a
+  prepass would change what the strict comparison resolves for equal depths.
+  Not exact, so not offered.
+* **Fewer PCF taps**: this changes the image, and the d3d11 tier's whole job is
+  to agree with the reference. Out of scope by the same rule that made change 2
+  worth taking.
+
+### Can the readback delete its copy? No - and the runtime says so
+
+The 4.6 ms `CopyResource` from the colour target into a `D3D11_USAGE_STAGING`
+texture is the obvious suspect: delete it and the GPU renders straight into
+memory the host can map, the way D3D12 and Vulkan let a render target sit in a
+host-visible heap. That is not available in D3D11, and the reason is a property
+of the resource model rather than of this driver, so it is worth writing down
+once. Measured on this machine (feature level 11_0) by walking every
+description the readback would need and then every Map flag against the ones
+that create:
+
+| usage | bind | cpu access | creates? | mappable? | usable as RT? |
+|---|---|---|---|---|---|
+| `STAGING` | - | `READ` | yes | **yes** (READ) | **no** - `E_INVALIDARG` |
+| `STAGING` | `RENDER_TARGET` | any | **no** `E_INVALIDARG` | - | - |
+| `DEFAULT` | `RENDER_TARGET` | none | yes | no | yes |
+| `DEFAULT` | `RENDER_TARGET` | `READ` | **yes** | **no** - `E_INVALIDARG` | yes |
+| `DEFAULT` | `RENDER_TARGET` | `WRITE` | **yes** | **no** - `E_INVALIDARG` | yes |
+| `DEFAULT` | none | `READ` | yes | no - `E_INVALIDARG` | - |
+| `DYNAMIC` | any | any | **no** `E_INVALIDARG` | - | - |
+
+* **The trap is the fourth row.** `D3D11_USAGE_DEFAULT` + `BIND_RENDER_TARGET` +
+  `CPU_ACCESS_READ` *creates successfully* - the runtime accepts the description
+  without complaint - and then rejects every `Map` on it with `E_INVALIDARG`:
+  `READ`, `WRITE`, `WRITE_NO_OVERWRITE` and `WRITE_DISCARD` alike. A
+  driver-side trap rather than a documented refusal, and exactly the kind of
+  thing that costs an afternoon if nobody checked.
+* **The only mappable texture in D3D11 is `STAGING` + `CPU_ACCESS_READ`, and
+  staging cannot be a render target** (`E_INVALIDARG` on creation, the documented
+  meaning of `D3D11_USAGE_STAGING`: copy source or destination only, never
+  pipeline-bound). So the two halves the readback needs - GPU-writable and
+  host-readable - have no description that is both. The copy is the bridge
+  D3D11 provides and there is no route around it.
+* **`DYNAMIC` does not open a door either.** It is rejected outright for a
+  texture, and it is the usage the backend already uses for its mappable
+  constant buffers (`imp.rs`), where it works - so the restriction is specific
+  to textures, not to the flag.
+* **There is no swapchain to fall back on.** `CreateDXGIFactory1` is used for
+  adapter enumeration and nothing else: the backend has no
+  `CreateSwapChainForHwnd`, no `IDXGISwapChain` and no `Present()`. It renders
+  offscreen and copies into a host buffer, which is what makes the gate headless
+  and keeps scanout out of a measurement that is about frame cost. A
+  `DXGI_USAGE_STAGING` swapchain back buffer is the nearest D3D11 thing to a
+  mapped render target, and reaching for it would mean inventing a window the
+  readback path does not have, adding a present to a benchmark that deliberately
+  has none, and changing what the gate measures.
+
+So the copy stays, it is not an implementation accident to be tidied away, and
+4K's floor is the colour pass plus that copy: 13.6 + 4.6 = 18.3 ms of GPU time
+against a 16.667 ms budget, before the host has read a byte.
+
+### The blocker, stated as a number
+
+4K cannot pass on this device. The GPU alone is 18.3 ms - colour 13.6 + DMA 4.6
+- against a 16.667 ms budget, *before* the host has copied a single byte out of
+the mapping. The frame is over budget with the readback made free and perfectly
+overlapped. Closing it needs the 13.6 ms colour pass, and the only things that
+reach that far are giving up shading the image (unlit measures 2.0 ms) or not
+rendering 4K (a GPU-side downscale). Both are changes to *what present means*,
+not to how it copies, and neither is a performance fix.
+
+Scaling is the other half of it: 4K is 4.0x 1080p's pixels, and the pass is
+purely per-pixel, so 4K is ~4x 1080p's shading cost by construction. 1080p at
+~3.4 ms of the same work fits the budget with room; 4K does not. This is a
+hardware-tier ceiling, and the gate is correctly reporting it.
+
+### The gate's measurement policy - making the hook reproducible
+
+The caution at the top of this section was not decoration. The same binary, on the
+same day, measured 4K at 24.8 ms and again at 34.7 ms, and 1440p came back PASS
+on one run and FAIL on the next with no code in between. A verdict that changes
+when nothing did is not a measurement, and until it stops, no 4K work can be
+judged against it. So the fix was to the *hook*, in `tools/reconl-bench` only -
+not one line of the render path was touched.
+
+* **The gate now reduces twice, in two separate places.** Within a trial the
+  statistic is the **median** of the measured frames, so a single stalled frame
+  cannot move it: 59 frames at 10 ms and one at 500 ms average 18.167 ms (over
+  budget) and median 10 ms (inside it). Across trials, `--fps-stat` picks how the
+  trial medians collapse - `median` by default, which is what absorbs a machine
+  that drifts part-way through a sweep. `--fps-stat=mean` reproduces the old
+  policy and `--fps-stat=best` reports the honest ceiling, so the alternatives
+  are reachable rather than argued about.
+* **Repeated trials are also the warmup-outlier discard.** Each resolution is
+  measured `--fps-trials` times (3 by default), each trial a full
+  warmup-then-measure run on its own renderer. A caller who passes `--warmup=0`
+  puts the cold frames in the *first* trial only, and the median across trials
+  drops that trial rather than letting it set the verdict. Nothing is special-
+  cased: the same reduction that ignores a stall ignores a cold start.
+* **The table prints the statistic it gates on, and its evidence.** A `gated`
+  column, the per-trial medians beside it, and `min`/`max` across every frame of
+  every trial. The gap between `gated` and `max` is exactly what the old
+  mean-based verdict was hostage to, and a row that shows its own spread is a
+  row a reader can check instead of trust.
+* **What it bought, measured.** Three back-to-back `--fps-gate --backend=d3d11`
+  runs gave identical per-resolution verdicts: 720p PASS, 1080p PASS, 1440p PASS,
+  4K FAIL, every time. 1440p gated 12.638 / 12.225 / 12.192 ms - 27% of headroom
+  where the old mean sat on the budget at 16.4-17.5 ms and flipped.
+
+An honest limit, since the number is easy to oversell: run back to back on a
+*healthy* machine the old policy agrees with the new one (1440p 12.529 / 12.441 ms
+old against 12.192-12.638 ms new), because on a healthy machine the outliers are
+rare. What the change buys is reproducibility at the boundary and under
+degradation, which is where the flipping lived. It does not and cannot make 4K
+pass - and at 4K the trial-to-trial spread is itself the finding (24.8 ms, 29.8 ms
+and 24.8 ms across three trials in one run), which the old single mean was
+structurally unable to show.
+
+Pinned by new unit tests in `tools/reconl-bench/src/main.rs`: the median ignores a
+single catastrophic stall while the mean does not; the median is always a frame
+that was really measured and is order-free; the three statistics collapse trials
+as documented and read zero from an empty set; the trial column and the summary
+say what they claim in milliseconds and in the right grammar.
+
+**Verdict: not committed.** The two exact changes are real and worth keeping, but
+the task was 4K inside the budget, 4K is not inside the budget, and committing a
+partial fix while reporting it as the fix would be the dishonest outcome. The
+tree is left with the two changes uncommitted and the gate exiting 3 with 4K
+named. Two gate runs taken while the machine was *degraded* gave 720p 8.732 /
+6.830 ms, 1080p 12.470 / 11.936 ms, 1440p 17.512 / 16.408 ms (FAIL / PASS - 1440p
+straddled the budget), 4K 34.377 / 34.705 ms. A later run on a recovered machine
+is the one the blocker above is stated from: 720p 6.635 / 8.616 ms, 1080p
+9.243 / 9.845 ms, 1440p 11.301 / 11.955 ms - all three PASS with room - and 4K
+at 23.634 / 24.843 ms, still 1.5x over. That spread (4K 24.8 ms healthy vs
+34.7 ms degraded, same binary) is the machine, not the code, and is why the
+interleaved splits above are the ones to trust.
+
+Validation for this pass: `cargo check --workspace --all-targets` 0 errors,
+0 warnings; `cargo test --workspace` 318 passed / 0 failed. All instrumentation
+is gone from `backends/d3d11/src/imp.rs` and `shaders.rs`.
 
 ## Checks
 
