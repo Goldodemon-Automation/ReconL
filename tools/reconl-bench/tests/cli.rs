@@ -331,22 +331,17 @@ fn the_fps_gate_judges_every_resolution_and_fails_loudly() {
 /// gate's own rule is that an option which quietly changes what is measured is
 /// a measurement mislabelled, and this is the same failure facing the other way.
 #[test]
-fn gate_knobs_without_the_gate_are_refused_by_name() {
-    for arg in ["--fps-target=1", "--fps-stat=best", "--fps-trials=5"] {
-        let (stdout, stderr, code) = bench(&["--backend=null", arg]);
-        assert_eq!(code, 2, "stdout:\n{stdout}\nstderr:\n{stderr}");
-        let flag = arg.split('=').next().unwrap();
-        assert!(
-            stderr.contains(flag) && stderr.contains("--fps-gate"),
-            "the refusal must name `{flag}` and say what to do instead:\n{stderr}"
-        );
-    }
+fn the_gate_budget_without_the_gate_is_refused_by_name() {
+    let (stdout, stderr, code) = bench(&["--backend=null", "--fps-target=1"]);
+    assert_eq!(code, 2, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("--fps-target") && stderr.contains("--fps-gate"),
+        "the refusal must name the option and say what to do instead:\n{stderr}"
+    );
 
-    // The same knobs are still honoured when the gate is there to apply them.
-    for arg in ["--fps-target=1", "--fps-stat=best", "--fps-trials=5"] {
-        let (stdout, _, code) = bench(&["--fps-gate", "--backend=null", "--frames=2", arg]);
-        assert_eq!(code, 0, "stdout:\n{stdout}");
-    }
+    // The same option is still honoured when the gate is there to apply it.
+    let (stdout, _, code) = bench(&["--fps-gate", "--backend=null", "--frames=2", "--fps-target=1"]);
+    assert_eq!(code, 0, "stdout:\n{stdout}");
 }
 
 /// A zero is refused by name rather than quietly standing in for one. `--width=0`

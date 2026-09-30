@@ -553,16 +553,15 @@ hold 60 FPS?" into a number, a table and an exit code. It sweeps the four
 resolutions a host means by 720p, 1080p, 1440p and 4K - 1280x720, 1920x1080,
 2560x1440, 3840x2160 - on one device, through the same warmup-then-measure
 discipline every bench run uses (5 unmeasured frames, then 60 measured), and
-judges each resolution's *mean* frame time against the budget.
+judges each resolution's *gated* frame time against the budget.
 
 * **The budget is an integer.** `--fps-target=N` (default 60) becomes
   `1_000_000_000 / N` nanoseconds - 16,666,666 ns at 60 - so the verdict is an
   integer comparison and the same target always means the same number. The
   *gated* statistic decides - the median of three repeated trials, each the
-  median of its frames (`--fps-stat` / `--fps-trials`, see "The gate's
-  measurement policy" in the 4K defect section below for why a mean could not).
-  The trials and min/max are printed beside it because a number without its
-  spread is a peak wearing a costume.
+  median of its frames (see "The gate's measurement policy" in the 4K defect
+  section below for why a mean could not). The trials and min/max are printed
+  beside it because a number without its spread is a peak wearing a costume.
 * **Failure is loud.** Any resolution over budget prints a FAIL row, the summary
   names every offender with its mean, its fps and the amount it was over by, and
   the process exits 3 (0 pass, 2 error, 3 budget exceeded) - a CI step cannot
@@ -581,7 +580,7 @@ How to run it:
 cargo build --release -p reconl-bench
 target/release/reconl-bench --fps-gate --backend=soft-cpu   # headless: no GPU needed
 target/release/reconl-bench --fps-gate --backend=d3d11      # the hardware tier
-target/release/reconl-bench --fps-gate --fps-stat=best      # the ceiling, not the verdict
+target/release/reconl-bench --fps-gate --fps-target=120     # a 120 fps budget instead
 cargo test -p reconl-bench                                   # the gate's contract, on the null tier
 ```
 
@@ -894,17 +893,14 @@ not one line of the render path was touched.
 * **The gate now reduces twice, in two separate places.** Within a trial the
   statistic is the **median** of the measured frames, so a single stalled frame
   cannot move it: 59 frames at 10 ms and one at 500 ms average 18.167 ms (over
-  budget) and median 10 ms (inside it). Across trials, `--fps-stat` picks how the
-  trial medians collapse - `median` by default, which is what absorbs a machine
-  that drifts part-way through a sweep. `--fps-stat=mean` reproduces the old
-  policy and `--fps-stat=best` reports the honest ceiling, so the alternatives
-  are reachable rather than argued about.
+  budget) and median 10 ms (inside it). Across three trials, again by median,
+  which is what absorbs a machine that drifts part-way through a sweep.
 * **Repeated trials are also the warmup-outlier discard.** Each resolution is
-  measured `--fps-trials` times (3 by default), each trial a full
-  warmup-then-measure run on its own renderer. A caller who passes `--warmup=0`
-  puts the cold frames in the *first* trial only, and the median across trials
-  drops that trial rather than letting it set the verdict. Nothing is special-
-  cased: the same reduction that ignores a stall ignores a cold start.
+  measured `GATE_TRIALS` (3) times, each trial a full warmup-then-measure run on
+  its own renderer. A caller who passes `--warmup=0` puts the cold frames in the
+  *first* trial only, and the median across trials drops that trial rather than
+  letting it set the verdict. Nothing is special-cased: the same reduction that
+  ignores a stall ignores a cold start.
 * **The table prints the statistic it gates on, and its evidence.** A `gated`
   column, the per-trial medians beside it, and `min`/`max` across every frame of
   every trial. The gap between `gated` and `max` is exactly what the old
@@ -925,27 +921,22 @@ and 24.8 ms across three trials in one run), which the old single mean was
 structurally unable to show.
 
 Pinned by new unit tests in `tools/reconl-bench/src/main.rs`: the median ignores a
-single catastrophic stall while the mean does not; the median is always a frame
-that was really measured and is order-free; the three statistics collapse trials
-as documented and read zero from an empty set; the trial column and the summary
-say what they claim in milliseconds and in the right grammar.
+single catastrophic stall while the mean does not, and it is always a frame that
+was really measured, order-free.
 
-**Verdict: not committed.** The two exact changes are real and worth keeping, but
-the task was 4K inside the budget, 4K is not inside the budget, and committing a
-partial fix while reporting it as the fix would be the dishonest outcome. The
-tree is left with the two changes uncommitted and the gate exiting 3 with 4K
-named. Two gate runs taken while the machine was *degraded* gave 720p 8.732 /
-6.830 ms, 1080p 12.470 / 11.936 ms, 1440p 17.512 / 16.408 ms (FAIL / PASS - 1440p
-straddled the budget), 4K 34.377 / 34.705 ms. A later run on a recovered machine
-is the one the blocker above is stated from: 720p 6.635 / 8.616 ms, 1080p
-9.243 / 9.845 ms, 1440p 11.301 / 11.955 ms - all three PASS with room - and 4K
-at 23.634 / 24.843 ms, still 1.5x over. That spread (4K 24.8 ms healthy vs
-34.7 ms degraded, same binary) is the machine, not the code, and is why the
-interleaved splits above are the ones to trust.
+**Verdict: landed, with 4K still open.** The two exact changes are real, but the
+task was 4K inside the budget and 4K is not inside the budget, so the commit says
+so in its subject rather than reporting a partial fix as the fix. The gate exits
+3 with 4K named. On a recovered machine: 720p 6.846 ms, 1080p 9.512 ms, 1440p
+11.393 ms - all three PASS with room - and 4K at 23.806 ms, still 1.4x over.
+That the same binary read 4K between 23.8 and 34.7 ms across the session is the
+machine, not the code, and is why the interleaved splits above are the ones to
+trust.
 
 Validation for this pass: `cargo check --workspace --all-targets` 0 errors,
-0 warnings; `cargo test --workspace` 318 passed / 0 failed. All instrumentation
-is gone from `backends/d3d11/src/imp.rs` and `shaders.rs`.
+0 warnings; `cargo test --workspace` 321 passed / 0 failed; probes/run.sh 24
+rows / 24 pass; golden byte-identical. All instrumentation is gone from
+`backends/d3d11/src/imp.rs` and `shaders.rs`.
 
 ## Checks
 
