@@ -27,3 +27,7 @@ path = "src/lib.rs"
 [[example]]
 name = "classify_probe"
 path = "examples/classify_probe.rs"
+
+[[example]]
+name = "pixel_hash"
+path = "examples/pixel_hash.rs"
