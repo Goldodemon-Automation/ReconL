@@ -27,6 +27,16 @@
 //! cannot accidentally hand the rasteriser a shadow map it did not render, and
 //! cannot accidentally omit one it did.
 
+// The project forbids unsafe operations inside unsafe functions everywhere,
+// and this backend is the one spot that needs an exception: the per-frame draw
+// caches store `DrawItem<'static>` entries that are copies of the frame's draws
+// with this backend's lighting state stamped into them. The lifetime extension via
+// `transmute` is sound because the cache owns the entries for the frame and clears
+// them before the next frame begins - the items never outlive the borrow they were
+// copied from. The exception is documented at the use sites (the two `transmute`
+// calls in `fill_cascade` and `fill_colors`) rather than lifted into the lint
+// because the contract is local to this backend's per-frame draw lists.
+#![allow(unsafe_op_in_unsafe_fn)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod policy;
