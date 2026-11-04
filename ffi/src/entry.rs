@@ -129,7 +129,11 @@ pub(crate) unsafe fn cstr(ptr: *const i8) -> String {
     let mut len = 0usize;
     // SAFETY: the caller guarantees a NUL-terminated string.
     unsafe {
-        while *ptr.add(len) != 0 && len < 4096 {
+        // The bound is tested before the byte is read. With the operands the
+        // other way round the loop read `ptr.add(4096)` to decide whether it
+        // had reached its own limit, which is one byte outside the window this
+        // scan promises to touch.
+        while len < 4096 && *ptr.add(len) != 0 {
             len += 1;
         }
         let slice = core::slice::from_raw_parts(ptr as *const u8, len);

@@ -3502,3 +3502,130 @@ fn the_compute_backend_refuses_rather_than_falling_back_to_software() {
         }
     }
 }
+
+/// A bind is where "this draw starts at byte N" becomes a claim about an
+/// allocation, so it is where the claim is judged. A vertex or index offset
+/// outside its buffer used to be accepted and only met by arithmetic in the
+/// draw, where a wrapped `u64` could make the bound check pass and the index
+/// pointer walk out of the buffer. Each case is refused at the bind now, names
+/// the offset, and forms no pointer; the valid bind still submits.
+#[test]
+fn a_buffer_bind_offset_outside_the_buffer_is_refused() {
+    let mut rig = Rig::new();
+    // SAFETY: the rig, the buffers it creates and the command list are all live
+    // for the test, and every descriptor is built here.
+    unsafe {
+        let verts: [abi::ReconLVertex; 3] = core::mem::zeroed();
+        let vb_bytes = (verts.len() * core::mem::size_of::<abi::ReconLVertex>()) as u64;
+        let vbd = abi::ReconLBufferDesc {
+            base: hdr::<abi::ReconLBufferDesc>(),
+            size_bytes: vb_bytes,
+            usage: 1, // VERTEX
+            reserved: 0,
+            data: verts.as_ptr() as *const core::ffi::c_void,
+            data_size: vb_bytes,
+            debug_name: core::ptr::null(),
+        };
+        let mut vb: *mut reconl::BufferHandle = core::ptr::null_mut();
+        assert_eq!(reconl::reconlCreateBuffer(rig.device, &vbd, &mut vb), abi::result::OK);
+
+        let indices = [9u32, 9, 9, 0, 1, 2];
+        let ib_bytes = (indices.len() * 4) as u64;
+        let ibd = abi::ReconLBufferDesc {
+            base: hdr::<abi::ReconLBufferDesc>(),
+            size_bytes: ib_bytes,
+            usage: 2, // INDEX
+            reserved: 0,
+            data: indices.as_ptr() as *const core::ffi::c_void,
+            data_size: ib_bytes,
+            debug_name: core::ptr::null(),
+        };
+        let mut ib: *mut reconl::BufferHandle = core::ptr::null_mut();
+        assert_eq!(reconl::reconlCreateBuffer(rig.device, &ibd, &mut ib), abi::result::OK);
+
+        // SAFETY: every handle passed in was created by this rig.
+        unsafe fn submit_binds(
+            rig: &mut Rig,
+            vb: *mut reconl::BufferHandle,
+            vertex_offset: u64,
+            ib: *mut reconl::BufferHandle,
+            index_offset: u64,
+        ) -> i32 {
+            assert_eq!(begin_frame(rig, W, H), abi::result::OK);
+            reconl::reconlCmdReset(rig.commands);
+            let rp = abi::ReconLRenderPassDesc {
+                base: hdr::<abi::ReconLRenderPassDesc>(),
+                color_count: 0,
+                reserved: 0,
+                color: [zeroed_attachment(); abi::RECONL_MAX_ATTACHMENTS],
+                depth: core::ptr::null_mut(),
+                viewport_width: W,
+                viewport_height: H,
+                load_color: 1,
+                load_depth: 1,
+                clear_color: [0.0, 0.0, 1.0, 1.0],
+                clear_depth: 0.0,
+                stencil_clear: 0,
+                reserved2: 0,
+            };
+            reconl::reconlCmdBeginRenderPass(rig.commands, &rp);
+            reconl::reconlCmdSetPipeline(rig.commands, rig.pipeline);
+            let identity: [f32; 16] =
+                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+            reconl::reconlCmdPushConstants(rig.commands, 0, identity.as_ptr() as *const core::ffi::c_void, 64);
+            reconl::reconlCmdPushConstants(rig.commands, 1, identity.as_ptr() as *const core::ffi::c_void, 64);
+            reconl::reconlCmdSetVertexBuffer(rig.commands, 0, vb, vertex_offset);
+            reconl::reconlCmdSetIndexBuffer(rig.commands, ib, index_offset, 1); // UINT32
+            reconl::reconlCmdDrawIndexed(rig.commands, 3, 0, 0);
+            reconl::reconlCmdEndRenderPass(rig.commands);
+            reconl::reconlSubmit(rig.device, rig.commands, core::ptr::null_mut())
+        }
+
+        let r = submit_binds(&mut rig, vb, vb_bytes + 1, ib, 0);
+        assert_eq!(r, abi::result::INVALID_ARGUMENT, "{}", rig.error_message());
+        assert!(
+            rig.error_message().contains("vertex buffer bind offset"),
+            "the refusal must name the bind: {}",
+            rig.error_message()
+        );
+
+        // `u64::MAX - 8` is the case that used to wrap: the bind now refuses it
+        // before any offset arithmetic can. (Vertex and index buffers are
+        // separate handles, so neither test reads the other's bytes.)
+        let r = submit_binds(&mut rig, vb, 0, ib, u64::MAX - 8);
+        assert_eq!(r, abi::result::INVALID_ARGUMENT, "{}", rig.error_message());
+        assert!(
+            rig.error_message().contains("index buffer bind offset"),
+            "the refusal must name the bind: {}",
+            rig.error_message()
+        );
+
+        // A uint32 index read through a `*const u32` needs an aligned address.
+        let r = submit_binds(&mut rig, vb, 0, ib, 2);
+        assert_eq!(r, abi::result::INVALID_ARGUMENT, "{}", rig.error_message());
+        assert!(
+            rig.error_message().contains("4-byte aligned"),
+            "the refusal must name the alignment: {}",
+            rig.error_message()
+        );
+
+        // A vertex read through a `Vertex` pointer needs that type's alignment.
+        let r = submit_binds(&mut rig, vb, 2, ib, 0);
+        assert_eq!(r, abi::result::INVALID_ARGUMENT, "{}", rig.error_message());
+        assert!(
+            rig.error_message().contains("multiple of"),
+            "the refusal must name the alignment: {}",
+            rig.error_message()
+        );
+
+        // The gate refuses bad binds, not every bind. The index bind starts at
+        // byte 12, where the indices are [0, 1, 2]; a draw that ignored the
+        // bind offset would read [9, 9, 9] and be refused by the vertex bound,
+        // so this OK is evidence that the offset is honored.
+        let r = submit_binds(&mut rig, vb, 0, ib, 12);
+        assert_eq!(r, abi::result::OK, "{}", rig.error_message());
+
+        reconl::reconlRelease(vb as *mut core::ffi::c_void);
+        reconl::reconlRelease(ib as *mut core::ffi::c_void);
+    }
+}
