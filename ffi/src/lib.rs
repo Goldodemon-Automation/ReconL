@@ -2419,6 +2419,31 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                         return err!(Code::InvalidArgument, "null vertex buffer");
                     }
                     child!(device, buffer, Kind::Buffer, "buffer");
+                    // The bind is where an offset becomes a claim about the
+                    // buffer, so it is where the claim is judged. A draw then
+                    // starts from an offset that is inside the allocation and
+                    // its own range arithmetic cannot be made to wrap the bound
+                    // check below into passing.
+                    let held = unsafe { &*buffer };
+                    if offset > held.bytes.len() as u64 {
+                        return err!(
+                            Code::InvalidArgument,
+                            "the vertex buffer bind offset {} is past the {}-byte buffer",
+                            offset,
+                            held.bytes.len()
+                        );
+                    }
+                    // Vertices are read through a `Vertex` pointer, so the bind
+                    // address has to satisfy that type's alignment; an odd
+                    // offset would make every slice read unaligned.
+                    if offset % core::mem::align_of::<Vertex>() as u64 != 0 {
+                        return err!(
+                            Code::InvalidArgument,
+                            "the vertex buffer bind offset {} is not a multiple of {}",
+                            offset,
+                            core::mem::align_of::<Vertex>()
+                        );
+                    }
                     state.vertex = Some((buffer, offset));
                 }
                 Command::SetIndexBuffer { buffer, offset, format } => {
@@ -2426,6 +2451,25 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                         return err!(Code::InvalidArgument, "null index buffer");
                     }
                     child!(device, buffer, Kind::Buffer, "buffer");
+                    let held = unsafe { &*buffer };
+                    if offset > held.bytes.len() as u64 {
+                        return err!(
+                            Code::InvalidArgument,
+                            "the index buffer bind offset {} is past the {}-byte buffer",
+                            offset,
+                            held.bytes.len()
+                        );
+                    }
+                    // `uint32` indices are read through a `*const u32`, which
+                    // requires the address to be aligned: an odd bind offset
+                    // would make every index read unaligned.
+                    if format == abi::index_format::UINT32 && offset % 4 != 0 {
+                        return err!(
+                            Code::InvalidArgument,
+                            "a uint32 index buffer bind must be 4-byte aligned, got offset {}",
+                            offset
+                        );
+                    }
                     state.index = Some((buffer, offset, format));
                 }
                 Command::SetTexture { slot, texture, filter, wrap_u, wrap_v } => {
@@ -2462,8 +2506,23 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     };
                     let buffer_ref = unsafe { &*buffer };
                     let stride = core::mem::size_of::<Vertex>() as u64;
-                    let base = offset + first_vertex as u64 * stride;
-                    let end = base + vertex_count as u64 * stride;
+                    // The bind already bounded `offset`; this stays checked so
+                    // a future caller cannot reintroduce a wrapping bound check.
+                    let base = match offset.checked_add(first_vertex as u64 * stride) {
+                        Some(base) => base,
+                        None => {
+                            return err!(
+                                Code::InvalidArgument,
+                                "the draw's vertex offset overflows"
+                            )
+                        }
+                    };
+                    let end = match base.checked_add(vertex_count as u64 * stride) {
+                        Some(end) => end,
+                        None => {
+                            return err!(Code::InvalidArgument, "the draw's vertex range overflows")
+                        }
+                    };
                     if end > buffer_ref.bytes.len() as u64 {
                         return err!(
                             Code::InvalidArgument,
@@ -2530,14 +2589,35 @@ pub unsafe extern "C" fn reconlSubmit(device: *mut DeviceHandle, list: *const Co
                     let buffer_ref = unsafe { &*buffer };
                     let index_ref = unsafe { &*index_buffer };
                     let index_bytes = index_count as u64 * 4;
-                    if index_offset + first_index as u64 * 4 + index_bytes > index_ref.bytes.len() as u64 {
+                    let index_end = match (first_index as u64)
+                        .checked_mul(4)
+                        .and_then(|first| index_offset.checked_add(first))
+                        .and_then(|start| start.checked_add(index_bytes))
+                    {
+                        Some(end) => end,
+                        None => {
+                            return err!(
+                                Code::InvalidArgument,
+                                "the indexed draw's index range overflows"
+                            )
+                        }
+                    };
+                    if index_end > index_ref.bytes.len() as u64 {
                         return err!(Code::InvalidArgument, "the indexed draw reads past the index buffer");
                     }
                     // The base the indices are relative to: the offset the host
                     // bound the buffer at, plus the draw's own first vertex. Both
                     // were previously dropped, so an indexed draw with a non-zero
                     // offset drew whatever sat at the start of the buffer.
-                    let base = offset + vertex_offset.max(0) as u64 * stride;
+                    let base = match offset.checked_add(vertex_offset.max(0) as u64 * stride) {
+                        Some(base) => base,
+                        None => {
+                            return err!(
+                                Code::InvalidArgument,
+                                "the indexed draw's vertex offset overflows"
+                            )
+                        }
+                    };
                     let max_index = vertex_count_upper(index_ref, index_offset, first_index, index_count);
                     if base + (max_index + 1) * stride > buffer_ref.bytes.len() as u64 {
                         return err!(Code::InvalidArgument, "the indexed draw reads past the vertex buffer");

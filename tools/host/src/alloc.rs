@@ -70,11 +70,11 @@ pub fn reset() {
 }
 
 fn add(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(value)));
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_add(value)));
 }
 
 fn sub(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(value)));
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(value)));
 }
 
 /// Books an allocation. Called from inside the `extern "C"` callback, so every

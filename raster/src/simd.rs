@@ -226,7 +226,11 @@ mod tests {
         // representable grid.
         let mut x = 0.123_456_7f32;
         for _ in 0..400 {
-            x = (x * 1.618_034).fract().max(0.0);
+            // Multiplying by the golden ratio and keeping the fraction is the
+            // standard low-discrepancy spread: it fills [0, 1) without ever
+            // repeating a value, so the 0.5 rounding boundary is hit from both
+            // sides many times over.
+            x = (x * core::f32::consts::GOLDEN_RATIO).fract().max(0.0);
             v.push(x);
             v.push(-x);
         }

@@ -314,7 +314,9 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let scene = Scene::with_shadow_mode(options.shadows);
 
     let (mut major, mut minor, mut patch) = (0u32, 0u32, 0u32);
-    reconl::reconlVersion(&mut major, &mut minor, &mut patch);
+    // SAFETY: the three out-pointers borrow local `u32`s for the duration of
+    // the call, so each one is valid to write.
+    unsafe { reconl::reconlVersion(&mut major, &mut minor, &mut patch) };
     println!("reconl-bench — ReconL {major}.{minor}.{patch} (ABI {})\n", abi::ABI_VERSION);
 
     // The fingerprint is printed from the *config*, before a device exists, and
