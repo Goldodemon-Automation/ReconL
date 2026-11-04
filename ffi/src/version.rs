@@ -12,8 +12,12 @@ use reconl_core::log::{self, Level};
 use reconl_core::tier::TIER_COUNT;
 use std::ffi::c_void;
 
+/// Writes the library's version into the three out-pointers, skipping any that
+/// are null. `unsafe` because the caller guarantees each non-null pointer is
+/// valid to write - the same contract every other entry point states, and the
+/// one this function was missing while still dereferencing its arguments.
 #[no_mangle]
-pub extern "C" fn reconlVersion(major: *mut u32, minor: *mut u32, patch: *mut u32) {
+pub unsafe extern "C" fn reconlVersion(major: *mut u32, minor: *mut u32, patch: *mut u32) {
     unsafe {
         if !major.is_null() {
             *major = abi::VERSION_MAJOR;
